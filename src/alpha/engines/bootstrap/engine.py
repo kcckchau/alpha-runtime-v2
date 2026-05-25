@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from alpha.calendar.base import SessionCalendar
@@ -286,30 +286,30 @@ class BootstrapEngine(BaseEngine):
         )
 
         for symbol in self._settings.runtime.symbols:
-            minute_bars = await self._historical.fetch_bars(
+            minute_bars = await self._load_or_fetch_bars(
                 symbol=symbol,
                 timeframe=BarTimeframe.M1,
                 start=minute_start,
                 end=end,
                 emit=True,
+                persist_direct=False,
             )
-            hourly_bars = await self._historical.fetch_bars(
+            hourly_bars = await self._load_or_fetch_bars(
                 symbol=symbol,
                 timeframe=BarTimeframe.H1,
                 start=hourly_start,
                 end=end,
                 emit=False,
+                persist_direct=True,
             )
-            daily_bars = await self._historical.fetch_bars(
+            daily_bars = await self._load_or_fetch_bars(
                 symbol=symbol,
                 timeframe=BarTimeframe.D1,
                 start=daily_start,
                 end=end,
                 emit=False,
+                persist_direct=True,
             )
-
-            for bar in hourly_bars + daily_bars:
-                await self._storage.save_bar(bar)
 
             self._startup_context[symbol] = build_symbol_context(
                 symbol=symbol,
@@ -318,6 +318,67 @@ class BootstrapEngine(BaseEngine):
                 daily_bars=daily_bars,
                 calendar=self._calendar,
             )
+
+    async def _load_or_fetch_bars(
+        self,
+        symbol: str,
+        timeframe: BarTimeframe,
+        start: datetime,
+        end: datetime,
+        *,
+        emit: bool,
+        persist_direct: bool,
+    ) -> list[Any]:
+        if self._historical is None or self._storage is None:
+            return []
+
+        stored = await self._storage.load_bar_events(symbol, timeframe, start.date(), end.date())
+        stored = [bar for bar in stored if start <= bar.timestamp <= end]
+
+        tail_start = self._tail_fetch_start(stored, start, end, timeframe)
+        if tail_start is None:
+            return stored
+
+        fetched = await self._historical.fetch_bars(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=tail_start,
+            end=end,
+            emit=emit,
+        )
+        if persist_direct:
+            for bar in fetched:
+                await self._storage.save_bar(bar)
+
+        merged = stored + fetched
+        merged.sort(key=lambda bar: bar.timestamp)
+        return merged
+
+    @staticmethod
+    def _tail_fetch_start(
+        stored_bars: list[Any],
+        start: datetime,
+        end: datetime,
+        timeframe: BarTimeframe,
+    ) -> datetime | None:
+        relevant = [bar for bar in stored_bars if start <= bar.timestamp <= end]
+        if not relevant:
+            return start
+
+        latest_bar = max(relevant, key=lambda bar: bar.timestamp)
+        if latest_bar.timestamp >= end:
+            return None
+
+        return latest_bar.timestamp + BootstrapEngine._timeframe_delta(timeframe)
+
+    @staticmethod
+    def _timeframe_delta(timeframe: BarTimeframe) -> timedelta:
+        mapping = {
+            BarTimeframe.M1: timedelta(minutes=1),
+            BarTimeframe.H1: timedelta(hours=1),
+            BarTimeframe.D1: timedelta(days=1),
+        }
+        return mapping[timeframe]
 
     async def _status_loop(self) -> None:
         ticks = 0

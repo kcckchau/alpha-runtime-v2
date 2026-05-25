@@ -34,6 +34,7 @@ from alpha.models.enums import BarTimeframe, EventType, HealthStatus
 from alpha.models.events import (
     AnyEvent,
     BarEvent,
+    EventMetadata,
     MarketStateEvent,
     OrderBookEvent,
     OrderUpdateEvent,
@@ -118,6 +119,19 @@ class StorageEngine(BaseEngine):
 
     async def has_bars(self, symbol: str, timeframe: BarTimeframe, d: date) -> bool:
         return self._parquet.exists(f"bars/{timeframe}", symbol, d)
+
+    async def list_bar_dates(self, symbol: str, timeframe: BarTimeframe) -> list[date]:
+        return self._parquet.list_dates(f"bars/{timeframe}", symbol)
+
+    async def load_bar_events(
+        self,
+        symbol: str,
+        timeframe: BarTimeframe,
+        start: date,
+        end: date,
+    ) -> list[BarEvent]:
+        table = self._parquet.read_range(f"bars/{timeframe}", symbol, start, end)
+        return [self._row_to_bar_event(row, timeframe) for row in table.to_pylist()]
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -264,6 +278,31 @@ class StorageEngine(BaseEngine):
         if isinstance(event, SystemEvent):
             return "__system__"
         return event.symbol
+
+    @staticmethod
+    def _row_to_bar_event(row: dict[str, Any], timeframe: BarTimeframe) -> BarEvent:
+        timestamp = datetime.fromisoformat(str(row["timestamp"]).replace("Z", "+00:00"))
+        received_at = datetime.fromisoformat(str(row["received_at"]).replace("Z", "+00:00"))
+        return BarEvent(
+            symbol=str(row["symbol"]),
+            timestamp=timestamp,
+            metadata=EventMetadata(
+                event_id=row["event_id"],
+                source=row["source"],
+                received_at=received_at,
+                is_replay=bool(row.get("is_replay", False)),
+                sequence_num=row.get("sequence_num"),
+            ),
+            timeframe=timeframe,
+            open=Decimal(str(row["open"])),
+            high=Decimal(str(row["high"])),
+            low=Decimal(str(row["low"])),
+            close=Decimal(str(row["close"])),
+            volume=int(row["volume"]),
+            vwap=Decimal(str(row["vwap"])) if row.get("vwap") is not None else None,
+            trade_count=int(row["trade_count"]) if row.get("trade_count") is not None else None,
+            is_partial=bool(row.get("is_partial", False)),
+        )
 
     @staticmethod
     def _decimal_text(value: Decimal | None) -> str | None:
