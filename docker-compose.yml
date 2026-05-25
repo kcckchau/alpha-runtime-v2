@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: alpha_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-alpha}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-alpha_dev}
+      POSTGRES_DB: ${DB_NAME:-alpha_runtime}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/00_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-alpha} -d ${DB_NAME:-alpha_runtime}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alpha_app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      - RUNTIME__MODE=${RUNTIME_MODE:-PAPER}
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src:ro
+    ports:
+      - "${API_PORT:-8000}:8000"
+    command: python -m alpha.main run
+
+volumes:
+  pgdata:
+    driver: local
