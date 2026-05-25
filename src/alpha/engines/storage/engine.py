@@ -19,8 +19,10 @@ Write path:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 from alpha.config.settings import AlphaSettings
@@ -29,7 +31,17 @@ from alpha.core.event_bus import EventBus
 from alpha.engines.storage.parquet import ParquetStore
 from alpha.engines.storage.postgres import PostgresStore
 from alpha.models.enums import BarTimeframe, EventType, HealthStatus
-from alpha.models.events import AnyEvent, BarEvent
+from alpha.models.events import (
+    AnyEvent,
+    BarEvent,
+    MarketStateEvent,
+    OrderBookEvent,
+    OrderUpdateEvent,
+    QuoteEvent,
+    SetupEvent,
+    SystemEvent,
+    TradeEvent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +143,134 @@ class StorageEngine(BaseEngine):
                 self._write_queue.task_done()
 
     async def _persist(self, event: AnyEvent) -> None:
-        # TODO: convert event → Arrow Table row and write to Parquet
-        # For now, this is a no-op placeholder
-        pass
+        import pyarrow as pa
+
+        data_type = self._data_type_for(event)
+        row = self._serialize_event(event)
+        table = pa.Table.from_pylist([row])
+        self._parquet.write(
+            table,
+            data_type,
+            self._storage_symbol(event),
+            event.timestamp.date(),
+        )
+
+    @staticmethod
+    def _data_type_for(event: AnyEvent) -> str:
+        if isinstance(event, BarEvent):
+            return f"bars/{event.timeframe}"
+        if isinstance(event, TradeEvent):
+            return "trades"
+        if isinstance(event, QuoteEvent):
+            return "quotes"
+        if isinstance(event, OrderBookEvent):
+            return "order_books"
+        if isinstance(event, MarketStateEvent):
+            return "market_states"
+        if isinstance(event, SetupEvent):
+            return "setups"
+        if isinstance(event, OrderUpdateEvent):
+            return "orders"
+        if isinstance(event, SystemEvent):
+            return "system"
+        raise TypeError(f"Unsupported event type: {type(event).__name__}")
+
+    def _serialize_event(self, event: AnyEvent) -> dict[str, Any]:
+        base = {
+            "event_id": str(event.metadata.event_id),
+            "event_type": str(event.event_type),
+            "symbol": event.symbol,
+            "timestamp": event.timestamp.isoformat(),
+            "source": str(event.metadata.source),
+            "received_at": event.metadata.received_at.isoformat(),
+            "is_replay": event.metadata.is_replay,
+            "sequence_num": event.metadata.sequence_num,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        if isinstance(event, BarEvent):
+            return {
+                **base,
+                "timeframe": str(event.timeframe),
+                "open": self._decimal_text(event.open),
+                "high": self._decimal_text(event.high),
+                "low": self._decimal_text(event.low),
+                "close": self._decimal_text(event.close),
+                "volume": event.volume,
+                "vwap": self._decimal_text(event.vwap),
+                "trade_count": event.trade_count,
+                "is_partial": event.is_partial,
+            }
+        if isinstance(event, TradeEvent):
+            return {
+                **base,
+                "price": self._decimal_text(event.price),
+                "size": event.size,
+                "conditions_json": self._json_text(event.conditions),
+                "exchange": event.exchange,
+                "taker_side": str(event.taker_side),
+                "trade_id": event.trade_id,
+            }
+        if isinstance(event, QuoteEvent):
+            return {
+                **base,
+                "bid_price": self._decimal_text(event.bid_price),
+                "bid_size": event.bid_size,
+                "ask_price": self._decimal_text(event.ask_price),
+                "ask_size": event.ask_size,
+                "bid_exchange": event.bid_exchange,
+                "ask_exchange": event.ask_exchange,
+            }
+        if isinstance(event, OrderBookEvent):
+            return {
+                **base,
+                "bids_json": self._json_text(event.bids),
+                "asks_json": self._json_text(event.asks),
+                "is_snapshot": event.is_snapshot,
+            }
+        if isinstance(event, MarketStateEvent):
+            return {
+                **base,
+                "state_data_json": self._json_text(event.state_data),
+            }
+        if isinstance(event, SetupEvent):
+            return {
+                **base,
+                "setup_id": str(event.setup_id),
+                "setup_type": str(event.setup_type),
+                "setup_state": str(event.setup_state),
+                "prev_state": str(event.prev_state) if event.prev_state is not None else None,
+            }
+        if isinstance(event, OrderUpdateEvent):
+            return {
+                **base,
+                "order_id": str(event.order_id),
+                "broker_order_id": event.broker_order_id,
+                "order_status": str(event.order_status),
+                "filled_quantity": event.filled_quantity,
+                "avg_fill_price": self._decimal_text(event.avg_fill_price),
+                "reject_reason": event.reject_reason,
+            }
+        if isinstance(event, SystemEvent):
+            return {
+                **base,
+                "event_name": event.event_name,
+                "payload_json": self._json_text(event.payload),
+            }
+        raise TypeError(f"Unsupported event type: {type(event).__name__}")
+
+    @staticmethod
+    def _storage_symbol(event: AnyEvent) -> str:
+        if isinstance(event, SystemEvent):
+            return "__system__"
+        return event.symbol
+
+    @staticmethod
+    def _decimal_text(value: Decimal | None) -> str | None:
+        if value is None:
+            return None
+        return str(value)
+
+    @staticmethod
+    def _json_text(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, default=str)
