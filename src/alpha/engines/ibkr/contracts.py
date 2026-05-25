@@ -7,10 +7,12 @@ Shared by all three IBKR adapters so normalization logic lives in one place.
 from __future__ import annotations
 
 import math
+from datetime import date
 from datetime import datetime, time, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
+from alpha.instruments import quarterly_contract_month
 from alpha.models.enums import AssetClass, BarTimeframe, DataSourceId
 from alpha.models.events import BarEvent, EventMetadata, QuoteEvent, TradeEvent
 from alpha.models.symbol import Symbol
@@ -98,10 +100,21 @@ MAX_CHUNK_DAYS: dict[BarTimeframe, int] = {
 
 def make_contract(sym: Symbol) -> "object":
     """Return an ib_insync Contract for the given Symbol."""
-    from ib_insync import Stock
+    from ib_insync import Future, Stock
 
     if sym.asset_class in {AssetClass.EQUITY, AssetClass.ETF}:
-        return Stock(sym.ticker, "SMART", sym.currency)
+        exchange = sym.exchange if sym.exchange != "UNKNOWN" else "SMART"
+        return Stock(sym.ticker, exchange, sym.currency)
+
+    if sym.asset_class == AssetClass.FUTURE:
+        contract_month = sym.contract_month or quarterly_contract_month(date.today())
+        root_symbol = sym.root_symbol or sym.ticker
+        return Future(
+            symbol=root_symbol,
+            lastTradeDateOrContractMonth=contract_month,
+            exchange=sym.exchange,
+            currency=sym.currency,
+        )
 
     raise NotImplementedError(
         f"IBKR contract not implemented for asset class: {sym.asset_class}"

@@ -9,6 +9,8 @@ class Symbol(BaseModel):
     ticker: str
     exchange: str
     asset_class: AssetClass
+    root_symbol: str | None = None
+    contract_month: str | None = None   # YYYYMM for futures when applicable
     currency: str = "USD"
     description: str = ""
     lot_size: int = 1

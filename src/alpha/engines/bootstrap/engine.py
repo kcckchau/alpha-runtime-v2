@@ -39,6 +39,7 @@ from alpha.core.clock import Clock, ReplayClock, WallClock
 from alpha.core.engine import BaseEngine
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
+from alpha.instruments import resolve_symbol
 from alpha.models.enums import EngineState, RuntimeMode
 from alpha.models.symbol import Symbol
 from alpha.runtime_status import write_snapshot
@@ -172,14 +173,8 @@ class BootstrapEngine(BaseEngine):
             self._clock = WallClock()
 
     def _populate_registry(self) -> None:
-        from alpha.models.enums import AssetClass
         for ticker in self._settings.runtime.symbols:
-            # Placeholder: in production, enrich from a symbol master
-            sym = Symbol(
-                ticker=ticker,
-                exchange="UNKNOWN",
-                asset_class=AssetClass.EQUITY,
-            )
+            sym = resolve_symbol(ticker)
             self._registry.register(sym)
         logger.info("Registry loaded: %d symbols", len(self._registry))
 
