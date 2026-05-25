@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 from fastapi import APIRouter
 from pydantic import BaseModel
 
 from alpha.config.loader import get_settings
-from alpha.models.enums import EngineState, HealthStatus
+from alpha.config.settings import StorageSettings
+from alpha.engines.storage.parquet import ParquetStore
+from alpha.models.enums import BarTimeframe, EngineState, HealthStatus
 from alpha.runtime_status import read_snapshot
+from alpha.timeframe_context import aggregate_monthly_history, rows_to_history_payload
 
 router = APIRouter(prefix="/runtime", tags=["runtime"])
 
@@ -43,10 +47,16 @@ def _snapshot_or_default() -> dict[str, Any]:
         "runtime_available": False,
         "quotes": {},
         "bars": {},
+        "contexts": {},
         "market_states": {},
         "setups": [],
         "orders": [],
     }
+
+
+def _parquet_store() -> ParquetStore:
+    settings = get_settings()
+    return ParquetStore(StorageSettings(parquet_root=settings.storage.parquet_root))
 
 
 @router.get("/status", response_model=RuntimeStatusResponse)
@@ -94,6 +104,48 @@ async def list_latest_bars(symbol: str | None = None) -> dict[str, Any]:
     if symbol is None:
         return bars
     return {symbol: bars.get(symbol)}
+
+
+@router.get("/bars/history")
+async def list_bar_history(
+    symbol: str,
+    timeframe: str,
+    start: date,
+    end: date,
+) -> list[dict[str, Any]]:  # type: ignore[type-arg]
+    store = _parquet_store()
+    normalized_symbol = symbol.upper()
+    normalized_timeframe = timeframe.lower()
+
+    if normalized_timeframe == "1mo":
+        table = store.read_range("bars/1d", normalized_symbol, start, end)
+        rows = aggregate_monthly_history(table.to_pylist())
+        return rows_to_history_payload(rows, "1mo")
+
+    timeframe_map = {
+        "1m": BarTimeframe.M1,
+        "1h": BarTimeframe.H1,
+        "1d": BarTimeframe.D1,
+    }
+    if normalized_timeframe not in timeframe_map:
+        return []
+
+    table = store.read_range(
+        f"bars/{timeframe_map[normalized_timeframe]}",
+        normalized_symbol,
+        start,
+        end,
+    )
+    return rows_to_history_payload(table.to_pylist(), normalized_timeframe)
+
+
+@router.get("/contexts")
+async def list_contexts(symbol: str | None = None) -> dict[str, Any]:
+    snapshot = _snapshot_or_default()
+    contexts = snapshot["contexts"]
+    if symbol is None:
+        return contexts
+    return {symbol: contexts.get(symbol)}
 
 
 @router.get("/orders")

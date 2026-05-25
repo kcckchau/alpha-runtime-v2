@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from alpha.calendar.base import SessionCalendar
@@ -40,9 +40,10 @@ from alpha.core.engine import BaseEngine
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.instruments import resolve_symbol
-from alpha.models.enums import EngineState, RuntimeMode
+from alpha.models.enums import BarTimeframe, EngineState, RuntimeMode
 from alpha.models.symbol import Symbol
 from alpha.runtime_status import write_snapshot
+from alpha.timeframe_context import build_symbol_context
 
 if TYPE_CHECKING:
     from alpha.engines.feature.engine import FeatureEngine
@@ -88,6 +89,7 @@ class BootstrapEngine(BaseEngine):
 
         self._engines: list[BaseEngine] = []
         self._status_task: asyncio.Task[None] | None = None
+        self._startup_context: dict[str, dict[str, Any]] = {}
 
     @property
     def name(self) -> str:
@@ -128,13 +130,17 @@ class BootstrapEngine(BaseEngine):
         self._write_runtime_snapshot()
 
     async def _on_start(self) -> None:
+        mode = self._settings.runtime.mode
         for engine in self._engines:
+            if mode in {RuntimeMode.LIVE, RuntimeMode.PAPER} and engine is self._live:
+                continue
             await engine.start()
 
-        mode = self._settings.runtime.mode
         if mode in {RuntimeMode.LIVE, RuntimeMode.PAPER}:
             await self._run_catchup()
             logger.info("Catch-up complete — transitioning to live feed")
+            if self._live is not None:
+                await self._live.start()
         elif mode == RuntimeMode.HISTORICAL_BACKFILL:
             await self._run_backfill()
         elif mode == RuntimeMode.REPLAY:
@@ -264,7 +270,54 @@ class BootstrapEngine(BaseEngine):
             "Running catch-up: last %d days",
             self._settings.runtime.catchup_lookback_days,
         )
-        # TODO: drive HistoricalDataEngine for catchup window, then LiveIngestionEngine
+        if self._historical is None or self._storage is None:
+            return
+
+        end = datetime.now(timezone.utc)
+        minute_start = end - timedelta(days=self._settings.runtime.catchup_lookback_days)
+        hourly_start = end - timedelta(
+            days=max(90, self._settings.historical.hourly_warmup_bars // 3)
+        )
+        daily_start = end - timedelta(
+            days=max(
+                self._settings.historical.daily_warmup_bars * 2,
+                self._settings.historical.monthly_warmup_months * 32,
+            )
+        )
+
+        for symbol in self._settings.runtime.symbols:
+            minute_bars = await self._historical.fetch_bars(
+                symbol=symbol,
+                timeframe=BarTimeframe.M1,
+                start=minute_start,
+                end=end,
+                emit=True,
+            )
+            hourly_bars = await self._historical.fetch_bars(
+                symbol=symbol,
+                timeframe=BarTimeframe.H1,
+                start=hourly_start,
+                end=end,
+                emit=False,
+            )
+            daily_bars = await self._historical.fetch_bars(
+                symbol=symbol,
+                timeframe=BarTimeframe.D1,
+                start=daily_start,
+                end=end,
+                emit=False,
+            )
+
+            for bar in hourly_bars + daily_bars:
+                await self._storage.save_bar(bar)
+
+            self._startup_context[symbol] = build_symbol_context(
+                symbol=symbol,
+                minute_bars=minute_bars,
+                hourly_bars=hourly_bars,
+                daily_bars=daily_bars,
+                calendar=self._calendar,
+            )
 
     async def _status_loop(self) -> None:
         ticks = 0
@@ -290,6 +343,7 @@ class BootstrapEngine(BaseEngine):
             "engines": [self._serialize_engine(engine) for engine in self._engines],
             "quotes": self._serialize_quotes(),
             "bars": self._serialize_bars(),
+            "contexts": self._startup_context,
             "market_states": self._serialize_market_states(),
             "setups": self._serialize_setups(),
             "orders": self._serialize_orders(),
