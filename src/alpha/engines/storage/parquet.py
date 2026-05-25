@@ -55,7 +55,7 @@ class ParquetStore:
         path.mkdir(parents=True, exist_ok=True)
         file_path = path / "data.parquet"
         if file_path.exists():
-            existing = pq.read_table(file_path)
+            existing = pq.ParquetFile(file_path).read()
             table = pa.concat_tables([existing, table], promote_options="default")
         pq.write_table(
             table,
