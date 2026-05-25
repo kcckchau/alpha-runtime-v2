@@ -231,3 +231,24 @@ No other engine needs to change — the normalized event contracts handle everyt
 | Testing | pytest + pytest-asyncio |
 | Linting | ruff |
 | Types | mypy (strict) |
+
+---
+
+## Next.js Dashboard
+
+A local operator dashboard now lives in [web/package.json](/Users/kennethchau/Projects/alpha-runtime-v2/web/package.json:1).
+
+```bash
+cd web
+/Users/kennethchau/Library/pnpm/bin/pnpm install
+NEXT_PUBLIC_ALPHA_API_BASE_URL=http://127.0.0.1:8000 /Users/kennethchau/Library/pnpm/bin/pnpm dev
+```
+
+Then open [http://127.0.0.1:3000](http://127.0.0.1:3000).
+
+The dashboard currently uses polling against:
+
+- `/runtime/status`
+- `/runtime/quotes`
+- `/runtime/contexts`
+- `/runtime/bars/history`

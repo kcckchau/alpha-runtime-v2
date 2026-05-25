@@ -8,7 +8,7 @@ Architecture:
   - Each subscription gets its own bounded asyncio.Queue
   - A dispatcher task routes published events to matching queues
   - Worker tasks drain each subscription queue and call the handler
-  - Backpressure: publish raises EventBusFullError when a queue is full
+  - Backpressure: publishers wait when a subscriber queue is full
 """
 
 from __future__ import annotations
@@ -27,10 +27,6 @@ from alpha.models.enums import EventType
 logger = logging.getLogger(__name__)
 
 HandlerT = Callable[[AnyEvent], Coroutine[Any, Any, None]]
-
-
-class EventBusFullError(Exception):
-    """Raised when a subscription queue is at capacity."""
 
 
 @dataclass
@@ -91,15 +87,14 @@ class EventBus:
         for sub in targets:
             if sub.symbol is not None and sub.symbol != event.symbol:
                 continue
-            try:
-                sub.queue.put_nowait(event)
-            except asyncio.QueueFull:
+            if sub.queue.full():
                 logger.warning(
-                    "EventBus: queue full for subscription %s (%s/%s), dropping event",
+                    "EventBus: queue full for subscription %s (%s/%s), applying backpressure",
                     sub.subscription_id,
                     event.event_type,
                     event.symbol,
                 )
+            await sub.queue.put(event)
 
     def subscribe(
         self,

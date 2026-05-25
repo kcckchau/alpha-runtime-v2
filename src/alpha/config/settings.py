@@ -19,6 +19,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from alpha.models.enums import DataSourceId, RuntimeMode
 
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 class DatabaseSettings(BaseSettings):
     host: str = "localhost"
@@ -138,7 +140,7 @@ class APISettings(BaseSettings):
 
 class AlphaSettings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_REPO_ROOT / ".env",
         env_nested_delimiter="__",
         extra="ignore",
     )
