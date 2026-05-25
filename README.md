@@ -2,6 +2,8 @@
 
 Production intraday trading runtime built in Python 3.12.
 
+See also: [ARCHITECTURE.md](ARCHITECTURE.md) for the runtime design rules and implementation priorities.
+
 ---
 
 ## Architecture Overview
