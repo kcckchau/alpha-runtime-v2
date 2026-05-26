@@ -117,3 +117,6 @@ class NYSECalendar(SessionCalendar):
         if et < close_start:
             return SessionPhase.POWER_HOUR
         return SessionPhase.CLOSING
+
+    def session_date(self, dt: datetime) -> date:
+        return dt.astimezone(_ET).date()

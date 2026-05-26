@@ -76,7 +76,15 @@ class SessionCalendar(ABC):
     def session_phase(self, dt: datetime) -> SessionPhase:
         """Classify dt into a session phase."""
 
+    @abstractmethod
+    def session_date(self, dt: datetime) -> date:
+        """Return the instrument trading-session date for dt."""
+
     def opening_range_end(self, d: date, minutes: int = 5) -> datetime:
         """End of opening range period."""
         from datetime import timedelta
         return self.session_open(d) + timedelta(minutes=minutes)
+
+    def session_key(self, dt: datetime) -> str:
+        """Stable per-session identifier suitable for in-memory state keys."""
+        return self.session_date(dt).isoformat()

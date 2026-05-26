@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 from alpha.calendar.base import SessionCalendar
 from alpha.calendar.nyse import NYSECalendar
+from alpha.calendar.resolver import calendar_for_symbol
 from alpha.config.loader import get_settings
 from alpha.config.settings import AlphaSettings
 from alpha.core.clock import Clock, ReplayClock, WallClock
@@ -331,7 +332,7 @@ class BootstrapEngine(BaseEngine):
                 minute_bars=minute_bars,
                 hourly_bars=hourly_bars,
                 daily_bars=daily_bars,
-                calendar=self._calendar,
+                calendar=calendar_for_symbol(self._registry.get(symbol)),
             )
             logger.info(
                 "Catch-up complete for %s | 1m=%d 1h=%d 1d=%d",
@@ -474,6 +475,7 @@ class BootstrapEngine(BaseEngine):
             "contexts": self._startup_context,
             "market_states": self._serialize_market_states(),
             "setups": self._serialize_setups(),
+            "setup_contexts": self._serialize_setup_contexts(),
             "orders": self._serialize_orders(),
         }
 
@@ -571,6 +573,16 @@ class BootstrapEngine(BaseEngine):
         if self._order is None:
             return []
         return [order.model_dump(mode="json") for order in self._order.get_open_orders()]
+
+    def _serialize_setup_contexts(self) -> dict[str, Any]:
+        if self._setup is None:
+            return {}
+        contexts: dict[str, Any] = {}
+        for symbol in self._settings.runtime.symbols:
+            context = self._setup.session_setup_context(symbol)
+            if context is not None:
+                contexts[symbol] = context.model_dump(mode="json")
+        return contexts
 
     def _log_runtime_summary(self) -> None:
         if self._live is None:

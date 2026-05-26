@@ -22,6 +22,7 @@ from decimal import Decimal
 from typing import Deque
 
 from alpha.calendar.base import SessionCalendar
+from alpha.calendar.resolver import calendar_for_symbol
 from alpha.config.settings import AlphaSettings
 from alpha.core.clock import Clock
 from alpha.core.engine import BaseEngine, EngineHealth
@@ -74,6 +75,7 @@ class SymbolFeatureState:
         self.is_lower_low: bool = False
         self.prev_bar_high: Decimal | None = None
         self.prev_bar_low: Decimal | None = None
+        self.session_key: str | None = None
 
     def reset_session(self) -> None:
         self.bars_since_open = 0
@@ -97,6 +99,7 @@ class SymbolFeatureState:
         self.is_lower_low = False
         self.prev_bar_high = None
         self.prev_bar_low = None
+        self.session_key = None
 
     @property
     def vwap(self) -> Decimal:
@@ -129,6 +132,7 @@ class FeatureEngine(BaseEngine):
         self._clock = clock
         self._states: dict[str, SymbolFeatureState] = {}
         self._snapshots: dict[str, BarSnapshot] = {}
+        self._symbol_calendars: dict[str, SessionCalendar] = {}
         self._snapshots_emitted: int = 0
 
     @property
@@ -139,6 +143,7 @@ class FeatureEngine(BaseEngine):
 
     async def _on_initialize(self) -> None:
         for sym in self._registry.active():
+            self._symbol_calendars[sym.ticker] = calendar_for_symbol(sym)
             self._states[sym.ticker] = SymbolFeatureState(
                 sym.ticker, self._settings.runtime.orb_minutes
             )
@@ -184,19 +189,26 @@ class FeatureEngine(BaseEngine):
 
     def _get_or_create(self, ticker: str) -> SymbolFeatureState:
         if ticker not in self._states:
+            self._symbol_calendars[ticker] = calendar_for_symbol(self._registry.get(ticker))
             self._states[ticker] = SymbolFeatureState(
                 ticker, self._settings.runtime.orb_minutes
             )
         return self._states[ticker]
 
     def _update_state(self, state: SymbolFeatureState, bar: BarEvent) -> None:
-        phase = self._calendar.session_phase(bar.timestamp)
-        bar_date = bar.timestamp.date()
+        calendar = self._calendar_for_symbol(bar.symbol)
+        phase = calendar.session_phase(bar.timestamp)
+        session_key = calendar.session_key(bar.timestamp)
+        session_date = calendar.session_date(bar.timestamp)
 
-        if state.session_date is None or state.session_date.date() != bar_date:
-            if phase == SessionPhase.OPENING_RANGE:
-                state.reset_session()
-                state.session_date = bar.timestamp
+        if state.session_key != session_key:
+            state.reset_session()
+            state.session_key = session_key
+            state.session_date = datetime.combine(
+                session_date,
+                datetime.min.time(),
+                tzinfo=bar.timestamp.tzinfo,
+            )
 
         state.bars.append(bar)
 
@@ -206,7 +218,7 @@ class FeatureEngine(BaseEngine):
             typical = (bar.high + bar.low + bar.close) / 3
             state.cumulative_vwap_num += typical * bar.volume
 
-            orb_end = self._calendar.opening_range_end(bar_date, state.orb_minutes)
+            orb_end = calendar.opening_range_end(session_date, state.orb_minutes)
             if not state.orb_established and bar.timestamp < orb_end:
                 if state.orb_high is None or bar.high > state.orb_high:
                     state.orb_high = bar.high
@@ -346,7 +358,7 @@ class FeatureEngine(BaseEngine):
             orb_range=(state.orb_high - state.orb_low)
             if state.orb_high and state.orb_low else None,
             orb_state=orb_state,
-            session_phase=self._calendar.session_phase(bar.timestamp),
+            session_phase=self._calendar_for_symbol(bar.symbol).session_phase(bar.timestamp),
             bars_since_open=state.bars_since_open,
             ema_9=state.ema_9,
             ema_20=state.ema_20,
@@ -394,3 +406,6 @@ class FeatureEngine(BaseEngine):
         if bar.close < state.orb_low:
             return ORBState.BREAKOUT_DOWN
         return ORBState.INSIDE
+
+    def _calendar_for_symbol(self, ticker: str) -> SessionCalendar:
+        return self._symbol_calendars.get(ticker, self._calendar)
