@@ -1,8 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { LineStyle } from "lightweight-charts";
 import { CandlesChart } from "@/components/candles-chart";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 type EngineStatus = {
   name: string;
@@ -42,9 +44,23 @@ type BarHistoryRow = {
 
 type SymbolContext = {
   symbol: string;
-  bar_counts: Record<string, number>;
-  ema_levels: Record<string, Record<string, string | null>>;
-  levels: Record<string, string | null>;
+  bar_counts?: Record<string, number>;
+  ema_levels?: Record<string, Record<string, string | null>>;
+  levels?: Record<string, string | null>;
+  // Feature snapshot
+  relative_volume?: number | null;
+  atr_14?: number | null;
+  vwap_deviation_pct?: number | null;
+  rs_vs_spy?: number | null;
+  vwap?: number | null;
+  // Market state
+  trend?: string | null;
+  trend_strength?: number | null;
+  vwap_regime?: string | null;
+  orb_state?: string | null;
+  structure_score?: number | null;
+  confidence?: number | null;
+  session_phase?: string | null;
 };
 
 type SetupRow = {
@@ -53,6 +69,7 @@ type SetupRow = {
   setup_type: string;
   state: string;
   grade: string | null;
+  score?: number | null;
   entry_trigger: string | null;
   stop_reference: string | null;
   target_reference: string | null;
@@ -62,57 +79,74 @@ type SetupRow = {
   conditions_missing: string[];
 };
 
-const SETUP_LABELS: Record<string, string> = {
-  fake_breakdown: "Fake Breakdown",
-  hod_breakout: "HOD Breakout",
-  trend_pullback: "Trend Pullback",
-  vwap_reclaim: "VWAP Reclaim",
-  orb_breakout: "ORB Breakout",
+type RiskState = {
+  realized_pnl?: number | null;
+  unrealized_pnl?: number | null;
+  risk_consumed_pct?: number | null;
+  max_drawdown?: number | null;
+  is_halted?: boolean | null;
 };
 
-function formatSetupType(type: string): string {
-  return SETUP_LABELS[type] ?? type.replaceAll("_", " ");
-}
+// ─── Constants ────────────────────────────────────────────────────────────────
 
 const API_BASE =
   process.env.NEXT_PUBLIC_ALPHA_API_BASE_URL?.replace(/\/$/, "") ?? "http://127.0.0.1:8000";
 
-const TIMEFRAME_COLORS: Record<string, string> = {
-  "1h": "#0f6c5c",
-  "1d": "#b8892d",
-  "1mo": "#6b4da7",
+const TIMEFRAMES = ["1s", "1m", "5m", "15m", "1h"] as const;
+type Timeframe = (typeof TIMEFRAMES)[number];
+
+// ─── Shared style constants ───────────────────────────────────────────────────
+
+const S = {
+  panel: {
+    background: "#111111",
+    border: "0.5px solid rgba(255,255,255,0.06)",
+    borderRadius: 6,
+  } as React.CSSProperties,
+  panelHd: {
+    padding: "7px 12px",
+    borderBottom: "0.5px solid rgba(255,255,255,0.06)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+  } as React.CSSProperties,
+  panelLbl: {
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: 10,
+    fontWeight: 500,
+    letterSpacing: "0.12em",
+    textTransform: "uppercase" as const,
+    color: "rgba(255,255,255,0.4)",
+  } as React.CSSProperties,
+  mono: { fontFamily: "'IBM Plex Mono', monospace" } as React.CSSProperties,
 };
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function fetchJson<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
-  if (!response.ok) {
-    throw new Error(`Request failed for ${path}: ${response.status}`);
-  }
+  if (!response.ok) throw new Error(`${path}: ${response.status}`);
   return (await response.json()) as T;
 }
 
 function formatPrice(value: string | number | null | undefined): string {
-  if (value === null || value === undefined) {
-    return "—";
-  }
+  if (value === null || value === undefined) return "—";
   const price = Number(value);
-  if (!Number.isFinite(price)) {
-    return "—";
-  }
+  if (!Number.isFinite(price)) return "—";
   return price.toLocaleString(undefined, {
     minimumFractionDigits: price >= 1000 ? 1 : 2,
     maximumFractionDigits: 2,
   });
 }
 
-function levelLabel(timeframe: string, period: string): string {
-  return `${timeframe.toUpperCase()} EMA ${period}`;
+function formatPnl(value: number | null | undefined): string {
+  if (value === null || value === undefined) return "—";
+  return (value >= 0 ? "+" : "−") + "$" + Math.abs(value).toFixed(0);
 }
 
 function historyStartDate(symbol: string): string {
-  const now = new Date();
-  const lookbackDays = symbol === "MNQ" ? 7 : 5;
-  const start = new Date(now.getTime() - lookbackDays * 24 * 60 * 60 * 1000);
+  const lookbackDays = symbol.includes("MNQ") ? 7 : 5;
+  const start = new Date(Date.now() - lookbackDays * 864e5);
   return start.toISOString().slice(0, 10);
 }
 
@@ -120,15 +154,377 @@ function todayDate(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+function gradeColor(grade: string | null): string {
+  if (grade === "SSS") return "#fbbf24";
+  if (grade === "A+") return "#22c55e";
+  if (grade === "A") return "#60a5fa";
+  return "rgba(255,255,255,0.4)";
+}
+
+function gradeBg(grade: string | null): string {
+  if (grade === "SSS") return "rgba(251,191,36,0.15)";
+  if (grade === "A+") return "rgba(34,197,94,0.15)";
+  if (grade === "A") return "rgba(96,165,250,0.15)";
+  return "rgba(255,255,255,0.08)";
+}
+
+function stateColor(state: string): string {
+  if (state === "confirmed") return "#22c55e";
+  if (state === "forming") return "#fbbf24";
+  if (state === "triggered") return "#60a5fa";
+  if (state === "failed" || state === "invalidated" || state === "expired") return "#ef4444";
+  return "rgba(255,255,255,0.4)";
+}
+
+function trendColor(trend: string | null | undefined): string {
+  if (!trend) return "rgba(255,255,255,0.88)";
+  if (trend.includes("up")) return "#22c55e";
+  if (trend.includes("down")) return "#ef4444";
+  return "#fbbf24";
+}
+
+function regimeColor(regime: string | null | undefined): string {
+  if (!regime) return "rgba(255,255,255,0.88)";
+  if (regime === "above" || regime === "reclaiming") return "#fbbf24";
+  if (regime === "rejecting") return "#ef4444";
+  return "rgba(255,255,255,0.88)";
+}
+
+// ─── Primitive components ─────────────────────────────────────────────────────
+
+function Dot({ color }: { color: string }) {
+  return (
+    <span
+      style={{ display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: color }}
+    />
+  );
+}
+
+type PillColor = "green" | "amber" | "red" | "blue" | "gray";
+
+function Pill({ color, children }: { color: PillColor; children: React.ReactNode }) {
+  const map: Record<PillColor, { bg: string; border: string; color: string }> = {
+    green:  { bg: "rgba(34,197,94,0.1)",   border: "rgba(34,197,94,0.4)",   color: "#22c55e" },
+    amber:  { bg: "rgba(251,191,36,0.1)",  border: "rgba(251,191,36,0.4)",  color: "#fbbf24" },
+    red:    { bg: "rgba(239,68,68,0.1)",   border: "rgba(239,68,68,0.4)",   color: "#ef4444" },
+    blue:   { bg: "rgba(96,165,250,0.1)",  border: "rgba(96,165,250,0.4)",  color: "#60a5fa" },
+    gray:   { bg: "rgba(255,255,255,0.06)", border: "rgba(255,255,255,0.12)", color: "rgba(255,255,255,0.4)" },
+  };
+  const t = map[color];
+  return (
+    <span
+      style={{
+        display: "inline-flex", alignItems: "center", gap: 4,
+        padding: "2px 8px", borderRadius: 100,
+        fontSize: 10, ...S.mono, fontWeight: 500, letterSpacing: "0.05em",
+        border: `0.5px solid ${t.border}`,
+        background: t.bg, color: t.color,
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+function MsRow({
+  label, value, valueColor, last,
+}: {
+  label: string; value: string; valueColor?: string; last?: boolean;
+}) {
+  return (
+    <div
+      style={{
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        padding: "5px 0",
+        borderBottom: last ? "none" : "0.5px solid rgba(255,255,255,0.06)",
+      }}
+    >
+      <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>{label}</span>
+      <span style={{ ...S.mono, fontSize: 11, fontWeight: 500, color: valueColor ?? "rgba(255,255,255,0.88)" }}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function LegendItem({ color, label, dashed }: { color: string; label: string; dashed?: boolean }) {
+  return (
+    <span style={{ display: "flex", alignItems: "center", gap: 4, ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.4)" }}>
+      <span
+        style={{
+          width: 16, height: 2, borderRadius: 1,
+          background: dashed ? "transparent" : color,
+          borderTop: dashed ? `2px dashed ${color}` : "none",
+        }}
+      />
+      {label}
+    </span>
+  );
+}
+
+// ─── Sidebar panels ───────────────────────────────────────────────────────────
+
+function SetupItem({ setup, past }: { setup: SetupRow; past?: boolean }) {
+  const borderColor = past ? "rgba(255,255,255,0.1)" : gradeColor(setup.grade);
+  const stateCol = stateColor(setup.state);
+  const time = new Date(setup.detected_at).toLocaleTimeString("en-US", {
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  });
+
+  return (
+    <div
+      style={{
+        borderLeft: `2px solid ${borderColor}`,
+        padding: "7px 9px", marginBottom: 5,
+        borderRadius: "0 4px 4px 0",
+        background: "rgba(255,255,255,0.03)",
+        opacity: past ? 0.7 : 1,
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+        <span style={{ ...S.mono, fontSize: 10, fontWeight: 500 }}>
+          {setup.setup_type.toUpperCase()}
+        </span>
+        {setup.grade && (
+          <span
+            style={{
+              ...S.mono, fontSize: 9, fontWeight: 500,
+              padding: "1px 5px", borderRadius: 3,
+              background: gradeBg(setup.grade), color: gradeColor(setup.grade),
+            }}
+          >
+            {setup.grade}{setup.score != null ? `·${setup.score}` : ""}
+          </span>
+        )}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 3 }}>
+        <span
+          style={{
+            display: "inline-flex", alignItems: "center",
+            padding: "1px 5px", borderRadius: 100,
+            fontSize: 9, ...S.mono, fontWeight: 500,
+            border: `0.5px solid ${stateCol}55`,
+            background: `${stateCol}18`, color: stateCol,
+          }}
+        >
+          {setup.state.toUpperCase()}
+        </span>
+        <span style={{ fontSize: 9, color: "rgba(255,255,255,0.4)", ...S.mono }}>{time}</span>
+      </div>
+      {!past && setup.entry_trigger && (
+        <div style={{ display: "flex", gap: 8 }}>
+          <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.4)" }}>
+            E <span style={{ color: "rgba(255,255,255,0.88)" }}>{formatPrice(setup.entry_trigger)}</span>
+          </span>
+          <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.4)" }}>
+            SL <span style={{ color: "#ef4444" }}>{formatPrice(setup.stop_reference)}</span>
+          </span>
+          <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.4)" }}>
+            TP <span style={{ color: "#22c55e" }}>{formatPrice(setup.target_reference)}</span>
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SetupsPanel({ setups }: { setups: SetupRow[] }) {
+  const active = setups.filter((s) => !["failed", "invalidated", "expired"].includes(s.state));
+  const past = setups
+    .filter((s) => ["failed", "invalidated", "expired"].includes(s.state))
+    .slice(0, 3);
+
+  return (
+    <div style={S.panel}>
+      <div style={S.panelHd}>
+        <span style={S.panelLbl}>Active Setups</span>
+        {active.length > 0 && <Pill color="green">{active.length}</Pill>}
+      </div>
+      <div style={{ padding: 8 }}>
+        {active.length === 0 ? (
+          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", ...S.mono, padding: "6px 0" }}>
+            No active setups
+          </div>
+        ) : (
+          active.map((s) => <SetupItem key={s.setup_id} setup={s} />)
+        )}
+        {past.length > 0 && (
+          <>
+            <div style={{ height: 0.5, background: "rgba(255,255,255,0.06)", margin: "6px 0" }} />
+            <span style={{ ...S.panelLbl, display: "block", marginBottom: 6 }}>Past</span>
+            {past.map((s) => <SetupItem key={s.setup_id} setup={s} past />)}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FeaturesPanel({ context }: { context: SymbolContext | null }) {
+  const rvol = context?.relative_volume;
+  const atr = context?.atr_14;
+  const vwapDev = context?.vwap_deviation_pct;
+  const rs = context?.rs_vs_spy;
+
+  const items = [
+    {
+      label: "RVOL",
+      value: rvol != null ? `${rvol.toFixed(2)}×` : "—",
+      color: rvol != null && rvol > 1.5 ? "#22c55e" : "rgba(255,255,255,0.88)",
+    },
+    {
+      label: "ATR(14)",
+      value: atr != null ? atr.toFixed(2) : "—",
+      color: "rgba(255,255,255,0.88)",
+    },
+    {
+      label: "VWAP DEV",
+      value: vwapDev != null ? ((vwapDev >= 0 ? "+" : "") + vwapDev.toFixed(2) + "%") : "—",
+      color: vwapDev != null ? (vwapDev >= 0 ? "#fbbf24" : "#ef4444") : "rgba(255,255,255,0.88)",
+    },
+    {
+      label: "RS vs SPY",
+      value: rs != null ? ((rs >= 0 ? "+" : "") + rs.toFixed(2)) : "—",
+      color: rs != null ? (rs >= 0 ? "#22c55e" : "#ef4444") : "rgba(255,255,255,0.88)",
+    },
+  ];
+
+  return (
+    <div style={S.panel}>
+      <div style={S.panelHd}>
+        <span style={S.panelLbl}>Features</span>
+      </div>
+      <div style={{ padding: 8, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+        {items.map(({ label, value, color }) => (
+          <div key={label} style={{ background: "rgba(255,255,255,0.03)", borderRadius: 5, padding: "6px 8px" }}>
+            <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", ...S.mono, marginBottom: 2 }}>{label}</div>
+            <div style={{ ...S.mono, fontSize: 13, fontWeight: 500, color }}>{value}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MarketStatePanel({ context }: { context: SymbolContext | null }) {
+  const trend = context?.trend;
+  const regime = context?.vwap_regime;
+  const orb = context?.orb_state;
+  const structure = context?.structure_score;
+  const confidence = context?.confidence;
+
+  return (
+    <div style={S.panel}>
+      <div style={S.panelHd}>
+        <span style={S.panelLbl}>Market State</span>
+      </div>
+      <div style={{ padding: "4px 12px 8px" }}>
+        <MsRow label="Trend" value={(trend ?? "—").toUpperCase()} valueColor={trendColor(trend)} />
+        <MsRow label="VWAP regime" value={(regime ?? "—").toUpperCase()} valueColor={regimeColor(regime)} />
+        <MsRow
+          label="ORB state"
+          value={(orb ?? "—").toUpperCase()}
+          valueColor={orb?.includes("breakout") ? "#22c55e" : undefined}
+        />
+        <MsRow
+          label="Structure"
+          value={structure != null ? structure.toFixed(2) : "—"}
+          valueColor={structure != null && structure > 0.7 ? "#22c55e" : undefined}
+        />
+        <MsRow
+          label="Confidence"
+          value={confidence != null ? confidence.toFixed(2) : "—"}
+          last
+        />
+      </div>
+    </div>
+  );
+}
+
+function RiskPanel({ risk }: { risk: RiskState | null }) {
+  const isHalted = risk?.is_halted ?? false;
+  const pnl = risk?.realized_pnl;
+  const unreal = risk?.unrealized_pnl;
+  const riskUsed = risk?.risk_consumed_pct;
+  const drawdown = risk?.max_drawdown;
+
+  return (
+    <div style={S.panel}>
+      <div style={S.panelHd}>
+        <span style={S.panelLbl}>Risk</span>
+      </div>
+      <div style={{ padding: "4px 12px 8px" }}>
+        <MsRow
+          label="Real P&L"
+          value={pnl != null ? formatPnl(pnl) : "—"}
+          valueColor={pnl != null ? (pnl >= 0 ? "#22c55e" : "#ef4444") : undefined}
+        />
+        <MsRow
+          label="Unreal"
+          value={unreal != null ? formatPnl(unreal) : "—"}
+          valueColor={unreal != null ? (unreal >= 0 ? "#22c55e" : "#fbbf24") : undefined}
+        />
+        <MsRow
+          label="Risk used"
+          value={riskUsed != null ? `${(riskUsed * 100).toFixed(0)}%` : "—"}
+          valueColor={riskUsed != null && riskUsed > 0.7 ? "#ef4444" : "#fbbf24"}
+        />
+        <MsRow
+          label="Drawdown"
+          value={drawdown != null ? formatPnl(drawdown) : "—"}
+          valueColor="#ef4444"
+          last
+        />
+        <div
+          style={{
+            marginTop: 8, display: "flex", alignItems: "center", gap: 5, padding: "5px 8px",
+            background: isHalted ? "rgba(239,68,68,0.07)" : "rgba(34,197,94,0.07)",
+            border: `0.5px solid ${isHalted ? "rgba(239,68,68,0.25)" : "rgba(34,197,94,0.25)"}`,
+            borderRadius: 5,
+          }}
+        >
+          <span
+            style={{
+              ...S.mono, fontSize: 10, fontWeight: 500, letterSpacing: "0.05em",
+              color: isHalted ? "#ef4444" : "#22c55e",
+            }}
+          >
+            {isHalted ? "RISK HALTED" : "TRADING ACTIVE"}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Main Dashboard ───────────────────────────────────────────────────────────
+
 export function Dashboard() {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState("MNQ");
+  const [selectedTimeframe, setSelectedTimeframe] = useState<Timeframe>("1m");
   const [contexts, setContexts] = useState<Record<string, SymbolContext | null>>({});
   const [quotes, setQuotes] = useState<Record<string, QuoteRow | null>>({});
   const [bars, setBars] = useState<BarHistoryRow[]>([]);
   const [setups, setSetups] = useState<SetupRow[]>([]);
+  const [riskState, setRiskState] = useState<RiskState | null>(null);
+  const [clock, setClock] = useState("--:--:-- ET");
   const [error, setError] = useState<string | null>(null);
 
+  // ET clock — ticks every second
+  useEffect(() => {
+    function tick() {
+      const et = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+      setClock(
+        `${String(et.getHours()).padStart(2, "0")}:${String(et.getMinutes()).padStart(2, "0")}:${String(et.getSeconds()).padStart(2, "0")} ET`
+      );
+    }
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Data polling
   useEffect(() => {
     let cancelled = false;
 
@@ -143,14 +539,15 @@ export function Dashboard() {
           fetchJson<Record<string, SymbolContext | null>>(`/runtime/contexts?symbol=${symbol}`),
           fetchJson<Record<string, QuoteRow | null>>(`/runtime/quotes?symbol=${symbol}`),
           fetchJson<BarHistoryRow[]>(
-            `/runtime/bars/history?symbol=${symbol}&timeframe=1m&start=${historyStartDate(symbol)}&end=${todayDate()}`,
+            `/runtime/bars/history?symbol=${symbol}&timeframe=${selectedTimeframe}&start=${historyStartDate(symbol)}&end=${todayDate()}`
           ),
           fetchJson<SetupRow[]>(`/runtime/setups?symbol=${symbol}`),
         ]);
 
-        if (cancelled) {
-          return;
-        }
+        // Optional endpoint — silently ignore if not yet implemented
+        const riskData = await fetchJson<RiskState>(`/runtime/risk?symbol=${symbol}`).catch(() => null);
+
+        if (cancelled) return;
 
         setStatus(statusData);
         setSelectedSymbol(symbol);
@@ -158,80 +555,102 @@ export function Dashboard() {
         setQuotes((prev) => ({ ...prev, ...quoteData }));
         setBars(barData);
         setSetups(setupData);
+        setRiskState(riskData);
         setError(null);
       } catch (err) {
-        if (cancelled) {
-          return;
-        }
-        setError(err instanceof Error ? err.message : "Unknown dashboard error");
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : "Unknown error");
       }
     }
 
     void loadAll();
-    const interval = window.setInterval(() => void loadAll(), 15000);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [selectedSymbol]);
+    const interval = setInterval(() => void loadAll(), 15000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [selectedSymbol, selectedTimeframe]);
 
   const currentContext = contexts[selectedSymbol] ?? null;
   const currentQuote = quotes[selectedSymbol] ?? null;
 
+  // Price / change from last two bars
+  const lastBar = bars[bars.length - 1];
+  const prevBar = bars[bars.length - 2];
+  const lastPrice = lastBar ? Number(lastBar.close) : null;
+  const prevClose = prevBar ? Number(prevBar.close) : null;
+  const pctChange =
+    lastPrice !== null && prevClose !== null && prevClose !== 0
+      ? ((lastPrice - prevClose) / prevClose) * 100
+      : null;
+
+  const activeSetupCount = setups.filter(
+    (s) => !["failed", "invalidated", "expired"].includes(s.state)
+  ).length;
+
+  const sessionPhase =
+    currentContext?.session_phase?.toUpperCase() ??
+    status?.runtime_state?.toUpperCase() ??
+    "—";
+
+  // Topbar pill colors
+  const modeStr = (status?.mode ?? "PAPER").toUpperCase();
+  const modePillColor: PillColor =
+    modeStr === "LIVE" ? "red" : modeStr === "PAPER" ? "green" : "blue";
+  const modeDotColor =
+    modePillColor === "green" ? "#22c55e" : modePillColor === "red" ? "#ef4444" : "#60a5fa";
+  const sessionPillColor: PillColor =
+    ["OPENING_RANGE", "EARLY", "POWER_HOUR"].some((p) => sessionPhase.includes(p.replace("_", "")))
+      ? "amber"
+      : "gray";
+  const sessionDotColor = sessionPillColor === "amber" ? "#fbbf24" : "rgba(255,255,255,0.4)";
+
+  // Chart overlay lines
   const overlayLines = useMemo(() => {
     const overlays: Array<{ label: string; price: number; color: string; style?: number }> = [];
 
-    if (currentContext) {
-      for (const [timeframe, levels] of Object.entries(currentContext.ema_levels)) {
+    if (currentContext?.vwap) {
+      overlays.push({ label: "VWAP", price: currentContext.vwap, color: "#fbbf24" });
+    }
+
+    if (currentContext?.ema_levels) {
+      for (const [tf, levels] of Object.entries(currentContext.ema_levels)) {
+        const color = tf === "1h" ? "#60a5fa" : tf === "1d" ? "#fbbf24" : "#a78bfa";
         for (const [period, value] of Object.entries(levels)) {
           if (!value) continue;
           overlays.push({
-            label: levelLabel(timeframe, period),
+            label: `${tf.toUpperCase()} EMA${period}`,
             price: Number(value),
-            color: TIMEFRAME_COLORS[timeframe] ?? "#444",
-            style: timeframe === "1mo" ? LineStyle.Dashed : LineStyle.Solid,
+            color,
+            style: tf === "1mo" ? LineStyle.Dashed : LineStyle.Solid,
           });
         }
       }
+    }
+
+    if (currentContext?.levels) {
       for (const [label, value] of Object.entries(currentContext.levels)) {
         if (!value) continue;
         overlays.push({
           label: label.replaceAll("_", " "),
           price: Number(value),
-          color: label.includes("high") ? "#b64b33" : "#3756a6",
+          color: label.includes("high") ? "#ef4444" : "#60a5fa",
           style: LineStyle.LargeDashed,
         });
       }
     }
 
-    // Setup price levels — entry / stop / target for CONFIRMED setups
     for (const s of setups) {
-      if (s.state !== "confirmed") continue;
-      const label = formatSetupType(s.setup_type);
+      if (s.state !== "confirmed" && s.state !== "triggered") continue;
       if (s.entry_trigger) {
         overlays.push({
-          label: `${label} entry`,
+          label: `${s.setup_type.replace(/_/g, " ")} E`,
           price: Number(s.entry_trigger),
-          color: "#b8892d",
-          style: LineStyle.Solid,
+          color: gradeColor(s.grade),
         });
       }
       if (s.stop_reference) {
-        overlays.push({
-          label: "stop",
-          price: Number(s.stop_reference),
-          color: "#bd4f36",
-          style: LineStyle.Dashed,
-        });
+        overlays.push({ label: "SL", price: Number(s.stop_reference), color: "#ef4444", style: LineStyle.Dashed });
       }
       if (s.target_reference) {
-        overlays.push({
-          label: "target",
-          price: Number(s.target_reference),
-          color: "#157f6b",
-          style: LineStyle.Dashed,
-        });
+        overlays.push({ label: "TP", price: Number(s.target_reference), color: "#22c55e", style: LineStyle.Dashed });
       }
     }
 
@@ -239,396 +658,192 @@ export function Dashboard() {
   }, [currentContext, setups]);
 
   return (
-    <main style={{ padding: "24px" }}>
-      <section
+    <div
+      style={{
+        fontFamily: "'IBM Plex Sans', sans-serif",
+        fontSize: 13,
+        color: "rgba(255,255,255,0.88)",
+        background: "#141414",
+        minHeight: "100vh",
+        padding: 8,
+      }}
+    >
+      {/* ── Topbar ── */}
+      <div
         style={{
-          maxWidth: 1440,
-          margin: "0 auto",
-          display: "grid",
-          gap: 20,
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          padding: "7px 12px", background: "#111111",
+          border: "0.5px solid rgba(255,255,255,0.06)", borderRadius: 6, marginBottom: 8,
         }}
       >
-        <header
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ ...S.mono, fontSize: 13, fontWeight: 500, letterSpacing: "0.06em" }}>
+            ALPHA<span style={{ color: "#22c55e" }}>▸</span>RUNTIME
+          </span>
+          <Pill color={modePillColor}>
+            <Dot color={modeDotColor} />
+            {modeStr}
+          </Pill>
+          <Pill color={sessionPillColor}>
+            <Dot color={sessionDotColor} />
+            {sessionPhase}
+          </Pill>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <select
+            value={selectedSymbol}
+            onChange={(e) => setSelectedSymbol(e.target.value)}
+            style={{
+              background: "rgba(255,255,255,0.06)",
+              border: "0.5px solid rgba(255,255,255,0.12)",
+              color: "rgba(255,255,255,0.88)",
+              borderRadius: 4, padding: "2px 8px",
+              ...S.mono, fontSize: 10, letterSpacing: "0.05em",
+              cursor: "pointer",
+            }}
+          >
+            {(status?.symbols ?? ["MNQ"]).map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+          <Pill color="green">{activeSetupCount} setups</Pill>
+          <Pill color="gray">{clock}</Pill>
+        </div>
+      </div>
+
+      {/* ── Error banner ── */}
+      {error && (
+        <div
           style={{
-            background: "var(--panel)",
-            border: "1px solid var(--line)",
-            borderRadius: 24,
-            boxShadow: "var(--shadow)",
-            padding: 24,
+            background: "rgba(239,68,68,0.1)", border: "0.5px solid rgba(239,68,68,0.4)",
+            color: "#ef4444", borderRadius: 6, padding: "8px 12px", marginBottom: 8,
+            ...S.mono, fontSize: 11,
           }}
         >
+          {error}
+        </div>
+      )}
+
+      {/* ── Main layout: chart + sidebar ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 220px", gap: 8 }}>
+
+        {/* Chart panel */}
+        <div style={{ ...S.panel, overflow: "hidden" }}>
+          {/* Chart header */}
           <div
             style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "end",
-              gap: 16,
+              display: "flex", alignItems: "center", gap: 8,
+              padding: "8px 12px",
+              borderBottom: "0.5px solid rgba(255,255,255,0.06)",
               flexWrap: "wrap",
             }}
           >
-            <div>
-              <div style={{ color: "var(--muted)", fontSize: 13, letterSpacing: "0.12em" }}>
-                ALPHA RUNTIME V2
-              </div>
-              <h1 style={{ margin: "8px 0 4px", fontSize: "clamp(2rem, 4vw, 3.4rem)" }}>
-                Multi-timeframe operator board
-              </h1>
-              <p style={{ margin: 0, color: "var(--muted)", maxWidth: 760 }}>
-                Startup context, intraday history, and live quote snapshots in one place so we can
-                verify catch-up behavior before layering in more strategy logic.
-              </p>
-            </div>
-
-            <label
-              style={{
-                display: "grid",
-                gap: 8,
-                color: "var(--muted)",
-                fontSize: 13,
-                minWidth: 180,
-              }}
-            >
-              Active symbol
-              <select
-                value={selectedSymbol}
-                onChange={(event) => setSelectedSymbol(event.target.value)}
+            <span style={{ ...S.mono, fontSize: 15, fontWeight: 500 }}>{selectedSymbol}</span>
+            <span style={{ ...S.mono, fontSize: 15 }}>{formatPrice(lastPrice)}</span>
+            {pctChange !== null && (
+              <span style={{ ...S.mono, fontSize: 12, color: pctChange >= 0 ? "#22c55e" : "#ef4444" }}>
+                {pctChange >= 0 ? "+" : ""}{pctChange.toFixed(2)}%
+              </span>
+            )}
+            <div style={{ width: 0.5, height: 14, background: "rgba(255,255,255,0.06)", margin: "0 4px" }} />
+            {TIMEFRAMES.map((tf) => (
+              <button
+                key={tf}
+                onClick={() => setSelectedTimeframe(tf)}
                 style={{
-                  borderRadius: 14,
-                  border: "1px solid var(--line)",
-                  padding: "10px 14px",
-                  background: "var(--panel-strong)",
-                  color: "var(--ink)",
-                  fontSize: 16,
+                  ...S.mono, fontSize: 11, fontWeight: 500,
+                  padding: "3px 8px", borderRadius: 4, cursor: "pointer",
+                  border: "0.5px solid rgba(255,255,255,0.06)",
+                  background: tf === selectedTimeframe ? "rgba(255,255,255,0.08)" : "transparent",
+                  color: tf === selectedTimeframe ? "rgba(255,255,255,0.88)" : "rgba(255,255,255,0.4)",
                 }}
               >
-                {(status?.symbols ?? ["MNQ"]).map((symbol) => (
-                  <option key={symbol} value={symbol}>
-                    {symbol}
-                  </option>
-                ))}
-              </select>
-            </label>
+                {tf}
+              </button>
+            ))}
+            <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
+              <LegendItem color="#fbbf24" label="VWAP" />
+              <LegendItem color="#60a5fa" label="EMA" dashed />
+            </div>
           </div>
-        </header>
 
-        {error ? (
-          <div
-            style={{
-              background: "rgba(182, 75, 51, 0.1)",
-              border: "1px solid rgba(182, 75, 51, 0.18)",
-              color: "var(--danger)",
-              borderRadius: 20,
-              padding: 18,
-            }}
-          >
-            {error}
-          </div>
-        ) : null}
+          {/* Candlestick chart */}
+          <CandlesChart bars={bars} overlays={overlayLines} />
 
-        <section
-          style={{
-            display: "grid",
-            gridTemplateColumns: "minmax(0, 2.1fr) minmax(320px, 0.9fr)",
-            gap: 20,
-          }}
-        >
-          <article
-            style={{
-              background: "var(--panel)",
-              border: "1px solid var(--line)",
-              borderRadius: 24,
-              boxShadow: "var(--shadow)",
-              padding: 20,
-            }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div>
-                <h2 style={{ margin: 0, fontSize: 24 }}>{selectedSymbol} intraday chart</h2>
-                <p style={{ margin: "6px 0 0", color: "var(--muted)" }}>
-                  1-minute history with current daily, hourly, and monthly levels overlaid.
-                </p>
-              </div>
-              <div
-                style={{
-                  background: "var(--accent-soft)",
-                  color: "var(--accent)",
-                  borderRadius: 999,
-                  padding: "8px 12px",
-                  fontSize: 13,
-                }}
-              >
-                Polling every 15s
-              </div>
-            </div>
-            <div style={{ marginTop: 18 }}>
-              <CandlesChart bars={bars} overlays={overlayLines} />
-            </div>
-          </article>
-
-          <aside style={{ display: "grid", gap: 20 }}>
-            <Panel title="Runtime">
-              <KeyValue label="Mode" value={status?.mode ?? "—"} />
-              <KeyValue label="State" value={status?.runtime_state ?? "—"} />
-              <KeyValue
-                label="Updated"
-                value={status?.updated_at ? new Date(status.updated_at).toLocaleString() : "—"}
-              />
-              <KeyValue
-                label="API snapshot"
-                value={status?.runtime_available ? "available" : "not ready"}
-              />
-            </Panel>
-
-            <Panel title="Quote">
-              <KeyValue label="Bid" value={formatPrice(currentQuote?.bid_price)} />
-              <KeyValue label="Ask" value={formatPrice(currentQuote?.ask_price)} />
-              <KeyValue label="Bid size" value={currentQuote?.bid_size?.toString() ?? "—"} />
-              <KeyValue label="Ask size" value={currentQuote?.ask_size?.toString() ?? "—"} />
-              <KeyValue
-                label="Quote time"
-                value={currentQuote?.timestamp ? new Date(currentQuote.timestamp).toLocaleString() : "—"}
-              />
-            </Panel>
-
-            <Panel title="Session levels">
-              {Object.entries(currentContext?.levels ?? {}).map(([label, value]) => (
-                <KeyValue key={label} label={label.replaceAll("_", " ")} value={formatPrice(value)} />
-              ))}
-            </Panel>
-          </aside>
-        </section>
-
-        <Panel title="SSS Setups">
-          {setups.length === 0 ? (
-            <p style={{ color: "var(--muted)", margin: 0 }}>No active setups for {selectedSymbol}.</p>
-          ) : (
-            <div style={{ display: "grid", gap: 12 }}>
-              {setups.map((s) => (
-                <SetupCard key={s.setup_id} setup={s} />
-              ))}
-            </div>
-          )}
-        </Panel>
-
-        <section
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1.1fr 0.9fr",
-            gap: 20,
-          }}
-        >
-          <Panel title="EMA context">
+          {/* Quote bar */}
+          {currentQuote && (
             <div
               style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                gap: 16,
+                display: "flex", gap: 16, padding: "6px 12px",
+                borderTop: "0.5px solid rgba(255,255,255,0.06)",
+                ...S.mono, fontSize: 11,
               }}
             >
-              {Object.entries(currentContext?.ema_levels ?? {}).map(([timeframe, levels]) => (
-                <div
-                  key={timeframe}
-                  style={{
-                    background: "var(--panel-strong)",
-                    border: "1px solid var(--line)",
-                    borderRadius: 18,
-                    padding: 16,
-                  }}
-                >
-                  <div
-                    style={{
-                      fontSize: 13,
-                      letterSpacing: "0.1em",
-                      color: TIMEFRAME_COLORS[timeframe] ?? "var(--muted)",
-                      marginBottom: 10,
-                    }}
-                  >
-                    {timeframe.toUpperCase()}
-                  </div>
-                  {Object.entries(levels).map(([period, value]) => (
-                    <KeyValue key={period} label={`EMA ${period}`} value={formatPrice(value)} compact />
-                  ))}
-                </div>
-              ))}
+              <span style={{ color: "rgba(255,255,255,0.4)" }}>
+                BID{" "}
+                <span style={{ color: "#22c55e" }}>{formatPrice(currentQuote.bid_price)}</span>
+              </span>
+              <span style={{ color: "rgba(255,255,255,0.4)" }}>
+                ASK{" "}
+                <span style={{ color: "#ef4444" }}>{formatPrice(currentQuote.ask_price)}</span>
+              </span>
+              <span style={{ color: "rgba(255,255,255,0.4)" }}>
+                SIZE {currentQuote.bid_size ?? "—"} × {currentQuote.ask_size ?? "—"}
+              </span>
             </div>
-          </Panel>
-
-          <Panel title="Engine health">
-            <div style={{ display: "grid", gap: 10 }}>
-              {(status?.engines ?? []).map((engine) => (
-                <div
-                  key={engine.name}
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "1fr auto auto",
-                    gap: 12,
-                    alignItems: "center",
-                    paddingBottom: 10,
-                    borderBottom: "1px solid var(--line)",
-                  }}
-                >
-                  <div>{engine.name}</div>
-                  <Pill>{engine.state}</Pill>
-                  <Pill tone={engine.health === "healthy" ? "good" : "warn"}>{engine.health}</Pill>
-                </div>
-              ))}
-            </div>
-          </Panel>
-        </section>
-      </section>
-    </main>
-  );
-}
-
-function Panel({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <article
-      style={{
-        background: "var(--panel)",
-        border: "1px solid var(--line)",
-        borderRadius: 24,
-        boxShadow: "var(--shadow)",
-        padding: 20,
-      }}
-    >
-      <h2 style={{ marginTop: 0, marginBottom: 16, fontSize: 22 }}>{title}</h2>
-      {children}
-    </article>
-  );
-}
-
-function KeyValue({
-  label,
-  value,
-  compact = false,
-}: {
-  label: string;
-  value: string;
-  compact?: boolean;
-}) {
-  return (
-    <div
-      style={{
-        display: "flex",
-        justifyContent: "space-between",
-        gap: 12,
-        padding: compact ? "6px 0" : "10px 0",
-        borderBottom: compact ? "none" : "1px solid var(--line)",
-        textTransform: "capitalize",
-      }}
-    >
-      <span style={{ color: "var(--muted)" }}>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
-function SetupCard({ setup }: { setup: SetupRow }) {
-  const stateColors: Record<string, string> = {
-    forming: "#b8892d",
-    confirmed: "#0f6c5c",
-    triggered: "#3756a6",
-    failed: "#bd4f36",
-    invalidated: "#888",
-  };
-  const color = stateColors[setup.state] ?? "#444";
-
-  return (
-    <div
-      style={{
-        display: "grid",
-        gridTemplateColumns: "auto 1fr auto",
-        gap: 12,
-        alignItems: "start",
-        padding: "14px 0",
-        borderBottom: "1px solid var(--line)",
-      }}
-    >
-      <div
-        style={{
-          width: 4,
-          alignSelf: "stretch",
-          background: color,
-          borderRadius: 2,
-          minHeight: 40,
-        }}
-      />
-      <div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
-          <strong style={{ fontSize: 15 }}>{formatSetupType(setup.setup_type)}</strong>
-          {setup.grade ? (
-            <span
-              style={{
-                background: "rgba(184, 137, 45, 0.15)",
-                color: "#8a631a",
-                borderRadius: 999,
-                fontSize: 11,
-                padding: "3px 8px",
-                letterSpacing: "0.06em",
-              }}
-            >
-              {setup.grade}
-            </span>
-          ) : null}
+          )}
         </div>
-        {setup.state === "confirmed" && setup.entry_trigger ? (
-          <div style={{ display: "flex", gap: 20, fontSize: 13, color: "var(--muted)" }}>
-            <span>Entry <strong style={{ color: "#b8892d" }}>{formatPrice(setup.entry_trigger)}</strong></span>
-            <span>Stop <strong style={{ color: "#bd4f36" }}>{formatPrice(setup.stop_reference)}</strong></span>
-            <span>Target <strong style={{ color: "#157f6b" }}>{formatPrice(setup.target_reference)}</strong></span>
-          </div>
-        ) : null}
-        <div style={{ marginTop: 4, fontSize: 12, color: "var(--muted)" }}>
-          detected {new Date(setup.detected_at).toLocaleTimeString()}
+
+        {/* Sidebar */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <SetupsPanel setups={setups} />
+          <FeaturesPanel context={currentContext} />
+          <MarketStatePanel context={currentContext} />
+          <RiskPanel risk={riskState} />
         </div>
       </div>
-      <Pill tone={setup.state === "confirmed" ? "good" : setup.state === "forming" ? "warn" : "neutral"}>
-        {setup.state}
-      </Pill>
+
+      {/* ── Engine health strip ── */}
+      {(status?.engines ?? []).length > 0 && (
+        <div style={{ ...S.panel, marginTop: 8 }}>
+          <div style={S.panelHd}>
+            <span style={S.panelLbl}>Engine Health</span>
+            <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.4)" }}>
+              {status?.updated_at ? new Date(status.updated_at).toLocaleTimeString() : ""}
+            </span>
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap" }}>
+            {status!.engines.map((engine, i) => (
+              <div
+                key={engine.name}
+                style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  padding: "6px 12px", flex: "1 1 160px",
+                  borderRight:
+                    i < status!.engines.length - 1
+                      ? "0.5px solid rgba(255,255,255,0.06)"
+                      : "none",
+                }}
+              >
+                <span style={{ ...S.mono, fontSize: 11, color: "rgba(255,255,255,0.6)" }}>
+                  {engine.name}
+                </span>
+                <Pill
+                  color={
+                    engine.health === "healthy"
+                      ? "green"
+                      : engine.health === "degraded"
+                      ? "amber"
+                      : "red"
+                  }
+                >
+                  {engine.health}
+                </Pill>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
-  );
-}
-
-function Pill({
-  children,
-  tone = "neutral",
-}: {
-  children: React.ReactNode;
-  tone?: "neutral" | "good" | "warn";
-}) {
-  const colors = {
-    neutral: {
-      background: "rgba(63, 49, 36, 0.08)",
-      color: "#4a3c2f",
-    },
-    good: {
-      background: "rgba(15, 108, 92, 0.12)",
-      color: "#0f6c5c",
-    },
-    warn: {
-      background: "rgba(184, 137, 45, 0.16)",
-      color: "#8a631a",
-    },
-  }[tone];
-
-  return (
-    <span
-      style={{
-        ...colors,
-        borderRadius: 999,
-        fontSize: 12,
-        padding: "6px 10px",
-        textTransform: "uppercase",
-        letterSpacing: "0.06em",
-      }}
-    >
-      {children}
-    </span>
   );
 }

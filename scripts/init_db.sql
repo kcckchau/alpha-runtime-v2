@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS orders (
 
 -- ── Executions ────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS executions (
-    execution_id        UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    execution_id        UUID        NOT NULL DEFAULT gen_random_uuid(),
     order_id            UUID        NOT NULL REFERENCES orders(order_id),
     broker_execution_id TEXT,
     symbol              TEXT        NOT NULL,
@@ -115,7 +115,8 @@ CREATE TABLE IF NOT EXISTS executions (
     quantity            INTEGER     NOT NULL,
     price               NUMERIC     NOT NULL,
     commission          NUMERIC     NOT NULL DEFAULT 0,
-    ts                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    ts                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (execution_id, ts)
 );
 
 SELECT create_hypertable('executions', 'ts', if_not_exists => TRUE);
