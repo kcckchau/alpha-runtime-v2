@@ -11,6 +11,7 @@ from alpha.models.events import BarEvent
 
 _ET = ZoneInfo("America/New_York")
 _ZERO = Decimal("0")
+_INTRADAY_PERIODS = (9, 21)
 _MONTHLY_PERIODS = (10, 20, 50)
 _TREND_PERIODS = (10, 20, 50, 100, 200)
 
@@ -32,6 +33,7 @@ def build_symbol_context(
             "1mo": len(monthly_bars),
         },
         "ema_levels": {
+            "1m": _ema_levels(minute_bars, _INTRADAY_PERIODS),
             "1h": _ema_levels(hourly_bars, _TREND_PERIODS),
             "1d": _ema_levels(daily_bars, _TREND_PERIODS),
             "1mo": _ema_levels(monthly_bars, _MONTHLY_PERIODS),
