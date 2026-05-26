@@ -11,7 +11,7 @@ from alpha.core.registry import SymbolRegistry
 from alpha.engines.setup.engine import SetupEngine
 from alpha.instruments import resolve_symbol
 from alpha.models.bar import Bar
-from alpha.models.enums import BarTimeframe, ORBState, RuntimeMode, SessionPhase, SetupType
+from alpha.models.enums import AssetClass, BarTimeframe, ORBState, RuntimeMode, SessionPhase, SetupType
 from alpha.models.market_state import MarketState
 from alpha.models.setup import Setup
 from alpha.models.snapshot import BarSnapshot
@@ -81,3 +81,51 @@ async def test_setup_context_rolls_with_futures_session() -> None:
     assert next_context.session_key == "2026-05-27"
     assert next_context.setups == []
     assert next_context.last_setup is None
+
+
+@pytest.mark.asyncio
+async def test_futures_allow_setup_detection_outside_equity_rth() -> None:
+    registry = SymbolRegistry()
+    registry.register(resolve_symbol("MNQ"))
+    settings = AlphaSettings(runtime=RuntimeSettings(mode=RuntimeMode.PAPER, symbols=["MNQ"]))
+    engine = SetupEngine(settings, EventBus(), registry)
+    await engine._on_initialize()
+
+    premarket_snapshot = _snapshot(datetime(2026, 5, 26, 9, 38, tzinfo=timezone.utc)).model_copy(
+        update={"session_phase": SessionPhase.PRE_MARKET}
+    )
+
+    assert engine._session_allows_detection("MNQ", premarket_snapshot) is True
+
+
+@pytest.mark.asyncio
+async def test_equities_remain_limited_to_rth_detection() -> None:
+    registry = SymbolRegistry()
+    registry.register(resolve_symbol("QQQ"))
+    settings = AlphaSettings(runtime=RuntimeSettings(mode=RuntimeMode.PAPER, symbols=["QQQ"]))
+    engine = SetupEngine(settings, EventBus(), registry)
+    await engine._on_initialize()
+
+    bar = Bar(
+        symbol="QQQ",
+        timeframe=BarTimeframe.M1,
+        timestamp=datetime(2026, 5, 26, 9, 38, tzinfo=timezone.utc),
+        open=Decimal("100"),
+        high=Decimal("101"),
+        low=Decimal("99"),
+        close=Decimal("100.5"),
+        volume=100,
+    )
+    snapshot = BarSnapshot(
+        symbol="QQQ",
+        timestamp=bar.timestamp,
+        timeframe=BarTimeframe.M1,
+        bar=bar,
+        vwap=Decimal("100"),
+        orb_state=ORBState.INSIDE,
+        session_phase=SessionPhase.PRE_MARKET,
+        is_above_vwap=True,
+    )
+
+    assert registry.get("QQQ").asset_class == AssetClass.EQUITY
+    assert engine._session_allows_detection("QQQ", snapshot) is False

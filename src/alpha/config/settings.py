@@ -59,6 +59,7 @@ class RuntimeSettings(BaseSettings):
     mode: RuntimeMode = RuntimeMode.PAPER
     symbols: list[str] = Field(default_factory=lambda: ["SPY"])
     log_level: str = "INFO"
+    setup_debug: bool = False
     timezone: str = "America/New_York"
     orb_minutes: int = 5               # default opening-range window
     catchup_lookback_days: int = 5     # bars to load before going live
