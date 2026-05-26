@@ -47,7 +47,7 @@ function toChartData(bars: BarRow[]): CandlestickData<Time>[] {
   }
 
   return [...deduped.entries()]
-    .sort(([left], [right]) => left - right)
+    .sort(([a], [b]) => a - b)
     .map(([, bar]) => bar);
 }
 
@@ -57,41 +57,39 @@ export function CandlesChart({ bars, overlays }: CandlesChartProps) {
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
 
   useEffect(() => {
-    if (!containerRef.current || chartRef.current) {
-      return;
-    }
+    if (!containerRef.current || chartRef.current) return;
 
     const chart = createChart(containerRef.current, {
       autoSize: true,
       layout: {
-        background: { type: ColorType.Solid, color: "rgba(255, 252, 246, 0.9)" },
-        textColor: "#30261d",
-        fontFamily: 'Georgia, "Times New Roman", serif',
+        background: { type: ColorType.Solid, color: "#111111" },
+        textColor: "rgba(255,255,255,0.35)",
+        fontFamily: "'IBM Plex Mono', monospace",
       },
       grid: {
-        vertLines: { color: "rgba(63, 49, 36, 0.08)" },
-        horzLines: { color: "rgba(63, 49, 36, 0.08)" },
+        vertLines: { color: "rgba(255,255,255,0.04)" },
+        horzLines: { color: "rgba(255,255,255,0.04)" },
       },
       rightPriceScale: {
-        borderColor: "rgba(63, 49, 36, 0.18)",
+        borderColor: "rgba(255,255,255,0.08)",
       },
       timeScale: {
-        borderColor: "rgba(63, 49, 36, 0.18)",
+        borderColor: "rgba(255,255,255,0.08)",
         timeVisible: true,
         secondsVisible: false,
       },
       crosshair: {
-        vertLine: { color: "rgba(15, 108, 92, 0.25)" },
-        horzLine: { color: "rgba(15, 108, 92, 0.25)" },
+        vertLine: { color: "rgba(255,255,255,0.15)" },
+        horzLine: { color: "rgba(255,255,255,0.15)" },
       },
     });
 
     const series = chart.addSeries(CandlestickSeries, {
-      upColor: "#157f6b",
-      downColor: "#bd4f36",
+      upColor: "#22c55e",
+      downColor: "#ef4444",
       borderVisible: false,
-      wickUpColor: "#157f6b",
-      wickDownColor: "#bd4f36",
+      wickUpColor: "#22c55e",
+      wickDownColor: "#ef4444",
     });
 
     chartRef.current = chart;
@@ -107,9 +105,7 @@ export function CandlesChart({ bars, overlays }: CandlesChartProps) {
   useEffect(() => {
     const chart = chartRef.current;
     const series = seriesRef.current;
-    if (!chart || !series) {
-      return;
-    }
+    if (!chart || !series) return;
 
     series.setData(toChartData(bars));
     series.priceLines().forEach((line) => series.removePriceLine(line));
@@ -128,5 +124,5 @@ export function CandlesChart({ bars, overlays }: CandlesChartProps) {
     chart.timeScale().fitContent();
   }, [bars, overlays]);
 
-  return <div ref={containerRef} style={{ height: 460, width: "100%" }} />;
+  return <div ref={containerRef} style={{ height: 420, width: "100%" }} />;
 }
