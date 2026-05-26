@@ -2,7 +2,15 @@
   "permissions": {
     "allow": [
       "Bash(pip install *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(npx tsc:*)",
+      "Bash(pnpm exec:*)",
+      "Bash(/Users/kennethchau/Library/pnpm/bin/pnpm exec:*)",
+      "Bash(pnpm --dir /Users/kennethchau/Projects/alpha-runtime-v2/web exec tsc --noEmit)",
+      "Bash(node_modules/.bin/tsc --noEmit)",
+      "Bash(docker compose:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)"
     ]
   }
 }

@@ -2,7 +2,7 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import { LineStyle } from "lightweight-charts";
-import { CandlesChart } from "@/components/candles-chart";
+import { CandlesChart, EmaConfig } from "@/components/candles-chart";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -40,6 +40,7 @@ type BarHistoryRow = {
   low: string;
   close: string;
   volume: number;
+  vwap?: string | null;
 };
 
 type SymbolContext = {
@@ -606,24 +607,6 @@ export function Dashboard() {
   const overlayLines = useMemo(() => {
     const overlays: Array<{ label: string; price: number; color: string; style?: number }> = [];
 
-    if (currentContext?.vwap) {
-      overlays.push({ label: "VWAP", price: currentContext.vwap, color: "#fbbf24" });
-    }
-
-    if (currentContext?.ema_levels) {
-      for (const [tf, levels] of Object.entries(currentContext.ema_levels)) {
-        const color = tf === "1h" ? "#60a5fa" : tf === "1d" ? "#fbbf24" : "#a78bfa";
-        for (const [period, value] of Object.entries(levels)) {
-          if (!value) continue;
-          overlays.push({
-            label: `${tf.toUpperCase()} EMA${period}`,
-            price: Number(value),
-            color,
-            style: tf === "1mo" ? LineStyle.Dashed : LineStyle.Solid,
-          });
-        }
-      }
-    }
 
     if (currentContext?.levels) {
       for (const [label, value] of Object.entries(currentContext.levels)) {
@@ -656,6 +639,17 @@ export function Dashboard() {
 
     return overlays;
   }, [currentContext, setups]);
+
+  // EMA indicator configs — computed from bar data as line series in the chart
+  const emas = useMemo((): EmaConfig[] => {
+    if (selectedTimeframe === "1m" || selectedTimeframe === "5m") {
+      return [
+        { period: 9, color: "#60a5fa" },   // blue
+        { period: 21, color: "#fbbf24" },  // amber/yellow
+      ];
+    }
+    return [];
+  }, [selectedTimeframe]);
 
   return (
     <div
@@ -762,13 +756,18 @@ export function Dashboard() {
               </button>
             ))}
             <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
-              <LegendItem color="#fbbf24" label="VWAP" />
-              <LegendItem color="#60a5fa" label="EMA" dashed />
+              <LegendItem color="rgba(255,255,255,0.85)" label="VWAP" />
+              {(selectedTimeframe === "1m" || selectedTimeframe === "5m") ? (
+                <>
+                  <LegendItem color="#60a5fa" label="EMA9" />
+                  <LegendItem color="#fbbf24" label="EMA21" />
+                </>
+              ) : null}
             </div>
           </div>
 
           {/* Candlestick chart */}
-          <CandlesChart bars={bars} overlays={overlayLines} />
+          <CandlesChart bars={bars} overlays={overlayLines} emas={emas} />
 
           {/* Quote bar */}
           {currentQuote && (
