@@ -58,6 +58,23 @@ class SymbolFeatureState:
         self.atr_buffer: Deque[Decimal] = deque(maxlen=14)
         self.prev_close: Decimal | None = None
 
+        # ── Setup detection state ─────────────────────────────────────────────
+        self.bars_above_vwap: int = 0
+        self.bars_below_vwap: int = 0
+        self.prev_above_vwap: bool | None = None
+        self.prev_vwap_deviation_pct: float | None = None
+        self.vwap_deviation_shrinking: bool = False
+        self.vwap_cross_up: bool = False
+        self.vwap_cross_down: bool = False
+        self.intraday_high: Decimal | None = None
+        self.intraday_low: Decimal | None = None
+        self.is_new_hod: bool = False
+        self.is_new_lod: bool = False
+        self.is_higher_high: bool = False
+        self.is_lower_low: bool = False
+        self.prev_bar_high: Decimal | None = None
+        self.prev_bar_low: Decimal | None = None
+
     def reset_session(self) -> None:
         self.bars_since_open = 0
         self.cumulative_volume = 0
@@ -65,6 +82,21 @@ class SymbolFeatureState:
         self.orb_high = None
         self.orb_low = None
         self.orb_established = False
+        self.bars_above_vwap = 0
+        self.bars_below_vwap = 0
+        self.prev_above_vwap = None
+        self.prev_vwap_deviation_pct = None
+        self.vwap_deviation_shrinking = False
+        self.vwap_cross_up = False
+        self.vwap_cross_down = False
+        self.intraday_high = None
+        self.intraday_low = None
+        self.is_new_hod = False
+        self.is_new_lod = False
+        self.is_higher_high = False
+        self.is_lower_low = False
+        self.prev_bar_high = None
+        self.prev_bar_low = None
 
     @property
     def vwap(self) -> Decimal:
@@ -183,6 +215,67 @@ class FeatureEngine(BaseEngine):
             elif not state.orb_established and bar.timestamp >= orb_end:
                 state.orb_established = True
 
+            # ── Setup detection features ──────────────────────────────────────
+            vwap = state.vwap
+            if vwap > _ZERO:
+                is_above = bar.close >= vwap
+                dev_pct = float((bar.close - vwap) / vwap * 100)
+
+                if is_above:
+                    state.bars_above_vwap += 1
+                    state.bars_below_vwap = 0
+                else:
+                    state.bars_below_vwap += 1
+                    state.bars_above_vwap = 0
+
+                state.vwap_cross_up = (
+                    state.prev_above_vwap is not None
+                    and not state.prev_above_vwap
+                    and is_above
+                )
+                state.vwap_cross_down = (
+                    state.prev_above_vwap is not None
+                    and state.prev_above_vwap
+                    and not is_above
+                )
+                state.prev_above_vwap = is_above
+
+                state.vwap_deviation_shrinking = (
+                    state.prev_vwap_deviation_pct is not None
+                    and state.prev_vwap_deviation_pct > 0
+                    and dev_pct < state.prev_vwap_deviation_pct
+                    and dev_pct > 0
+                )
+                state.prev_vwap_deviation_pct = dev_pct
+            else:
+                state.vwap_cross_up = False
+                state.vwap_cross_down = False
+                state.vwap_deviation_shrinking = False
+
+            state.is_new_hod = state.intraday_high is None or bar.high > state.intraday_high
+            state.is_new_lod = state.intraday_low is None or bar.low < state.intraday_low
+            if state.is_new_hod:
+                state.intraday_high = bar.high
+            if state.is_new_lod:
+                state.intraday_low = bar.low
+
+            state.is_higher_high = (
+                state.prev_bar_high is not None and bar.high > state.prev_bar_high
+            )
+            state.is_lower_low = (
+                state.prev_bar_low is not None and bar.low < state.prev_bar_low
+            )
+            state.prev_bar_high = bar.high
+            state.prev_bar_low = bar.low
+        else:
+            state.vwap_cross_up = False
+            state.vwap_cross_down = False
+            state.vwap_deviation_shrinking = False
+            state.is_new_hod = False
+            state.is_new_lod = False
+            state.is_higher_high = False
+            state.is_lower_low = False
+
         state.ema_9 = self._ema(bar.close, state.ema_9, 9)
         state.ema_20 = self._ema(bar.close, state.ema_20, 20)
         state.ema_50 = self._ema(bar.close, state.ema_50, 50)
@@ -215,6 +308,17 @@ class FeatureEngine(BaseEngine):
             if state.latest_bid and state.latest_ask else None
         )
         spread_pct = float(spread / mid * 100) if spread and mid else None
+
+        bar_range = bar.high - bar.low
+        bar_close_pos: float | None = (
+            float((bar.close - bar.low) / bar_range) if bar_range > _ZERO else None
+        )
+        swept_below = bool(vwap > _ZERO and bar.low < vwap and bar.close >= vwap)
+        swept_orl = bool(state.orb_low is not None and bar.low < state.orb_low)
+        or_mid = (
+            (state.orb_high + state.orb_low) / 2
+            if state.orb_high and state.orb_low else None
+        )
 
         b = Bar(
             symbol=bar.symbol,
@@ -255,6 +359,21 @@ class FeatureEngine(BaseEngine):
             is_above_vwap=bar.close >= vwap,
             is_above_ema20=bar.close >= state.ema_20 if state.ema_20 else None,
             is_extended=abs(vwap_dev) > 2.0 if vwap else False,
+            bars_above_vwap=state.bars_above_vwap,
+            bars_below_vwap=state.bars_below_vwap,
+            vwap_cross_up=state.vwap_cross_up,
+            vwap_cross_down=state.vwap_cross_down,
+            vwap_deviation_shrinking=state.vwap_deviation_shrinking,
+            bar_close_position_pct=bar_close_pos,
+            intraday_high=state.intraday_high,
+            intraday_low=state.intraday_low,
+            is_new_hod=state.is_new_hod,
+            is_new_lod=state.is_new_lod,
+            is_higher_high=state.is_higher_high,
+            is_lower_low=state.is_lower_low,
+            or_mid=or_mid,
+            swept_below_vwap=swept_below,
+            swept_orl=swept_orl,
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────────

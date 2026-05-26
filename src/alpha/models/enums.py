@@ -113,6 +113,7 @@ class SetupType(StrEnum):
     ORB_BREAKDOWN = "orb_breakdown"
     SWEEP_RECLAIM = "sweep_reclaim"
     FAKE_BREAKDOWN = "fake_breakdown"
+    HOD_BREAKOUT = "hod_breakout"
     TREND_PULLBACK = "trend_pullback"
     RELATIVE_STRENGTH_BREAKOUT = "relative_strength_breakout"
 

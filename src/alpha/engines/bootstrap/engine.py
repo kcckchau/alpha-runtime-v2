@@ -90,6 +90,7 @@ class BootstrapEngine(BaseEngine):
         self._engines: list[BaseEngine] = []
         self._status_task: asyncio.Task[None] | None = None
         self._startup_context: dict[str, dict[str, Any]] = {}
+        self._ibkr_conn: object | None = None  # IBKRConnection, kept for clean shutdown
 
     @property
     def name(self) -> str:
@@ -157,6 +158,13 @@ class BootstrapEngine(BaseEngine):
                 pass
         for engine in reversed(self._engines):
             await engine.stop()
+        # Disconnect IBKR after engines stop (subscriptions are already cancelled
+        # by LiveIngestionEngine._on_stop). Doing this while the event loop is
+        # still running prevents IB.__del__ from firing on a closed loop.
+        if self._ibkr_conn is not None:
+            from alpha.engines.ibkr.connection import IBKRConnection
+            if isinstance(self._ibkr_conn, IBKRConnection):
+                await self._ibkr_conn.disconnect()
         await self._event_bus.stop()
         self._write_runtime_snapshot()
 
@@ -248,6 +256,7 @@ class BootstrapEngine(BaseEngine):
         from alpha.engines.order.adapters.ibkr import IBKRBrokerAdapter
 
         conn = IBKRConnection(self._settings.ibkr)
+        self._ibkr_conn = conn
 
         if hist_src == DataSourceId.INTERACTIVE_BROKERS:
             self._historical.register_source(

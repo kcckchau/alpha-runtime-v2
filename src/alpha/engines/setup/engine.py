@@ -12,9 +12,8 @@ Setup lifecycle:
    FAILED     INVALIDATED
               EXPIRED
 
-Each setup type (VWAP reclaim, ORB breakout, etc.) has its own detector
-function that returns True when conditions are met. The engine drives
-the state machine.
+Each setup type has its own detector (FORMING condition) and advance method
+(CONFIRMED / INVALIDATED / TRIGGERED / FAILED transitions).
 
 Input:  BarEvent (trigger), BarSnapshot + MarketState (from feature/market_state engines)
 Output: SetupEvent
@@ -24,19 +23,42 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal
 from uuid import UUID
 
 from alpha.config.settings import AlphaSettings
 from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
-from alpha.models.enums import EventType, HealthStatus, SetupState, SetupType
+from alpha.models.enums import (
+    EventType,
+    HealthStatus,
+    ORBState,
+    SessionPhase,
+    SetupGrade,
+    SetupState,
+    SetupType,
+)
 from alpha.models.events import AnyEvent, BarEvent, SetupEvent
 from alpha.models.market_state import MarketState
 from alpha.models.setup import Setup
 from alpha.models.snapshot import BarSnapshot
 
 logger = logging.getLogger(__name__)
+
+_RTH_PHASES = frozenset({
+    SessionPhase.OPENING_RANGE,
+    SessionPhase.EARLY,
+    SessionPhase.MID,
+    SessionPhase.POWER_HOUR,
+    SessionPhase.CLOSING,
+})
+
+_SSS_TYPES = frozenset({
+    SetupType.FAKE_BREAKDOWN,
+    SetupType.HOD_BREAKOUT,
+    SetupType.TREND_PULLBACK,
+})
 
 
 class SetupEngine(BaseEngine):
@@ -61,6 +83,8 @@ class SetupEngine(BaseEngine):
         self._market_state_engine: object | None = None
         # Active setups: symbol → {setup_id → Setup}
         self._active: dict[str, dict[UUID, Setup]] = {}
+        # Bars-in-forming counter for invalidation timers
+        self._forming_bars: dict[UUID, int] = {}
         self._setups_detected: int = 0
         self._setups_triggered: int = 0
 
@@ -115,10 +139,7 @@ class SetupEngine(BaseEngine):
         if snapshot is None or market_state is None:
             return
 
-        # Scan for new setups
         await self._scan_for_setups(symbol, snapshot, market_state, event)
-
-        # Update existing setups
         await self._update_active_setups(symbol, snapshot, market_state, event)
 
     # ── Detection ─────────────────────────────────────────────────────────────
@@ -131,36 +152,95 @@ class SetupEngine(BaseEngine):
         trigger: BarEvent,
     ) -> None:
         detectors = [
+            (SetupType.FAKE_BREAKDOWN, self._detect_fake_breakdown),
+            (SetupType.HOD_BREAKOUT, self._detect_hod_breakout),
+            (SetupType.TREND_PULLBACK, self._detect_trend_pullback),
             (SetupType.VWAP_RECLAIM, self._detect_vwap_reclaim),
             (SetupType.ORB_BREAKOUT, self._detect_orb_breakout),
             (SetupType.SWEEP_RECLAIM, self._detect_sweep_reclaim),
-            (SetupType.FAKE_BREAKDOWN, self._detect_fake_breakdown),
         ]
         for setup_type, detector in detectors:
+            if self._has_active(symbol, setup_type):
+                continue
             if detector(snapshot, market_state):
                 await self._open_setup(symbol, setup_type, snapshot, market_state, trigger)
 
+    def _has_active(self, symbol: str, setup_type: SetupType) -> bool:
+        return any(
+            s.setup_type == setup_type
+            for s in self._active.get(symbol, {}).values()
+        )
+
+    # ── SSS detectors ─────────────────────────────────────────────────────────
+
+    def _detect_fake_breakdown(self, snap: BarSnapshot, ms: MarketState) -> bool:
+        """
+        FORMING: at least 1 bar below VWAP, low near VWAP (within 0.1%).
+        MNQ opposed → blocked (not yet implemented; skipped until MNQ lead is wired).
+        """
+        if snap.session_phase not in _RTH_PHASES:
+            return False
+        if snap.bars_below_vwap < 1:
+            return False
+        # Low must be at or near VWAP (within 0.1% above)
+        if snap.bar.low > snap.vwap * Decimal("1.001"):
+            return False
+        return True
+
+    def _detect_hod_breakout(self, snap: BarSnapshot, ms: MarketState) -> bool:
+        """
+        Prereq: intraday_high > orb_high, price above VWAP.
+        FORMING: higher highs, within 0.2% of intraday high.
+        MNQ opposed → blocked (skipped until MNQ lead is wired).
+        """
+        if snap.session_phase not in _RTH_PHASES:
+            return False
+        # ORB must be established
+        if snap.orb_state == ORBState.NOT_SET or snap.orb_high is None:
+            return False
+        if snap.intraday_high is None:
+            return False
+        # Prereq: session high already above the OR high
+        if snap.intraday_high <= snap.orb_high:
+            return False
+        # Prereq: price above VWAP
+        if not snap.is_above_vwap:
+            return False
+        # FORMING: making higher highs
+        if not snap.is_higher_high:
+            return False
+        # FORMING: close within 0.2% of intraday high
+        dist_to_hod = float((snap.intraday_high - snap.bar.close) / snap.intraday_high)
+        if dist_to_hod > 0.002:
+            return False
+        return True
+
+    def _detect_trend_pullback(self, snap: BarSnapshot, ms: MarketState) -> bool:
+        """
+        FORMING: ≥5 consecutive bars above VWAP, pulling back (deviation shrinking),
+        within 0.5% of VWAP.
+        MNQ opposed → blocked (skipped until MNQ lead is wired).
+        """
+        if snap.session_phase not in _RTH_PHASES:
+            return False
+        if snap.bars_above_vwap < 5:
+            return False
+        if not snap.vwap_deviation_shrinking:
+            return False
+        # Within 0.5% of VWAP (and still above it — deviation positive)
+        if snap.vwap_deviation_pct <= 0 or snap.vwap_deviation_pct > 0.5:
+            return False
+        return True
+
+    # ── Stub detectors (not yet implemented) ─────────────────────────────────
+
     def _detect_vwap_reclaim(self, snap: BarSnapshot, ms: MarketState) -> bool:
-        """Price crossed above VWAP on volume with clean close."""
-        # TODO: implement full conditions
         return False
 
     def _detect_orb_breakout(self, snap: BarSnapshot, ms: MarketState) -> bool:
-        """Price broke above ORB high with volume confirmation."""
-        from alpha.models.enums import ORBState
-        if snap.orb_state != ORBState.BREAKOUT_UP:
-            return False
-        # TODO: add volume confirmation, clean close, no extended conditions
         return False
 
     def _detect_sweep_reclaim(self, snap: BarSnapshot, ms: MarketState) -> bool:
-        """Price swept below a level then immediately reclaimed it."""
-        # TODO: implement
-        return False
-
-    def _detect_fake_breakdown(self, snap: BarSnapshot, ms: MarketState) -> bool:
-        """Price broke a support level, then closed back above it."""
-        # TODO: implement
         return False
 
     # ── State machine ─────────────────────────────────────────────────────────
@@ -174,6 +254,7 @@ class SetupEngine(BaseEngine):
         trigger: BarEvent,
     ) -> None:
         now = datetime.now(timezone.utc)
+        grade = SetupGrade.SSS if setup_type in _SSS_TYPES else None
         setup = Setup(
             symbol=symbol,
             setup_type=setup_type,
@@ -182,6 +263,7 @@ class SetupEngine(BaseEngine):
             updated_at=now,
             market_state=market_state,
             bar_snapshot=snapshot,
+            grade=grade,
         )
         self._active.setdefault(symbol, {})[setup.setup_id] = setup
         self._setups_detected += 1
@@ -197,16 +279,22 @@ class SetupEngine(BaseEngine):
     ) -> None:
         to_remove: list[UUID] = []
         for setup_id, setup in self._active.get(symbol, {}).items():
-            updated, reason = self._advance_state(setup, snapshot, market_state)
+            updated, _ = self._advance_state(setup, snapshot, market_state)
             if updated.state != setup.state:
                 self._active[symbol][setup_id] = updated
                 await self._emit(updated, setup.state, trigger)
                 if updated.state == SetupState.TRIGGERED:
                     self._setups_triggered += 1
-            if updated.state in {SetupState.FAILED, SetupState.INVALIDATED, SetupState.EXPIRED}:
+            if updated.state in {
+                SetupState.TRIGGERED,
+                SetupState.FAILED,
+                SetupState.INVALIDATED,
+                SetupState.EXPIRED,
+            }:
                 to_remove.append(setup_id)
         for sid in to_remove:
             self._active[symbol].pop(sid, None)
+            self._forming_bars.pop(sid, None)
 
     def _advance_state(
         self,
@@ -214,8 +302,150 @@ class SetupEngine(BaseEngine):
         snapshot: BarSnapshot,
         market_state: MarketState,
     ) -> tuple[Setup, str]:
-        """Return (updated_setup, reason). No-op if state unchanged."""
-        # TODO: implement per-setup-type advancement logic
+        if setup.setup_type == SetupType.FAKE_BREAKDOWN:
+            return self._advance_fake_breakdown(setup, snapshot)
+        if setup.setup_type == SetupType.HOD_BREAKOUT:
+            return self._advance_hod_breakout(setup, snapshot)
+        if setup.setup_type == SetupType.TREND_PULLBACK:
+            return self._advance_trend_pullback(setup, snapshot)
+        return setup, ""
+
+    # ── Per-type advance methods ───────────────────────────────────────────────
+
+    def _advance_fake_breakdown(
+        self, setup: Setup, snap: BarSnapshot
+    ) -> tuple[Setup, str]:
+        if setup.state == SetupState.FORMING:
+            bars = self._forming_bars.get(setup.setup_id, 0) + 1
+            self._forming_bars[setup.setup_id] = bars
+
+            # Invalidation: below VWAP for >15 bars
+            if bars > 15 and not snap.is_above_vwap:
+                return setup.transition(SetupState.INVALIDATED, "below VWAP >15 bars"), ""
+
+            # Confirm: VWAP cross up + rvol ≥ 1.2 + close ≥ 50% of bar + close > OR mid
+            if snap.vwap_cross_up:
+                rvol_ok = snap.relative_volume is None or snap.relative_volume >= 1.2
+                close_pos_ok = (
+                    snap.bar_close_position_pct is None
+                    or snap.bar_close_position_pct >= 0.5
+                )
+                or_mid_ok = snap.or_mid is None or snap.bar.close > snap.or_mid
+                if rvol_ok and close_pos_ok and or_mid_ok:
+                    entry = snap.vwap
+                    # Stop: sweep low (FORMING bar's low) × 0.9995
+                    stop = setup.bar_snapshot.bar.low * Decimal("0.9995")
+                    target = entry + (entry - stop) * Decimal("2.5")
+                    confirmed = setup.transition(SetupState.CONFIRMED).model_copy(
+                        update={
+                            "entry_trigger": entry,
+                            "stop_reference": stop,
+                            "target_reference": target,
+                        }
+                    )
+                    logger.info(
+                        "Setup confirmed: %s %s entry=%.2f stop=%.2f target=%.2f",
+                        setup.symbol, setup.setup_type,
+                        float(entry), float(stop), float(target),
+                    )
+                    return confirmed, "confirmed"
+
+        elif setup.state == SetupState.CONFIRMED:
+            if setup.entry_trigger and snap.bar.high >= setup.entry_trigger:
+                return setup.transition(SetupState.TRIGGERED), "triggered"
+            if setup.stop_reference and snap.bar.low <= setup.stop_reference:
+                return setup.transition(SetupState.FAILED), "stop hit"
+
+        return setup, ""
+
+    def _advance_hod_breakout(
+        self, setup: Setup, snap: BarSnapshot
+    ) -> tuple[Setup, str]:
+        if setup.state == SetupState.FORMING:
+            self._forming_bars[setup.setup_id] = (
+                self._forming_bars.get(setup.setup_id, 0) + 1
+            )
+            # Confirm: new HOD + rvol ≥ 1.2
+            if snap.is_new_hod and snap.intraday_high is not None:
+                rvol_ok = snap.relative_volume is None or snap.relative_volume >= 1.2
+                if rvol_ok:
+                    entry = snap.intraday_high
+                    stop = snap.vwap * Decimal("0.999")
+                    target = entry + (entry - stop) * Decimal("2")
+                    confirmed = setup.transition(SetupState.CONFIRMED).model_copy(
+                        update={
+                            "entry_trigger": entry,
+                            "stop_reference": stop,
+                            "target_reference": target,
+                        }
+                    )
+                    logger.info(
+                        "Setup confirmed: %s %s entry=%.2f stop=%.2f target=%.2f",
+                        setup.symbol, setup.setup_type,
+                        float(entry), float(stop), float(target),
+                    )
+                    return confirmed, "confirmed"
+
+        elif setup.state == SetupState.CONFIRMED:
+            if setup.entry_trigger and snap.bar.high >= setup.entry_trigger:
+                return setup.transition(SetupState.TRIGGERED), "triggered"
+            if setup.stop_reference and snap.bar.low <= setup.stop_reference:
+                return setup.transition(SetupState.FAILED), "stop hit"
+
+        return setup, ""
+
+    def _advance_trend_pullback(
+        self, setup: Setup, snap: BarSnapshot
+    ) -> tuple[Setup, str]:
+        if setup.state == SetupState.FORMING:
+            self._forming_bars[setup.setup_id] = (
+                self._forming_bars.get(setup.setup_id, 0) + 1
+            )
+            # Invalidation: VWAP cross down
+            if snap.vwap_cross_down:
+                return setup.transition(
+                    SetupState.INVALIDATED, "VWAP cross down while forming"
+                ), ""
+            # Confirm: within 0.25% of VWAP, still above, rvol ≥ 0.8, no lower low
+            if (
+                snap.is_above_vwap
+                and 0 < snap.vwap_deviation_pct <= 0.25
+            ):
+                rvol_ok = snap.relative_volume is None or snap.relative_volume >= 0.8
+                no_lower_low = not snap.is_lower_low
+                if rvol_ok and no_lower_low:
+                    entry = snap.vwap
+                    stop = snap.vwap * Decimal("0.997")
+                    target = (
+                        snap.intraday_high
+                        if snap.intraday_high is not None
+                        else entry + (entry - stop) * Decimal("3")
+                    )
+                    confirmed = setup.transition(SetupState.CONFIRMED).model_copy(
+                        update={
+                            "entry_trigger": entry,
+                            "stop_reference": stop,
+                            "target_reference": target,
+                        }
+                    )
+                    logger.info(
+                        "Setup confirmed: %s %s entry=%.2f stop=%.2f target=%.2f",
+                        setup.symbol, setup.setup_type,
+                        float(entry), float(stop), float(target),
+                    )
+                    return confirmed, "confirmed"
+
+        elif setup.state == SetupState.CONFIRMED:
+            # Invalidation still applies after confirm
+            if snap.vwap_cross_down:
+                return setup.transition(
+                    SetupState.INVALIDATED, "VWAP cross down while confirmed"
+                ), ""
+            if setup.entry_trigger and snap.bar.high >= setup.entry_trigger:
+                return setup.transition(SetupState.TRIGGERED), "triggered"
+            if setup.stop_reference and snap.bar.low <= setup.stop_reference:
+                return setup.transition(SetupState.FAILED), "stop hit"
+
         return setup, ""
 
     # ── Emit ──────────────────────────────────────────────────────────────────

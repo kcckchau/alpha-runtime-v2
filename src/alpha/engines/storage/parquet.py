@@ -96,7 +96,7 @@ class ParquetStore:
             current += timedelta(days=1)
         if not tables:
             return pa.table({})
-        return pa.concat_tables(tables)
+        return pa.concat_tables(tables, promote_options="permissive")
 
     def exists(self, data_type: str, symbol: str, d: date) -> bool:
         return (_partition_path(self._root, data_type, symbol, d) / "data.parquet").exists()

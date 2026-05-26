@@ -57,3 +57,20 @@ class BarSnapshot(BaseModel):
     is_above_vwap: bool = False
     is_above_ema20: bool | None = None
     is_extended: bool = False                   # price far from VWAP (>2 std dev)
+
+    # ── Setup detection features ──────────────────────────────────────────────
+    bars_above_vwap: int = 0                    # consecutive bars closing above VWAP
+    bars_below_vwap: int = 0                    # consecutive bars closing below VWAP
+    vwap_cross_up: bool = False                 # this bar crossed above VWAP
+    vwap_cross_down: bool = False               # this bar crossed below VWAP
+    vwap_deviation_shrinking: bool = False      # distance to VWAP decreased vs prior bar (from above)
+    bar_close_position_pct: float | None = None  # (close - low) / (high - low)
+    intraday_high: Decimal | None = None        # session high so far
+    intraday_low: Decimal | None = None         # session low so far
+    is_new_hod: bool = False                    # this bar set a new session high
+    is_new_lod: bool = False                    # this bar set a new session low
+    is_higher_high: bool = False                # this bar's high > prior bar's high
+    is_lower_low: bool = False                  # this bar's low < prior bar's low
+    or_mid: Decimal | None = None               # (orb_high + orb_low) / 2
+    swept_below_vwap: bool = False              # low < vwap but close >= vwap
+    swept_orl: bool = False                     # low < orb_low

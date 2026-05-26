@@ -47,6 +47,33 @@ type SymbolContext = {
   levels: Record<string, string | null>;
 };
 
+type SetupRow = {
+  setup_id: string;
+  symbol: string;
+  setup_type: string;
+  state: string;
+  grade: string | null;
+  entry_trigger: string | null;
+  stop_reference: string | null;
+  target_reference: string | null;
+  detected_at: string;
+  updated_at: string;
+  conditions_met: string[];
+  conditions_missing: string[];
+};
+
+const SETUP_LABELS: Record<string, string> = {
+  fake_breakdown: "Fake Breakdown",
+  hod_breakout: "HOD Breakout",
+  trend_pullback: "Trend Pullback",
+  vwap_reclaim: "VWAP Reclaim",
+  orb_breakout: "ORB Breakout",
+};
+
+function formatSetupType(type: string): string {
+  return SETUP_LABELS[type] ?? type.replaceAll("_", " ");
+}
+
 const API_BASE =
   process.env.NEXT_PUBLIC_ALPHA_API_BASE_URL?.replace(/\/$/, "") ?? "http://127.0.0.1:8000";
 
@@ -99,6 +126,7 @@ export function Dashboard() {
   const [contexts, setContexts] = useState<Record<string, SymbolContext | null>>({});
   const [quotes, setQuotes] = useState<Record<string, QuoteRow | null>>({});
   const [bars, setBars] = useState<BarHistoryRow[]>([]);
+  const [setups, setSetups] = useState<SetupRow[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -111,12 +139,13 @@ export function Dashboard() {
           ? selectedSymbol
           : (statusData.symbols[0] ?? "MNQ");
 
-        const [contextData, quoteData, barData] = await Promise.all([
+        const [contextData, quoteData, barData, setupData] = await Promise.all([
           fetchJson<Record<string, SymbolContext | null>>(`/runtime/contexts?symbol=${symbol}`),
           fetchJson<Record<string, QuoteRow | null>>(`/runtime/quotes?symbol=${symbol}`),
           fetchJson<BarHistoryRow[]>(
             `/runtime/bars/history?symbol=${symbol}&timeframe=1m&start=${historyStartDate(symbol)}&end=${todayDate()}`,
           ),
+          fetchJson<SetupRow[]>(`/runtime/setups?symbol=${symbol}`),
         ]);
 
         if (cancelled) {
@@ -128,6 +157,7 @@ export function Dashboard() {
         setContexts((prev) => ({ ...prev, ...contextData }));
         setQuotes((prev) => ({ ...prev, ...quoteData }));
         setBars(barData);
+        setSetups(setupData);
         setError(null);
       } catch (err) {
         if (cancelled) {
@@ -150,39 +180,63 @@ export function Dashboard() {
   const currentQuote = quotes[selectedSymbol] ?? null;
 
   const overlayLines = useMemo(() => {
-    if (!currentContext) {
-      return [];
-    }
-
     const overlays: Array<{ label: string; price: number; color: string; style?: number }> = [];
-    for (const [timeframe, levels] of Object.entries(currentContext.ema_levels)) {
-      for (const [period, value] of Object.entries(levels)) {
-        if (!value) {
-          continue;
+
+    if (currentContext) {
+      for (const [timeframe, levels] of Object.entries(currentContext.ema_levels)) {
+        for (const [period, value] of Object.entries(levels)) {
+          if (!value) continue;
+          overlays.push({
+            label: levelLabel(timeframe, period),
+            price: Number(value),
+            color: TIMEFRAME_COLORS[timeframe] ?? "#444",
+            style: timeframe === "1mo" ? LineStyle.Dashed : LineStyle.Solid,
+          });
         }
+      }
+      for (const [label, value] of Object.entries(currentContext.levels)) {
+        if (!value) continue;
         overlays.push({
-          label: levelLabel(timeframe, period),
+          label: label.replaceAll("_", " "),
           price: Number(value),
-          color: TIMEFRAME_COLORS[timeframe] ?? "#444",
-          style: timeframe === "1mo" ? LineStyle.Dashed : LineStyle.Solid,
+          color: label.includes("high") ? "#b64b33" : "#3756a6",
+          style: LineStyle.LargeDashed,
         });
       }
     }
 
-    for (const [label, value] of Object.entries(currentContext.levels)) {
-      if (!value) {
-        continue;
+    // Setup price levels — entry / stop / target for CONFIRMED setups
+    for (const s of setups) {
+      if (s.state !== "confirmed") continue;
+      const label = formatSetupType(s.setup_type);
+      if (s.entry_trigger) {
+        overlays.push({
+          label: `${label} entry`,
+          price: Number(s.entry_trigger),
+          color: "#b8892d",
+          style: LineStyle.Solid,
+        });
       }
-      overlays.push({
-        label: label.replaceAll("_", " "),
-        price: Number(value),
-        color: label.includes("high") ? "#b64b33" : "#3756a6",
-        style: LineStyle.LargeDashed,
-      });
+      if (s.stop_reference) {
+        overlays.push({
+          label: "stop",
+          price: Number(s.stop_reference),
+          color: "#bd4f36",
+          style: LineStyle.Dashed,
+        });
+      }
+      if (s.target_reference) {
+        overlays.push({
+          label: "target",
+          price: Number(s.target_reference),
+          color: "#157f6b",
+          style: LineStyle.Dashed,
+        });
+      }
     }
 
     return overlays;
-  }, [currentContext]);
+  }, [currentContext, setups]);
 
   return (
     <main style={{ padding: "24px" }}>
@@ -344,6 +398,18 @@ export function Dashboard() {
           </aside>
         </section>
 
+        <Panel title="SSS Setups">
+          {setups.length === 0 ? (
+            <p style={{ color: "var(--muted)", margin: 0 }}>No active setups for {selectedSymbol}.</p>
+          ) : (
+            <div style={{ display: "grid", gap: 12 }}>
+              {setups.map((s) => (
+                <SetupCard key={s.setup_id} setup={s} />
+              ))}
+            </div>
+          )}
+        </Panel>
+
         <section
           style={{
             display: "grid",
@@ -459,6 +525,72 @@ function KeyValue({
     >
       <span style={{ color: "var(--muted)" }}>{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function SetupCard({ setup }: { setup: SetupRow }) {
+  const stateColors: Record<string, string> = {
+    forming: "#b8892d",
+    confirmed: "#0f6c5c",
+    triggered: "#3756a6",
+    failed: "#bd4f36",
+    invalidated: "#888",
+  };
+  const color = stateColors[setup.state] ?? "#444";
+
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "auto 1fr auto",
+        gap: 12,
+        alignItems: "start",
+        padding: "14px 0",
+        borderBottom: "1px solid var(--line)",
+      }}
+    >
+      <div
+        style={{
+          width: 4,
+          alignSelf: "stretch",
+          background: color,
+          borderRadius: 2,
+          minHeight: 40,
+        }}
+      />
+      <div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
+          <strong style={{ fontSize: 15 }}>{formatSetupType(setup.setup_type)}</strong>
+          {setup.grade ? (
+            <span
+              style={{
+                background: "rgba(184, 137, 45, 0.15)",
+                color: "#8a631a",
+                borderRadius: 999,
+                fontSize: 11,
+                padding: "3px 8px",
+                letterSpacing: "0.06em",
+              }}
+            >
+              {setup.grade}
+            </span>
+          ) : null}
+        </div>
+        {setup.state === "confirmed" && setup.entry_trigger ? (
+          <div style={{ display: "flex", gap: 20, fontSize: 13, color: "var(--muted)" }}>
+            <span>Entry <strong style={{ color: "#b8892d" }}>{formatPrice(setup.entry_trigger)}</strong></span>
+            <span>Stop <strong style={{ color: "#bd4f36" }}>{formatPrice(setup.stop_reference)}</strong></span>
+            <span>Target <strong style={{ color: "#157f6b" }}>{formatPrice(setup.target_reference)}</strong></span>
+          </div>
+        ) : null}
+        <div style={{ marginTop: 4, fontSize: 12, color: "var(--muted)" }}>
+          detected {new Date(setup.detected_at).toLocaleTimeString()}
+        </div>
+      </div>
+      <Pill tone={setup.state === "confirmed" ? "good" : setup.state === "forming" ? "warn" : "neutral"}>
+        {setup.state}
+      </Pill>
     </div>
   );
 }
