@@ -132,7 +132,10 @@ def normalize_bar(
     # IBKR gives datetime for intraday, date for daily+
     raw_date = getattr(raw, "date", None)
     if isinstance(raw_date, datetime):
-        ts = raw_date.replace(tzinfo=_ET).astimezone(_UTC)
+        # `formatDate=2` historical bars come back as datetime values that should
+        # be treated as UTC timestamps. Re-labelling them as ET shifts every bar
+        # by 4-5 hours and breaks the chart session boundary.
+        ts = raw_date.astimezone(_UTC) if raw_date.tzinfo is not None else raw_date.replace(tzinfo=_UTC)
     else:
         # daily bar — use session open as the timestamp
         ts = datetime.combine(raw_date, time(9, 30), _ET).astimezone(_UTC)
