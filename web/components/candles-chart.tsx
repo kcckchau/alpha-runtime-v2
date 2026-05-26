@@ -10,9 +10,11 @@ import {
   LineData,
   LineSeries,
   LineStyle,
+  SeriesMarker,
   TickMarkType,
   Time,
   createChart,
+  createSeriesMarkers,
 } from "lightweight-charts";
 
 type BarRow = {
@@ -41,6 +43,7 @@ type CandlesChartProps = {
   bars: BarRow[];
   overlays: OverlayLine[];
   emas?: EmaConfig[];
+  markers?: SeriesMarker<Time>[];
 };
 
 // ─── ET timezone helpers ──────────────────────────────────────────────────────
@@ -162,12 +165,13 @@ function computeEma(bars: BarRow[], period: number): LineData<Time>[] {
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
-export function CandlesChart({ bars, overlays, emas = [] }: CandlesChartProps) {
+export function CandlesChart({ bars, overlays, emas = [], markers = [] }: CandlesChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const vwapRef = useRef<ISeriesApi<"Line"> | null>(null);
   const emaSeriesRef = useRef<Map<number, ISeriesApi<"Line">>>(new Map());
+  const markerApiRef = useRef<ReturnType<typeof createSeriesMarkers<Time>> | null>(null);
 
   useEffect(() => {
     if (!containerRef.current || chartRef.current) return;
@@ -214,16 +218,19 @@ export function CandlesChart({ bars, overlays, emas = [] }: CandlesChartProps) {
       wickUpColor: "#22c55e",
       wickDownColor: "#ef4444",
     });
+    const markerApi = createSeriesMarkers(candle, [], { zOrder: "aboveSeries" });
 
     chartRef.current = chart;
     candleRef.current = candle;
     vwapRef.current = vwap;
+    markerApiRef.current = markerApi;
 
     return () => {
       chart.remove();
       chartRef.current = null;
       candleRef.current = null;
       vwapRef.current = null;
+      markerApiRef.current = null;
       emaSeriesRef.current.clear();
     };
   }, []);
@@ -272,9 +279,10 @@ export function CandlesChart({ bars, overlays, emas = [] }: CandlesChartProps) {
         title: overlay.label,
       });
     }
+    markerApiRef.current?.setMarkers(markers);
 
     chart.timeScale().fitContent();
-  }, [bars, overlays, emas]);
+  }, [bars, overlays, emas, markers]);
 
   return <div ref={containerRef} style={{ height: 420, width: "100%" }} />;
 }

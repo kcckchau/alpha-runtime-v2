@@ -36,6 +36,7 @@ from alpha.models.enums import (
     EventType,
     HealthStatus,
     ORBState,
+    OrderSide,
     SessionPhase,
     SetupGrade,
     SetupState,
@@ -517,6 +518,7 @@ class SetupEngine(BaseEngine):
         context.last_setup = entry
         context.counts = self._build_counts(context.setups)
         context.counts_by_type = self._build_counts_by_type(context.setups)
+        context.counts_by_level = self._build_counts_by_level(context.setups)
 
     @staticmethod
     def _history_entry_from_setup(setup: Setup) -> SetupHistoryEntry:
@@ -533,6 +535,8 @@ class SetupEngine(BaseEngine):
             detected_at=setup.detected_at,
             updated_at=setup.updated_at,
             resolved_at=resolved_at,
+            side=SetupEngine._side_for_setup_type(setup.setup_type),
+            level_tag=SetupEngine._level_tag_for_setup_type(setup.setup_type),
             entry_trigger=setup.entry_trigger,
             stop_reference=setup.stop_reference,
             target_reference=setup.target_reference,
@@ -573,6 +577,40 @@ class SetupEngine(BaseEngine):
             bucket["detected"] += 1
             bucket[str(entry.state)] += 1
         return counts
+
+    @staticmethod
+    def _build_counts_by_level(setups: list[SetupHistoryEntry]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for entry in setups:
+            counts[entry.level_tag] = counts.get(entry.level_tag, 0) + 1
+        return counts
+
+    @staticmethod
+    def _side_for_setup_type(setup_type: SetupType) -> OrderSide:
+        bullish = {
+            SetupType.VWAP_RECLAIM,
+            SetupType.ORB_BREAKOUT,
+            SetupType.SWEEP_RECLAIM,
+            SetupType.FAKE_BREAKDOWN,
+            SetupType.HOD_BREAKOUT,
+            SetupType.TREND_PULLBACK,
+            SetupType.RELATIVE_STRENGTH_BREAKOUT,
+        }
+        return OrderSide.BUY if setup_type in bullish else OrderSide.SELL
+
+    @staticmethod
+    def _level_tag_for_setup_type(setup_type: SetupType) -> str:
+        if setup_type == SetupType.HOD_BREAKOUT:
+            return "hod"
+        if setup_type in {SetupType.VWAP_RECLAIM, SetupType.VWAP_REJECTION, SetupType.FAKE_BREAKDOWN, SetupType.TREND_PULLBACK}:
+            return "vwap"
+        if setup_type in {SetupType.ORB_BREAKOUT, SetupType.ORB_BREAKDOWN}:
+            return "orb"
+        if setup_type == SetupType.SWEEP_RECLAIM:
+            return "sweep"
+        if setup_type == SetupType.RELATIVE_STRENGTH_BREAKOUT:
+            return "relative_strength"
+        return "other"
 
     def _calendar_for_symbol(self, symbol: str) -> SessionCalendar:
         if symbol not in self._symbol_calendars:

@@ -4,7 +4,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
-from alpha.models.enums import SessionPhase, SetupGrade, SetupState, SetupType
+from alpha.models.enums import OrderSide, SessionPhase, SetupGrade, SetupState, SetupType
 from alpha.models.market_state import MarketState
 from alpha.models.snapshot import BarSnapshot
 
@@ -63,6 +63,8 @@ class SetupHistoryEntry(BaseModel):
     detected_at: datetime
     updated_at: datetime
     resolved_at: datetime | None = None
+    side: OrderSide
+    level_tag: str
     entry_trigger: Decimal | None = None
     stop_reference: Decimal | None = None
     target_reference: Decimal | None = None
@@ -83,3 +85,4 @@ class SessionSetupContext(BaseModel):
     setups: list[SetupHistoryEntry] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
     counts_by_type: dict[str, dict[str, int]] = Field(default_factory=dict)
+    counts_by_level: dict[str, int] = Field(default_factory=dict)
