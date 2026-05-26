@@ -4,7 +4,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
-from alpha.models.enums import SetupGrade, SetupState, SetupType
+from alpha.models.enums import SessionPhase, SetupGrade, SetupState, SetupType
 from alpha.models.market_state import MarketState
 from alpha.models.snapshot import BarSnapshot
 
@@ -54,3 +54,32 @@ class Setup(BaseModel):
             if reason:
                 updates["invalidation_reason"] = reason
         return self.model_copy(update=updates)
+
+
+class SetupHistoryEntry(BaseModel):
+    setup_id: UUID
+    setup_type: SetupType
+    state: SetupState
+    detected_at: datetime
+    updated_at: datetime
+    resolved_at: datetime | None = None
+    entry_trigger: Decimal | None = None
+    stop_reference: Decimal | None = None
+    target_reference: Decimal | None = None
+    grade: SetupGrade | None = None
+    score: float | None = None
+    session_phase: SessionPhase
+    invalidation_reason: str | None = None
+
+
+class SessionSetupContext(BaseModel):
+    symbol: str
+    session_key: str
+    session_date: str
+    session_open: datetime
+    session_close: datetime
+    session_timezone: str
+    last_setup: SetupHistoryEntry | None = None
+    setups: list[SetupHistoryEntry] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+    counts_by_type: dict[str, dict[str, int]] = Field(default_factory=dict)

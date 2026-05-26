@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID
 
+from alpha.calendar.base import SessionCalendar
+from alpha.calendar.resolver import calendar_for_symbol
 from alpha.config.settings import AlphaSettings
 from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
@@ -41,7 +43,7 @@ from alpha.models.enums import (
 )
 from alpha.models.events import AnyEvent, BarEvent, SetupEvent
 from alpha.models.market_state import MarketState
-from alpha.models.setup import Setup
+from alpha.models.setup import SessionSetupContext, Setup, SetupHistoryEntry
 from alpha.models.snapshot import BarSnapshot
 
 logger = logging.getLogger(__name__)
@@ -83,6 +85,9 @@ class SetupEngine(BaseEngine):
         self._market_state_engine: object | None = None
         # Active setups: symbol → {setup_id → Setup}
         self._active: dict[str, dict[UUID, Setup]] = {}
+        self._session_contexts: dict[str, SessionSetupContext] = {}
+        self._session_keys: dict[str, str] = {}
+        self._symbol_calendars: dict[str, SessionCalendar] = {}
         # Bars-in-forming counter for invalidation timers
         self._forming_bars: dict[UUID, int] = {}
         self._setups_detected: int = 0
@@ -101,8 +106,10 @@ class SetupEngine(BaseEngine):
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def _on_initialize(self) -> None:
-        for ticker in self._registry.tickers():
+        for symbol in self._registry.all():
+            ticker = symbol.ticker
             self._active[ticker] = {}
+            self._symbol_calendars[ticker] = calendar_for_symbol(symbol)
 
     async def _on_start(self) -> None:
         self._event_bus.subscribe(EventType.BAR, self._handle_bar)
@@ -127,6 +134,9 @@ class SetupEngine(BaseEngine):
     def active_setups(self, symbol: str) -> list[Setup]:
         return list(self._active.get(symbol, {}).values())
 
+    def session_setup_context(self, symbol: str) -> SessionSetupContext | None:
+        return self._session_contexts.get(symbol)
+
     # ── Handler ───────────────────────────────────────────────────────────────
 
     async def _handle_bar(self, event: AnyEvent) -> None:
@@ -134,6 +144,7 @@ class SetupEngine(BaseEngine):
             return
 
         symbol = event.symbol
+        self._roll_session_if_needed(symbol, event.timestamp)
         snapshot = self._get_snapshot(symbol)
         market_state = self._get_market_state(symbol)
         if snapshot is None or market_state is None:
@@ -267,6 +278,7 @@ class SetupEngine(BaseEngine):
         )
         self._active.setdefault(symbol, {})[setup.setup_id] = setup
         self._setups_detected += 1
+        self._record_setup(symbol, setup)
         logger.info("Setup detected: %s %s @ %s", symbol, setup_type, snapshot.timestamp)
         await self._emit(setup, None, trigger)
 
@@ -282,6 +294,7 @@ class SetupEngine(BaseEngine):
             updated, _ = self._advance_state(setup, snapshot, market_state)
             if updated.state != setup.state:
                 self._active[symbol][setup_id] = updated
+                self._record_setup(symbol, updated)
                 await self._emit(updated, setup.state, trigger)
                 if updated.state == SetupState.TRIGGERED:
                     self._setups_triggered += 1
@@ -465,6 +478,106 @@ class SetupEngine(BaseEngine):
         await self._event_bus.publish(event)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _roll_session_if_needed(self, symbol: str, timestamp: datetime) -> None:
+        calendar = self._calendar_for_symbol(symbol)
+        session_key = calendar.session_key(timestamp)
+        if self._session_keys.get(symbol) == session_key:
+            return
+
+        self._session_keys[symbol] = session_key
+        stale_ids = list(self._active.get(symbol, {}).keys())
+        self._active[symbol] = {}
+        for setup_id in stale_ids:
+            self._forming_bars.pop(setup_id, None)
+
+        session_date = calendar.session_date(timestamp)
+        self._session_contexts[symbol] = SessionSetupContext(
+            symbol=symbol,
+            session_key=session_key,
+            session_date=session_date.isoformat(),
+            session_open=calendar.session_open(session_date),
+            session_close=calendar.session_close(session_date),
+            session_timezone=calendar.timezone,
+        )
+
+    def _record_setup(self, symbol: str, setup: Setup) -> None:
+        context = self._session_contexts.get(symbol)
+        if context is None:
+            return
+
+        entry = self._history_entry_from_setup(setup)
+        for index, existing in enumerate(context.setups):
+            if existing.setup_id == setup.setup_id:
+                context.setups[index] = entry
+                break
+        else:
+            context.setups.append(entry)
+
+        context.last_setup = entry
+        context.counts = self._build_counts(context.setups)
+        context.counts_by_type = self._build_counts_by_type(context.setups)
+
+    @staticmethod
+    def _history_entry_from_setup(setup: Setup) -> SetupHistoryEntry:
+        resolved_at = setup.updated_at if setup.state in {
+            SetupState.TRIGGERED,
+            SetupState.FAILED,
+            SetupState.INVALIDATED,
+            SetupState.EXPIRED,
+        } else None
+        return SetupHistoryEntry(
+            setup_id=setup.setup_id,
+            setup_type=setup.setup_type,
+            state=setup.state,
+            detected_at=setup.detected_at,
+            updated_at=setup.updated_at,
+            resolved_at=resolved_at,
+            entry_trigger=setup.entry_trigger,
+            stop_reference=setup.stop_reference,
+            target_reference=setup.target_reference,
+            grade=setup.grade,
+            score=setup.score,
+            session_phase=setup.bar_snapshot.session_phase,
+            invalidation_reason=setup.invalidation_reason,
+        )
+
+    @staticmethod
+    def _build_counts(setups: list[SetupHistoryEntry]) -> dict[str, int]:
+        return {
+            "detected_total": len(setups),
+            "forming_total": sum(entry.state == SetupState.FORMING for entry in setups),
+            "confirmed_total": sum(entry.state == SetupState.CONFIRMED for entry in setups),
+            "triggered_total": sum(entry.state == SetupState.TRIGGERED for entry in setups),
+            "failed_total": sum(entry.state == SetupState.FAILED for entry in setups),
+            "invalidated_total": sum(entry.state == SetupState.INVALIDATED for entry in setups),
+            "expired_total": sum(entry.state == SetupState.EXPIRED for entry in setups),
+        }
+
+    @staticmethod
+    def _build_counts_by_type(setups: list[SetupHistoryEntry]) -> dict[str, dict[str, int]]:
+        counts: dict[str, dict[str, int]] = {}
+        for entry in setups:
+            bucket = counts.setdefault(
+                str(entry.setup_type),
+                {
+                    "detected": 0,
+                    "forming": 0,
+                    "confirmed": 0,
+                    "triggered": 0,
+                    "failed": 0,
+                    "invalidated": 0,
+                    "expired": 0,
+                },
+            )
+            bucket["detected"] += 1
+            bucket[str(entry.state)] += 1
+        return counts
+
+    def _calendar_for_symbol(self, symbol: str) -> SessionCalendar:
+        if symbol not in self._symbol_calendars:
+            self._symbol_calendars[symbol] = calendar_for_symbol(self._registry.get(symbol))
+        return self._symbol_calendars[symbol]
 
     def _get_snapshot(self, symbol: str) -> BarSnapshot | None:
         if self._feature_engine is None:

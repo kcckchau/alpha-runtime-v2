@@ -50,6 +50,7 @@ def _snapshot_or_default() -> dict[str, Any]:
         "contexts": {},
         "market_states": {},
         "setups": [],
+        "setup_contexts": {},
         "orders": [],
     }
 
@@ -90,6 +91,15 @@ async def list_active_setups(symbol: str | None = None) -> list[dict]:  # type: 
     if symbol is None:
         return setups
     return [setup for setup in setups if setup.get("symbol") == symbol]
+
+
+@router.get("/setup-contexts")
+async def list_setup_contexts(symbol: str | None = None) -> dict[str, Any]:
+    snapshot = _snapshot_or_default()
+    contexts = snapshot["setup_contexts"]
+    if symbol is None:
+        return contexts
+    return {symbol: contexts.get(symbol)}
 
 
 @router.get("/quotes")
