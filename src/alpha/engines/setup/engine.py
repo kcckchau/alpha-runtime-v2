@@ -33,6 +33,7 @@ from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.models.enums import (
+    AssetClass,
     EventType,
     HealthStatus,
     ORBState,
@@ -149,6 +150,12 @@ class SetupEngine(BaseEngine):
         snapshot = self._get_snapshot(symbol)
         market_state = self._get_market_state(symbol)
         if snapshot is None or market_state is None:
+            self._log_scan_detail(
+                "Setup scan skipped: %s missing_context snapshot=%s market_state=%s",
+                symbol,
+                snapshot is not None,
+                market_state is not None,
+            )
             return
 
         await self._scan_for_setups(symbol, snapshot, market_state, event)
@@ -173,9 +180,31 @@ class SetupEngine(BaseEngine):
         ]
         for setup_type, detector in detectors:
             if self._has_active(symbol, setup_type):
+                self._log_scan_detail(
+                    "Setup scan skipped: %s %s reason=already_active",
+                    symbol,
+                    setup_type,
+                )
                 continue
-            if detector(snapshot, market_state):
+            if not self._session_allows_detection(symbol, snapshot):
+                self._log_scan_detail(
+                    "Setup scan blocked: %s %s reason=session_phase_not_allowed phase=%s",
+                    symbol,
+                    setup_type,
+                    snapshot.session_phase,
+                )
+                continue
+            reason = self._detector_reason(setup_type, snapshot, market_state)
+            if reason is None:
                 await self._open_setup(symbol, setup_type, snapshot, market_state, trigger)
+            else:
+                self._log_scan_detail(
+                    "Setup candidate rejected: %s %s reason=%s phase=%s",
+                    symbol,
+                    setup_type,
+                    reason,
+                    snapshot.session_phase,
+                )
 
     def _has_active(self, symbol: str, setup_type: SetupType) -> bool:
         return any(
@@ -190,8 +219,6 @@ class SetupEngine(BaseEngine):
         FORMING: at least 1 bar below VWAP, low near VWAP (within 0.1%).
         MNQ opposed → blocked (not yet implemented; skipped until MNQ lead is wired).
         """
-        if snap.session_phase not in _RTH_PHASES:
-            return False
         if snap.bars_below_vwap < 1:
             return False
         # Low must be at or near VWAP (within 0.1% above)
@@ -199,14 +226,19 @@ class SetupEngine(BaseEngine):
             return False
         return True
 
+    def _reason_fake_breakdown(self, snap: BarSnapshot, ms: MarketState) -> str | None:
+        if snap.bars_below_vwap < 1:
+            return "bars_below_vwap_lt_1"
+        if snap.bar.low > snap.vwap * Decimal("1.001"):
+            return "low_not_near_vwap"
+        return None
+
     def _detect_hod_breakout(self, snap: BarSnapshot, ms: MarketState) -> bool:
         """
         Prereq: intraday_high > orb_high, price above VWAP.
         FORMING: higher highs, within 0.2% of intraday high.
         MNQ opposed → blocked (skipped until MNQ lead is wired).
         """
-        if snap.session_phase not in _RTH_PHASES:
-            return False
         # ORB must be established
         if snap.orb_state == ORBState.NOT_SET or snap.orb_high is None:
             return False
@@ -227,14 +259,28 @@ class SetupEngine(BaseEngine):
             return False
         return True
 
+    def _reason_hod_breakout(self, snap: BarSnapshot, ms: MarketState) -> str | None:
+        if snap.orb_state == ORBState.NOT_SET or snap.orb_high is None:
+            return "orb_not_set"
+        if snap.intraday_high is None:
+            return "intraday_high_missing"
+        if snap.intraday_high <= snap.orb_high:
+            return "intraday_high_not_above_orb_high"
+        if not snap.is_above_vwap:
+            return "not_above_vwap"
+        if not snap.is_higher_high:
+            return "not_higher_high"
+        dist_to_hod = float((snap.intraday_high - snap.bar.close) / snap.intraday_high)
+        if dist_to_hod > 0.002:
+            return "close_too_far_from_hod"
+        return None
+
     def _detect_trend_pullback(self, snap: BarSnapshot, ms: MarketState) -> bool:
         """
         FORMING: ≥5 consecutive bars above VWAP, pulling back (deviation shrinking),
         within 0.5% of VWAP.
         MNQ opposed → blocked (skipped until MNQ lead is wired).
         """
-        if snap.session_phase not in _RTH_PHASES:
-            return False
         if snap.bars_above_vwap < 5:
             return False
         if not snap.vwap_deviation_shrinking:
@@ -243,6 +289,17 @@ class SetupEngine(BaseEngine):
         if snap.vwap_deviation_pct <= 0 or snap.vwap_deviation_pct > 0.5:
             return False
         return True
+
+    def _reason_trend_pullback(self, snap: BarSnapshot, ms: MarketState) -> str | None:
+        if snap.bars_above_vwap < 5:
+            return "bars_above_vwap_lt_5"
+        if not snap.vwap_deviation_shrinking:
+            return "vwap_deviation_not_shrinking"
+        if snap.vwap_deviation_pct <= 0:
+            return "not_above_vwap"
+        if snap.vwap_deviation_pct > 0.5:
+            return "pullback_too_far_from_vwap"
+        return None
 
     # ── Stub detectors (not yet implemented) ─────────────────────────────────
 
@@ -254,6 +311,26 @@ class SetupEngine(BaseEngine):
 
     def _detect_sweep_reclaim(self, snap: BarSnapshot, ms: MarketState) -> bool:
         return False
+
+    def _detector_reason(
+        self,
+        setup_type: SetupType,
+        snapshot: BarSnapshot,
+        market_state: MarketState,
+    ) -> str | None:
+        if setup_type == SetupType.FAKE_BREAKDOWN:
+            return self._reason_fake_breakdown(snapshot, market_state)
+        if setup_type == SetupType.HOD_BREAKOUT:
+            return self._reason_hod_breakout(snapshot, market_state)
+        if setup_type == SetupType.TREND_PULLBACK:
+            return self._reason_trend_pullback(snapshot, market_state)
+        if setup_type == SetupType.VWAP_RECLAIM:
+            return "not_implemented"
+        if setup_type == SetupType.ORB_BREAKOUT:
+            return "not_implemented"
+        if setup_type == SetupType.SWEEP_RECLAIM:
+            return "not_implemented"
+        return "no_reason_available"
 
     # ── State machine ─────────────────────────────────────────────────────────
 
@@ -616,6 +693,18 @@ class SetupEngine(BaseEngine):
         if symbol not in self._symbol_calendars:
             self._symbol_calendars[symbol] = calendar_for_symbol(self._registry.get(symbol))
         return self._symbol_calendars[symbol]
+
+    def _log_scan_detail(self, message: str, *args: object) -> None:
+        if self._settings.runtime.setup_debug:
+            logger.info("[setup-debug] " + message, *args)
+        else:
+            logger.debug(message, *args)
+
+    def _session_allows_detection(self, symbol: str, snapshot: BarSnapshot) -> bool:
+        asset_class = self._registry.get(symbol).asset_class
+        if asset_class == AssetClass.FUTURE:
+            return snapshot.session_phase != SessionPhase.CLOSED
+        return snapshot.session_phase in _RTH_PHASES
 
     def _get_snapshot(self, symbol: str) -> BarSnapshot | None:
         if self._feature_engine is None:
