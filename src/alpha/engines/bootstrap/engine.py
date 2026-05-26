@@ -357,7 +357,7 @@ class BootstrapEngine(BaseEngine):
 
         stored = await self._storage.load_bar_events(symbol, timeframe, start.date(), end.date())
         stored = [bar for bar in stored if start <= bar.timestamp <= end]
-        missing_ranges = self._missing_ranges(stored, start, end, timeframe)
+        missing_ranges = self._missing_ranges(symbol, stored, start, end, timeframe)
         logger.info(
             "Catch-up %s %s | stored=%d | missing_ranges=%d | window=%s -> %s",
             symbol,
@@ -412,14 +412,16 @@ class BootstrapEngine(BaseEngine):
         }
         return mapping[timeframe]
 
-    @staticmethod
     def _missing_ranges(
+        self,
+        symbol: str,
         stored_bars: list[Any],
         start: datetime,
         end: datetime,
         timeframe: BarTimeframe,
     ) -> list[tuple[datetime, datetime]]:
         step = BootstrapEngine._timeframe_delta(timeframe)
+        calendar = calendar_for_symbol(self._registry.get(symbol))
         relevant = sorted(
             [bar for bar in stored_bars if start <= bar.timestamp <= end],
             key=lambda bar: bar.timestamp,
@@ -430,16 +432,16 @@ class BootstrapEngine(BaseEngine):
         missing: list[tuple[datetime, datetime]] = []
 
         first = relevant[0]
-        if first.timestamp > start:
+        if self._should_fill_head_gap(calendar, timeframe, start, first.timestamp):
             missing.append((start, first.timestamp - step))
 
         for left, right in zip(relevant, relevant[1:]):
             expected_next = left.timestamp + step
-            if right.timestamp > expected_next:
+            if self._should_fill_internal_gap(calendar, timeframe, left.timestamp, right.timestamp, expected_next):
                 missing.append((expected_next, right.timestamp - step))
 
         last = relevant[-1]
-        if last.timestamp < end:
+        if self._should_fill_tail_gap(calendar, timeframe, last.timestamp, end):
             missing.append((last.timestamp + step, end))
 
         return [
@@ -447,6 +449,42 @@ class BootstrapEngine(BaseEngine):
             for gap_start, gap_end in missing
             if gap_start <= gap_end
         ]
+
+    @staticmethod
+    def _should_fill_head_gap(
+        calendar: SessionCalendar,
+        timeframe: BarTimeframe,
+        start: datetime,
+        first: datetime,
+    ) -> bool:
+        if timeframe in {BarTimeframe.H1, BarTimeframe.D1}:
+            return calendar.session_key(start) == calendar.session_key(first)
+        return first > start
+
+    @staticmethod
+    def _should_fill_internal_gap(
+        calendar: SessionCalendar,
+        timeframe: BarTimeframe,
+        left: datetime,
+        right: datetime,
+        expected_next: datetime,
+    ) -> bool:
+        if right <= expected_next:
+            return False
+        if timeframe in {BarTimeframe.H1, BarTimeframe.D1}:
+            return calendar.session_key(left) == calendar.session_key(right)
+        return True
+
+    @staticmethod
+    def _should_fill_tail_gap(
+        calendar: SessionCalendar,
+        timeframe: BarTimeframe,
+        last: datetime,
+        end: datetime,
+    ) -> bool:
+        if timeframe in {BarTimeframe.H1, BarTimeframe.D1}:
+            return calendar.session_key(last) == calendar.session_key(end)
+        return last < end
 
     async def _status_loop(self) -> None:
         ticks = 0
