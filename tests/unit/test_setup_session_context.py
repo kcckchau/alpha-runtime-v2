@@ -68,6 +68,10 @@ async def test_setup_context_rolls_with_futures_session() -> None:
     assert first_context is not None
     assert first_context.session_key == "2026-05-26"
     assert first_context.counts["detected_total"] == 1
+    assert first_context.last_setup is not None
+    assert first_context.last_setup.side == "buy"
+    assert first_context.last_setup.level_tag == "hod"
+    assert first_context.counts_by_level == {"hod": 1}
 
     next_session_timestamp = datetime(2026, 5, 26, 22, 30, tzinfo=timezone.utc)
     engine._roll_session_if_needed("MNQ", next_session_timestamp)

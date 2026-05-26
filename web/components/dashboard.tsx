@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
-import { LineStyle } from "lightweight-charts";
+import { LineStyle, SeriesMarker, Time } from "lightweight-charts";
 import { CandlesChart, EmaConfig } from "@/components/candles-chart";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -88,6 +88,38 @@ type RiskState = {
   is_halted?: boolean | null;
 };
 
+type SetupHistoryEntry = {
+  setup_id: string;
+  setup_type: string;
+  state: string;
+  detected_at: string;
+  updated_at: string;
+  resolved_at?: string | null;
+  side: string;
+  level_tag: string;
+  entry_trigger?: string | null;
+  stop_reference?: string | null;
+  target_reference?: string | null;
+  grade?: string | null;
+  score?: number | null;
+  session_phase: string;
+  invalidation_reason?: string | null;
+};
+
+type SetupSessionContext = {
+  symbol: string;
+  session_key: string;
+  session_date: string;
+  session_open: string;
+  session_close: string;
+  session_timezone: string;
+  last_setup?: SetupHistoryEntry | null;
+  setups: SetupHistoryEntry[];
+  counts: Record<string, number>;
+  counts_by_type: Record<string, Record<string, number>>;
+  counts_by_level: Record<string, number>;
+};
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const API_BASE =
@@ -95,6 +127,17 @@ const API_BASE =
 
 const TIMEFRAMES = ["1s", "1m", "5m", "15m", "1h"] as const;
 type Timeframe = (typeof TIMEFRAMES)[number];
+
+const ET_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
 
 // ─── Shared style constants ───────────────────────────────────────────────────
 
@@ -155,6 +198,14 @@ function todayDate(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+function toETChartTime(timestamp: string): Time {
+  const raw = new Date(timestamp).getTime();
+  const parts = ET_FMT.formatToParts(new Date(raw));
+  const g = (t: string) => parts.find((p) => p.type === t)?.value ?? "00";
+  const iso = `${g("year")}-${g("month")}-${g("day")}T${g("hour")}:${g("minute")}:${g("second")}Z`;
+  return Math.floor(new Date(iso).getTime() / 1000) as Time;
+}
+
 function gradeColor(grade: string | null): string {
   if (grade === "SSS") return "#fbbf24";
   if (grade === "A+") return "#22c55e";
@@ -189,6 +240,24 @@ function regimeColor(regime: string | null | undefined): string {
   if (regime === "above" || regime === "reclaiming") return "#fbbf24";
   if (regime === "rejecting") return "#ef4444";
   return "rgba(255,255,255,0.88)";
+}
+
+function levelColor(levelTag: string): string {
+  if (levelTag === "hod") return "#60a5fa";
+  if (levelTag === "vwap") return "#fbbf24";
+  if (levelTag === "orb") return "#22c55e";
+  if (levelTag === "sweep") return "#ef4444";
+  return "rgba(255,255,255,0.55)";
+}
+
+function setupMarkerShape(entry: SetupHistoryEntry): "circle" | "square" | "arrowUp" | "arrowDown" {
+  if (entry.state === "triggered") return entry.side === "buy" ? "arrowUp" : "arrowDown";
+  if (entry.state === "failed" || entry.state === "invalidated" || entry.state === "expired") return "square";
+  return "circle";
+}
+
+function setupMarkerPosition(entry: SetupHistoryEntry): "aboveBar" | "belowBar" {
+  return entry.side === "buy" ? "belowBar" : "aboveBar";
 }
 
 // ─── Primitive components ─────────────────────────────────────────────────────
@@ -361,6 +430,94 @@ function SetupsPanel({ setups }: { setups: SetupRow[] }) {
   );
 }
 
+function SetupHistoryPanel({ context }: { context: SetupSessionContext | null }) {
+  const recent = [...(context?.setups ?? [])]
+    .sort((a, b) => new Date(b.detected_at).getTime() - new Date(a.detected_at).getTime())
+    .slice(0, 6);
+
+  return (
+    <div style={S.panel}>
+      <div style={S.panelHd}>
+        <span style={S.panelLbl}>Today&apos;s Setup History</span>
+        {context && <Pill color="blue">{context.session_key}</Pill>}
+      </div>
+      <div style={{ padding: 8 }}>
+        {!context || recent.length === 0 ? (
+          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", ...S.mono, padding: "6px 0" }}>
+            No setups recorded this session
+          </div>
+        ) : (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 8 }}>
+              <div style={{ background: "rgba(255,255,255,0.03)", borderRadius: 5, padding: "6px 8px" }}>
+                <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", ...S.mono, marginBottom: 2 }}>Detected</div>
+                <div style={{ ...S.mono, fontSize: 13, fontWeight: 500 }}>{context.counts.detected_total ?? 0}</div>
+              </div>
+              <div style={{ background: "rgba(255,255,255,0.03)", borderRadius: 5, padding: "6px 8px" }}>
+                <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", ...S.mono, marginBottom: 2 }}>Triggered</div>
+                <div style={{ ...S.mono, fontSize: 13, fontWeight: 500, color: "#22c55e" }}>{context.counts.triggered_total ?? 0}</div>
+              </div>
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+              {Object.entries(context.counts_by_level).map(([level, count]) => (
+                <span
+                  key={level}
+                  style={{
+                    ...S.mono,
+                    fontSize: 10,
+                    padding: "2px 6px",
+                    borderRadius: 100,
+                    background: "rgba(255,255,255,0.05)",
+                    border: `0.5px solid ${levelColor(level)}55`,
+                    color: levelColor(level),
+                  }}
+                >
+                  {level.toUpperCase()} {count}
+                </span>
+              ))}
+            </div>
+            {recent.map((entry) => (
+              <div
+                key={entry.setup_id}
+                style={{
+                  borderLeft: `2px solid ${levelColor(entry.level_tag)}`,
+                  padding: "7px 9px",
+                  marginBottom: 5,
+                  borderRadius: "0 4px 4px 0",
+                  background: "rgba(255,255,255,0.03)",
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 3 }}>
+                  <span style={{ ...S.mono, fontSize: 10, fontWeight: 500 }}>
+                    {entry.setup_type.toUpperCase()}
+                  </span>
+                  <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.4)" }}>
+                    {new Date(entry.detected_at).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false })}
+                  </span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", marginBottom: 3 }}>
+                  <span style={{ ...S.mono, fontSize: 9, color: levelColor(entry.level_tag) }}>{entry.level_tag.toUpperCase()}</span>
+                  <span style={{ ...S.mono, fontSize: 9, color: entry.side === "buy" ? "#22c55e" : "#ef4444" }}>{entry.side.toUpperCase()}</span>
+                  <span style={{ ...S.mono, fontSize: 9, color: stateColor(entry.state) }}>{entry.state.toUpperCase()}</span>
+                  {entry.grade && <span style={{ ...S.mono, fontSize: 9, color: gradeColor(entry.grade) }}>{entry.grade}</span>}
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.4)" }}>
+                    E <span style={{ color: "rgba(255,255,255,0.88)" }}>{formatPrice(entry.entry_trigger)}</span>
+                  </span>
+                  <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.4)" }}>
+                    SL <span style={{ color: "#ef4444" }}>{formatPrice(entry.stop_reference)}</span>
+                  </span>
+                </div>
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function FeaturesPanel({ context }: { context: SymbolContext | null }) {
   const rvol = context?.relative_volume;
   const atr = context?.atr_14;
@@ -508,6 +665,7 @@ export function Dashboard() {
   const [quotes, setQuotes] = useState<Record<string, QuoteRow | null>>({});
   const [bars, setBars] = useState<BarHistoryRow[]>([]);
   const [setups, setSetups] = useState<SetupRow[]>([]);
+  const [setupContexts, setSetupContexts] = useState<Record<string, SetupSessionContext | null>>({});
   const [riskState, setRiskState] = useState<RiskState | null>(null);
   const [clock, setClock] = useState("--:--:-- ET");
   const [error, setError] = useState<string | null>(null);
@@ -536,13 +694,14 @@ export function Dashboard() {
           ? selectedSymbol
           : (statusData.symbols[0] ?? "MNQ");
 
-        const [contextData, quoteData, barData, setupData] = await Promise.all([
+        const [contextData, quoteData, barData, setupData, setupContextData] = await Promise.all([
           fetchJson<Record<string, SymbolContext | null>>(`/runtime/contexts?symbol=${symbol}`),
           fetchJson<Record<string, QuoteRow | null>>(`/runtime/quotes?symbol=${symbol}`),
           fetchJson<BarHistoryRow[]>(
             `/runtime/bars/history?symbol=${symbol}&timeframe=${selectedTimeframe}&start=${historyStartDate(symbol)}&end=${todayDate()}`
           ),
           fetchJson<SetupRow[]>(`/runtime/setups?symbol=${symbol}`),
+          fetchJson<Record<string, SetupSessionContext | null>>(`/runtime/setup-contexts?symbol=${symbol}`),
         ]);
 
         // Optional endpoint — silently ignore if not yet implemented
@@ -556,6 +715,7 @@ export function Dashboard() {
         setQuotes((prev) => ({ ...prev, ...quoteData }));
         setBars(barData);
         setSetups(setupData);
+        setSetupContexts((prev) => ({ ...prev, ...setupContextData }));
         setRiskState(riskData);
         setError(null);
       } catch (err) {
@@ -571,6 +731,7 @@ export function Dashboard() {
 
   const currentContext = contexts[selectedSymbol] ?? null;
   const currentQuote = quotes[selectedSymbol] ?? null;
+  const currentSetupContext = setupContexts[selectedSymbol] ?? null;
 
   // Price / change from last two bars
   const lastBar = bars[bars.length - 1];
@@ -637,8 +798,31 @@ export function Dashboard() {
       }
     }
 
+    for (const entry of currentSetupContext?.setups ?? []) {
+      if (!entry.entry_trigger) continue;
+      if (setups.some((active) => active.setup_id === entry.setup_id)) continue;
+      overlays.push({
+        label: `${entry.level_tag} ${entry.state}`,
+        price: Number(entry.entry_trigger),
+        color: `${levelColor(entry.level_tag)}cc`,
+        style: LineStyle.Dotted,
+      });
+    }
+
     return overlays;
-  }, [currentContext, setups]);
+  }, [currentContext, setups, currentSetupContext]);
+
+  const historyMarkers = useMemo((): SeriesMarker<Time>[] => {
+    return (currentSetupContext?.setups ?? [])
+      .filter((entry) => !!entry.detected_at)
+      .map((entry) => ({
+        time: toETChartTime(entry.detected_at),
+        position: setupMarkerPosition(entry),
+        color: levelColor(entry.level_tag),
+        shape: setupMarkerShape(entry),
+        text: `${entry.level_tag.toUpperCase()} ${entry.state.toUpperCase()}`,
+      }));
+  }, [currentSetupContext]);
 
   // EMA indicator configs — computed from bar data as line series in the chart
   const emas = useMemo((): EmaConfig[] => {
@@ -767,7 +951,7 @@ export function Dashboard() {
           </div>
 
           {/* Candlestick chart */}
-          <CandlesChart bars={bars} overlays={overlayLines} emas={emas} />
+          <CandlesChart bars={bars} overlays={overlayLines} emas={emas} markers={historyMarkers} />
 
           {/* Quote bar */}
           {currentQuote && (
@@ -795,6 +979,7 @@ export function Dashboard() {
 
         {/* Sidebar */}
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <SetupHistoryPanel context={currentSetupContext} />
           <SetupsPanel setups={setups} />
           <FeaturesPanel context={currentContext} />
           <MarketStatePanel context={currentContext} />
