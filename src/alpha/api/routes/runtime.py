@@ -59,6 +59,10 @@ def _parquet_store() -> ParquetStore:
     return ParquetStore(StorageSettings(parquet_root=settings.storage.parquet_root))
 
 
+def _sorted_history_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=lambda row: row["timestamp"])
+
+
 @router.get("/status", response_model=RuntimeStatusResponse)
 async def runtime_status() -> RuntimeStatusResponse:
     """Return current runtime mode, symbols, and engine health snapshot."""
@@ -136,7 +140,7 @@ async def list_bar_history(
         start,
         end,
     )
-    return rows_to_history_payload(table.to_pylist(), normalized_timeframe)
+    return rows_to_history_payload(_sorted_history_rows(table.to_pylist()), normalized_timeframe)
 
 
 @router.get("/contexts")

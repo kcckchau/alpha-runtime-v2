@@ -102,6 +102,9 @@ class StorageEngine(BaseEngine):
     async def save_bar(self, event: BarEvent) -> None:
         await self._write_queue.put(event)
 
+    async def flush(self) -> None:
+        await self._write_queue.join()
+
     # ── Public read API ───────────────────────────────────────────────────────
 
     async def load_bars(

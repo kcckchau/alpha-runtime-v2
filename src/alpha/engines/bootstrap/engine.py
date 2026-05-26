@@ -139,6 +139,8 @@ class BootstrapEngine(BaseEngine):
 
         if mode in {RuntimeMode.LIVE, RuntimeMode.PAPER}:
             await self._run_catchup()
+            if self._storage is not None:
+                await self._storage.flush()
             logger.info("Catch-up complete — transitioning to live feed")
             if self._live is not None:
                 await self._live.start()
@@ -276,8 +278,11 @@ class BootstrapEngine(BaseEngine):
     async def _run_catchup(self) -> None:
         """Load recent history before connecting the live feed."""
         logger.info(
-            "Running catch-up: last %d days",
+            "Running catch-up: last %d days | hourly_warmup_bars=%d | daily_warmup_bars=%d | monthly_warmup_months=%d",
             self._settings.runtime.catchup_lookback_days,
+            self._settings.historical.hourly_warmup_bars,
+            self._settings.historical.daily_warmup_bars,
+            self._settings.historical.monthly_warmup_months,
         )
         if self._historical is None or self._storage is None:
             return
@@ -285,16 +290,17 @@ class BootstrapEngine(BaseEngine):
         end = datetime.now(timezone.utc)
         minute_start = end - timedelta(days=self._settings.runtime.catchup_lookback_days)
         hourly_start = end - timedelta(
-            days=max(90, self._settings.historical.hourly_warmup_bars // 3)
+            days=max(30, self._settings.historical.hourly_warmup_bars // 6)
         )
         daily_start = end - timedelta(
             days=max(
                 self._settings.historical.daily_warmup_bars * 2,
-                self._settings.historical.monthly_warmup_months * 32,
+                self._settings.historical.monthly_warmup_months * 22,
             )
         )
 
         for symbol in self._settings.runtime.symbols:
+            logger.info("Catch-up starting for %s", symbol)
             minute_bars = await self._load_or_fetch_bars(
                 symbol=symbol,
                 timeframe=BarTimeframe.M1,
@@ -327,6 +333,13 @@ class BootstrapEngine(BaseEngine):
                 daily_bars=daily_bars,
                 calendar=self._calendar,
             )
+            logger.info(
+                "Catch-up complete for %s | 1m=%d 1h=%d 1d=%d",
+                symbol,
+                len(minute_bars),
+                len(hourly_bars),
+                len(daily_bars),
+            )
 
     async def _load_or_fetch_bars(
         self,
@@ -343,42 +356,51 @@ class BootstrapEngine(BaseEngine):
 
         stored = await self._storage.load_bar_events(symbol, timeframe, start.date(), end.date())
         stored = [bar for bar in stored if start <= bar.timestamp <= end]
-
-        tail_start = self._tail_fetch_start(stored, start, end, timeframe)
-        if tail_start is None:
-            return stored
-
-        fetched = await self._historical.fetch_bars(
-            symbol=symbol,
-            timeframe=timeframe,
-            start=tail_start,
-            end=end,
-            emit=emit,
+        missing_ranges = self._missing_ranges(stored, start, end, timeframe)
+        logger.info(
+            "Catch-up %s %s | stored=%d | missing_ranges=%d | window=%s -> %s",
+            symbol,
+            timeframe,
+            len(stored),
+            len(missing_ranges),
+            start.isoformat(),
+            end.isoformat(),
         )
-        if persist_direct:
-            for bar in fetched:
-                await self._storage.save_bar(bar)
 
-        merged = stored + fetched
-        merged.sort(key=lambda bar: bar.timestamp)
+        fetched: list[Any] = []
+        for gap_start, gap_end in missing_ranges:
+            logger.info(
+                "Fetching gap for %s %s | %s -> %s",
+                symbol,
+                timeframe,
+                gap_start.isoformat(),
+                gap_end.isoformat(),
+            )
+            bars = await self._historical.fetch_bars(
+                symbol=symbol,
+                timeframe=timeframe,
+                start=gap_start,
+                end=gap_end,
+                emit=emit,
+            )
+            fetched.extend(bars)
+            if persist_direct:
+                for bar in bars:
+                    await self._storage.save_bar(bar)
+
+        merged_by_ts = {bar.timestamp: bar for bar in stored}
+        for bar in fetched:
+            merged_by_ts[bar.timestamp] = bar
+
+        merged = sorted(merged_by_ts.values(), key=lambda bar: bar.timestamp)
+        logger.info(
+            "Catch-up %s %s complete | fetched=%d | merged_total=%d",
+            symbol,
+            timeframe,
+            len(fetched),
+            len(merged),
+        )
         return merged
-
-    @staticmethod
-    def _tail_fetch_start(
-        stored_bars: list[Any],
-        start: datetime,
-        end: datetime,
-        timeframe: BarTimeframe,
-    ) -> datetime | None:
-        relevant = [bar for bar in stored_bars if start <= bar.timestamp <= end]
-        if not relevant:
-            return start
-
-        latest_bar = max(relevant, key=lambda bar: bar.timestamp)
-        if latest_bar.timestamp >= end:
-            return None
-
-        return latest_bar.timestamp + BootstrapEngine._timeframe_delta(timeframe)
 
     @staticmethod
     def _timeframe_delta(timeframe: BarTimeframe) -> timedelta:
@@ -388,6 +410,42 @@ class BootstrapEngine(BaseEngine):
             BarTimeframe.D1: timedelta(days=1),
         }
         return mapping[timeframe]
+
+    @staticmethod
+    def _missing_ranges(
+        stored_bars: list[Any],
+        start: datetime,
+        end: datetime,
+        timeframe: BarTimeframe,
+    ) -> list[tuple[datetime, datetime]]:
+        step = BootstrapEngine._timeframe_delta(timeframe)
+        relevant = sorted(
+            [bar for bar in stored_bars if start <= bar.timestamp <= end],
+            key=lambda bar: bar.timestamp,
+        )
+        if not relevant:
+            return [(start, end)]
+
+        missing: list[tuple[datetime, datetime]] = []
+
+        first = relevant[0]
+        if first.timestamp > start:
+            missing.append((start, first.timestamp - step))
+
+        for left, right in zip(relevant, relevant[1:]):
+            expected_next = left.timestamp + step
+            if right.timestamp > expected_next:
+                missing.append((expected_next, right.timestamp - step))
+
+        last = relevant[-1]
+        if last.timestamp < end:
+            missing.append((last.timestamp + step, end))
+
+        return [
+            (gap_start, gap_end)
+            for gap_start, gap_end in missing
+            if gap_start <= gap_end
+        ]
 
     async def _status_loop(self) -> None:
         ticks = 0

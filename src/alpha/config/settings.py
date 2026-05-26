@@ -82,9 +82,9 @@ class HistoricalSettings(BaseSettings):
     primary_source: DataSourceId = DataSourceId.INTERACTIVE_BROKERS
     lookback_days: int = 30
     max_gap_seconds: int = 300         # gaps larger than this are flagged
-    hourly_warmup_bars: int = 300
-    daily_warmup_bars: int = 300
-    monthly_warmup_months: int = 100
+    hourly_warmup_bars: int = 180
+    daily_warmup_bars: int = 220
+    monthly_warmup_months: int = 60
 
 
 class LiveSettings(BaseSettings):
