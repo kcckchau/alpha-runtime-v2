@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from fastapi import APIRouter
@@ -62,6 +62,57 @@ def _parquet_store() -> ParquetStore:
 
 def _sorted_history_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda row: row["timestamp"])
+
+
+def _parse_timestamp(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def _aggregate_history_rows(
+    rows: list[dict[str, Any]],
+    timeframe: str,
+) -> list[dict[str, Any]]:
+    if timeframe not in {"15m", "1h"}:
+        return rows
+
+    bucket_minutes = 15 if timeframe == "15m" else 60
+    buckets: dict[str, list[dict[str, Any]]] = {}
+
+    for row in _sorted_history_rows(rows):
+        ts = _parse_timestamp(row["timestamp"])
+        if bucket_minutes == 60:
+            bucket = ts.replace(minute=0, second=0, microsecond=0)
+        else:
+            minute = (ts.minute // bucket_minutes) * bucket_minutes
+            bucket = ts.replace(minute=minute, second=0, microsecond=0)
+        buckets.setdefault(bucket.isoformat(), []).append(row)
+
+    aggregated: list[dict[str, Any]] = []
+    for bucket_key in sorted(buckets.keys()):
+        bucket_rows = buckets[bucket_key]
+        first = bucket_rows[0]
+        last = bucket_rows[-1]
+        aggregated.append(
+            {
+                "symbol": first["symbol"],
+                "timestamp": bucket_key,
+                "open": first["open"],
+                "high": str(max(float(item["high"]) for item in bucket_rows)),
+                "low": str(min(float(item["low"]) for item in bucket_rows)),
+                "close": last["close"],
+                "volume": sum(int(item["volume"]) for item in bucket_rows),
+                "vwap": last.get("vwap"),
+                "trade_count": sum(
+                    int(item.get("trade_count") or 0) for item in bucket_rows
+                ) or None,
+                "is_partial": any(bool(item.get("is_partial")) for item in bucket_rows),
+                "source": first.get("source"),
+                "is_replay": first.get("is_replay"),
+            }
+        )
+    return aggregated
 
 
 @router.get("/status", response_model=RuntimeStatusResponse)
@@ -138,9 +189,19 @@ async def list_bar_history(
 
     timeframe_map = {
         "1m": BarTimeframe.M1,
+        "5m": BarTimeframe.M5,
         "1h": BarTimeframe.H1,
         "1d": BarTimeframe.D1,
     }
+    if normalized_timeframe == "15m":
+        table = store.read_range(
+            f"bars/{BarTimeframe.M5}",
+            normalized_symbol,
+            start,
+            end,
+        )
+        rows = _aggregate_history_rows(table.to_pylist(), "15m")
+        return rows_to_history_payload(rows, "15m")
     if normalized_timeframe not in timeframe_map:
         return []
 
@@ -150,7 +211,8 @@ async def list_bar_history(
         start,
         end,
     )
-    return rows_to_history_payload(_sorted_history_rows(table.to_pylist()), normalized_timeframe)
+    rows = _sorted_history_rows(table.to_pylist())
+    return rows_to_history_payload(rows, normalized_timeframe)
 
 
 @router.get("/contexts")

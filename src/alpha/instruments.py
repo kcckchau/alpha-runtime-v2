@@ -83,7 +83,9 @@ def quarterly_contract_month(as_of: date | None = None) -> str:
         if month < quarter_month:
             return f"{year}{quarter_month:02d}"
         if month == quarter_month:
-            if current <= _third_friday(year, quarter_month):
+            # Roll on expiry Friday itself so we don't keep requesting a contract
+            # that IBKR may no longer resolve reliably later that day.
+            if current < _third_friday(year, quarter_month):
                 return f"{year}{quarter_month:02d}"
             break
     return f"{year + 1}03"

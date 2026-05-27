@@ -28,6 +28,8 @@ type QuoteRow = {
   ask_price: string | null;
   bid_size: number | null;
   ask_size: number | null;
+  last_price: string | null;
+  last_size: number | null;
   timestamp: string;
 };
 
@@ -122,8 +124,23 @@ type SetupSessionContext = {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const API_BASE =
-  process.env.NEXT_PUBLIC_ALPHA_API_BASE_URL?.replace(/\/$/, "") ?? "http://127.0.0.1:8000";
+function normalizeApiBaseUrl(rawUrl: string): string {
+  const trimmed = rawUrl.replace(/\/$/, "");
+  try {
+    const parsed = new URL(trimmed);
+    if (typeof window !== "undefined" && parsed.hostname === "127.0.0.1") {
+      parsed.hostname = "localhost";
+      return parsed.toString().replace(/\/$/, "");
+    }
+  } catch {
+    return trimmed;
+  }
+  return trimmed;
+}
+
+const API_BASE = normalizeApiBaseUrl(
+  process.env.NEXT_PUBLIC_ALPHA_API_BASE_URL?.replace(/\/$/, "") ?? "http://127.0.0.1:8000"
+);
 
 const TIMEFRAMES = ["1s", "1m", "5m", "15m", "1h"] as const;
 type Timeframe = (typeof TIMEFRAMES)[number];
@@ -240,7 +257,7 @@ function mergeLiveBar(
   incomingBar: BarHistoryRow,
   timeframe: Timeframe
 ): BarHistoryRow[] {
-  if (timeframe !== "1m") return existingBars;
+  if (timeframe === "1s") return existingBars;
 
   const bucket = bucketTimestamp(incomingBar.timestamp, timeframe);
   const nextBar: BarHistoryRow = {
@@ -791,12 +808,13 @@ export function Dashboard() {
           ? selectedSymbol
           : (statusData.symbols[0] ?? "MNQ");
 
-        const [contextData, quoteData, barData, setupData, setupContextData] = await Promise.all([
+        const [contextData, quoteData, barData, latestBarData, setupData, setupContextData] = await Promise.all([
           fetchJson<Record<string, SymbolContext | null>>(`/runtime/contexts?symbol=${symbol}`),
           fetchJson<Record<string, QuoteRow | null>>(`/runtime/quotes?symbol=${symbol}`),
           fetchJson<BarHistoryRow[]>(
             `/runtime/bars/history?symbol=${symbol}&timeframe=${selectedTimeframe}&start=${historyStartDate(symbol)}&end=${todayDate()}`
           ),
+          fetchJson<Record<string, BarHistoryRow | null>>(`/runtime/bars?symbol=${symbol}`),
           fetchJson<SetupRow[]>(`/runtime/setups?symbol=${symbol}`),
           fetchJson<Record<string, SetupSessionContext | null>>(`/runtime/setup-contexts?symbol=${symbol}`),
         ]);
@@ -810,7 +828,8 @@ export function Dashboard() {
         setSelectedSymbol(symbol);
         setContexts((prev) => ({ ...prev, ...contextData }));
         setQuotes((prev) => ({ ...prev, ...quoteData }));
-        setBars(barData);
+        const latestLiveBar = latestBarData[symbol] ?? null;
+        setBars(latestLiveBar ? mergeLiveBar(barData, latestLiveBar, selectedTimeframe) : barData);
         setSetups(setupData);
         setSetupContexts((prev) => ({ ...prev, ...setupContextData }));
         setRiskState(riskData);
@@ -853,6 +872,35 @@ export function Dashboard() {
         }
         if (payload.quote) {
           setQuotes((prev) => ({ ...prev, [selectedSymbol]: payload.quote }));
+
+          // Use last trade price to keep the live candle close current between
+          // partial bar updates (which arrive every few seconds). The partial
+          // bar will correct the full OHLCV when it arrives.
+          const { last_price, timestamp } = payload.quote;
+          if (last_price != null) {
+            const price = Number(last_price);
+            if (isFinite(price) && price > 0) {
+              setBars((prev) => {
+                if (prev.length === 0) return prev;
+                const lastBar = prev[prev.length - 1];
+                if (
+                  bucketTimestamp(timestamp, selectedTimeframe) !==
+                  bucketTimestamp(lastBar.timestamp, selectedTimeframe)
+                ) {
+                  return prev;
+                }
+                return [
+                  ...prev.slice(0, -1),
+                  {
+                    ...lastBar,
+                    close: String(price),
+                    high: String(Math.max(Number(lastBar.high), price)),
+                    low: String(Math.min(Number(lastBar.low), price)),
+                  },
+                ];
+              });
+            }
+          }
         }
         if (payload.setup_context) {
           setSetupContexts((prev) => ({ ...prev, [selectedSymbol]: payload.setup_context }));
@@ -883,10 +931,13 @@ export function Dashboard() {
   const currentQuote = quotes[selectedSymbol] ?? null;
   const currentSetupContext = setupContexts[selectedSymbol] ?? null;
 
-  // Price / change from last two bars
+  // Price / change
+  // Preference order: last trade price (tick-level) → bar close (few-second partial bar) → stale
   const lastBar = bars[bars.length - 1];
   const prevBar = bars[bars.length - 2];
-  const lastPrice = lastBar ? Number(lastBar.close) : null;
+  const lastTradePrice =
+    currentQuote?.last_price != null ? Number(currentQuote.last_price) : null;
+  const lastPrice = lastTradePrice ?? (lastBar ? Number(lastBar.close) : null);
   const prevClose = prevBar ? Number(prevBar.close) : null;
   const pctChange =
     lastPrice !== null && prevClose !== null && prevClose !== 0

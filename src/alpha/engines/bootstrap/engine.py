@@ -41,7 +41,7 @@ from alpha.core.engine import BaseEngine
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.instruments import resolve_symbol
-from alpha.models.enums import BarTimeframe, EngineState, RuntimeMode
+from alpha.models.enums import AssetClass, BarTimeframe, EngineState, RuntimeMode
 from alpha.models.symbol import Symbol
 from alpha.runtime_status import write_snapshot
 from alpha.timeframe_context import build_symbol_context
@@ -138,19 +138,22 @@ class BootstrapEngine(BaseEngine):
                 continue
             await engine.start()
 
+        self._write_runtime_snapshot()
+        self._status_task = asyncio.create_task(self._status_loop())
+
         if mode in {RuntimeMode.LIVE, RuntimeMode.PAPER}:
+            if self._live is not None:
+                await self._live.start()
+                self._write_runtime_snapshot()
             await self._run_catchup()
             if self._storage is not None:
                 await self._storage.flush()
-            logger.info("Catch-up complete — transitioning to live feed")
-            if self._live is not None:
-                await self._live.start()
+            logger.info("Catch-up complete — live feed remains active")
         elif mode == RuntimeMode.HISTORICAL_BACKFILL:
             await self._run_backfill()
         elif mode == RuntimeMode.REPLAY:
             await self._run_replay()
         self._write_runtime_snapshot()
-        self._status_task = asyncio.create_task(self._status_loop())
 
     async def _on_stop(self) -> None:
         if self._status_task and not self._status_task.done():
@@ -305,6 +308,13 @@ class BootstrapEngine(BaseEngine):
 
         for symbol in self._settings.runtime.symbols:
             logger.info("Catch-up starting for %s", symbol)
+            symbol_def = self._registry.get(symbol)
+            symbol_d1_start = d1_start
+            if symbol_def.asset_class == AssetClass.FUTURE:
+                # Avoid multi-year expired-contract daily backfills on futures during startup.
+                # The web UI doesn't chart 1d, and a short recent window is enough for
+                # previous-day levels while keeping startup responsive.
+                symbol_d1_start = max(d1_start, end - timedelta(days=45))
             minute_bars = await self._load_or_fetch_bars(
                 symbol=symbol,
                 timeframe=BarTimeframe.M1,
@@ -332,7 +342,7 @@ class BootstrapEngine(BaseEngine):
             daily_bars = await self._load_or_fetch_bars(
                 symbol=symbol,
                 timeframe=BarTimeframe.D1,
-                start=d1_start,
+                start=symbol_d1_start,
                 end=end,
                 emit=False,
                 persist_direct=True,
@@ -532,10 +542,10 @@ class BootstrapEngine(BaseEngine):
         ticks = 0
         while True:
             self._write_runtime_snapshot()
-            if ticks % 6 == 0:
+            if ticks % 30 == 0:
                 self._log_runtime_summary()
             ticks += 1
-            await asyncio.sleep(5)
+            await asyncio.sleep(1)
 
     def _write_runtime_snapshot(self) -> None:
         try:
@@ -625,9 +635,15 @@ class BootstrapEngine(BaseEngine):
     def _serialize_bars(self) -> dict[str, Any]:
         if self._live is None:
             return {}
+        completed = self._live.latest_bars()
+        partial = self._live.latest_partial_bars()
         bars = {}
-        for symbol, event in self._live.latest_bars().items():
-            bars[symbol] = event.model_dump(mode="json")
+        for symbol in set(completed) | set(partial):
+            # Prefer the in-progress partial bar — it has the current price.
+            # Fall back to the last completed bar if no partial bar exists yet.
+            event = partial.get(symbol) or completed.get(symbol)
+            if event:
+                bars[symbol] = event.model_dump(mode="json")
         return bars
 
     def _serialize_market_states(self) -> dict[str, Any]:

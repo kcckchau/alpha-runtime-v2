@@ -94,74 +94,159 @@ const timeFormatter = (time: Time): string => {
   return `${mo} ${d.getUTCDate()} ${h}:${m} ET`;
 };
 
+// ─── Incremental state types ──────────────────────────────────────────────────
+
+type VwapState = { cumTPV: number; cumVol: number; prevTime: number | null };
+type EmaState = { value: number; index: number };
+
 // ─── Data helpers ─────────────────────────────────────────────────────────────
 
-function sortedDeduped<T extends { time: number }>(items: T[]): T[] {
-  const map = new Map<number, T>();
-  for (const item of items) map.set(item.time, item);
-  return [...map.values()].sort((a, b) => a.time - b.time);
+function getCachedEpoch(cache: Map<string, number>, timestamp: string): number {
+  let v = cache.get(timestamp);
+  if (v === undefined) {
+    v = toETEpoch(timestamp);
+    cache.set(timestamp, v);
+  }
+  return v;
 }
 
-function toCandleData(bars: BarRow[]): CandlestickData<Time>[] {
-  return sortedDeduped(
-    bars.map((b) => ({
-      time: toETEpoch(b.timestamp),
-      open: Number(b.open),
-      high: Number(b.high),
-      low: Number(b.low),
-      close: Number(b.close),
-    }))
-  ).map((d) => ({ ...d, time: d.time as Time }));
+function buildSortedDeduped(
+  bars: BarRow[],
+  cache: Map<string, number>
+): Array<{ t: number; b: BarRow }> {
+  const map = new Map<number, { t: number; b: BarRow }>();
+  for (const b of bars) {
+    const t = getCachedEpoch(cache, b.timestamp);
+    map.set(t, { t, b });
+  }
+  return [...map.values()].sort((a, b) => a.t - b.t);
 }
 
-// VWAP computed from OHLV (IBKR bars don't carry per-bar VWAP).
-// Resets on gaps > 1 hour so each trading session gets its own VWAP.
-function computeVwap(bars: BarRow[]): LineData<Time>[] {
-  const sorted = sortedDeduped(
-    bars
-      .map((b) => ({
-        time: toETEpoch(b.timestamp),
-        high: Number(b.high),
-        low: Number(b.low),
-        close: Number(b.close),
-        volume: Number(b.volume ?? 0),
-      }))
-      .filter((b) => isFinite(b.close))
+function buildCandleData(
+  bars: BarRow[],
+  cache: Map<string, number>
+): CandlestickData<Time>[] {
+  return buildSortedDeduped(bars, cache).map(({ t, b }) => ({
+    time: t as Time,
+    open: Number(b.open),
+    high: Number(b.high),
+    low: Number(b.low),
+    close: Number(b.close),
+  }));
+}
+
+type VwapResult = {
+  data: LineData<Time>[];
+  statePreLast: VwapState;
+  stateLast: VwapState;
+};
+
+function buildVwapData(bars: BarRow[], cache: Map<string, number>): VwapResult {
+  const items = buildSortedDeduped(bars, cache).filter((i) =>
+    isFinite(Number(i.b.close))
   );
 
-  let cumTPV = 0;
-  let cumVol = 0;
-  let prevTime: number | null = null;
+  let cumTPV = 0,
+    cumVol = 0,
+    prevTime: number | null = null;
+  let statePreLast: VwapState = { cumTPV: 0, cumVol: 0, prevTime: null };
+  const data: LineData<Time>[] = [];
 
-  return sorted.map((bar) => {
-    if (prevTime !== null && bar.time - prevTime > 3600) {
+  for (let i = 0; i < items.length; i++) {
+    const { t, b } = items[i];
+
+    // Capture state before last bar
+    if (i === items.length - 1) {
+      statePreLast = { cumTPV, cumVol, prevTime };
+    }
+
+    // Session reset on gap > 1 hour
+    if (prevTime !== null && t - prevTime > 3600) {
       cumTPV = 0;
       cumVol = 0;
+      if (i === items.length - 1) {
+        statePreLast = { cumTPV: 0, cumVol: 0, prevTime };
+      }
     }
-    prevTime = bar.time;
-    const typical = (bar.high + bar.low + bar.close) / 3;
-    cumTPV += typical * bar.volume;
-    cumVol += bar.volume;
-    return { time: bar.time as Time, value: cumVol > 0 ? cumTPV / cumVol : bar.close };
-  });
+
+    const typical = (Number(b.high) + Number(b.low) + Number(b.close)) / 3;
+    const vol = Number(b.volume ?? 0);
+    cumTPV += typical * vol;
+    cumVol += vol;
+    prevTime = t;
+    data.push({ time: t as Time, value: cumVol > 0 ? cumTPV / cumVol : Number(b.close) });
+  }
+
+  return { data, statePreLast, stateLast: { cumTPV, cumVol, prevTime } };
 }
 
-// EMA from bar closes; only emitted after `period` warmup bars
-function computeEma(bars: BarRow[], period: number): LineData<Time>[] {
-  const sorted = sortedDeduped(
-    bars
-      .map((b) => ({ time: toETEpoch(b.timestamp), value: Number(b.close) }))
-      .filter((d) => isFinite(d.value))
+type EmaResult = {
+  data: LineData<Time>[];
+  statePreLast: EmaState | null;
+  stateLast: EmaState | null;
+};
+
+function buildEmaData(
+  bars: BarRow[],
+  period: number,
+  cache: Map<string, number>
+): EmaResult {
+  const items = buildSortedDeduped(bars, cache).filter((i) =>
+    isFinite(Number(i.b.close))
   );
-  if (sorted.length < period) return [];
+
+  if (items.length === 0) return { data: [], statePreLast: null, stateLast: null };
+
   const alpha = 2 / (period + 1);
-  let ema = sorted[0].value;
-  const result: LineData<Time>[] = [];
-  for (let i = 0; i < sorted.length; i++) {
-    ema = i === 0 ? sorted[i].value : sorted[i].value * alpha + ema * (1 - alpha);
-    if (i >= period - 1) result.push({ time: sorted[i].time as Time, value: ema });
+  let ema = Number(items[0].b.close);
+  let statePreLast: EmaState | null = null;
+  const data: LineData<Time>[] = [];
+
+  for (let i = 0; i < items.length; i++) {
+    if (i === items.length - 1 && i > 0) {
+      statePreLast = { value: ema, index: i - 1 };
+    }
+    ema = i === 0 ? Number(items[i].b.close) : Number(items[i].b.close) * alpha + ema * (1 - alpha);
+    if (i >= period - 1) {
+      data.push({ time: items[i].t as Time, value: ema });
+    }
   }
-  return result;
+
+  return {
+    data,
+    statePreLast,
+    stateLast: items.length > 0 ? { value: ema, index: items.length - 1 } : null,
+  };
+}
+
+function vwapPointFromState(
+  state: VwapState,
+  bar: BarRow,
+  t: number
+): { value: number; nextState: VwapState } {
+  let { cumTPV, cumVol } = state;
+  if (state.prevTime !== null && t - state.prevTime > 3600) {
+    cumTPV = 0;
+    cumVol = 0;
+  }
+  const typical = (Number(bar.high) + Number(bar.low) + Number(bar.close)) / 3;
+  const vol = Number(bar.volume ?? 0);
+  cumTPV += typical * vol;
+  cumVol += vol;
+  return {
+    value: cumVol > 0 ? cumTPV / cumVol : Number(bar.close),
+    nextState: { cumTPV, cumVol, prevTime: t },
+  };
+}
+
+function emaPointFromState(
+  state: EmaState,
+  close: number,
+  period: number
+): { value: number; nextState: EmaState } {
+  const alpha = 2 / (period + 1);
+  const value = close * alpha + state.value * (1 - alpha);
+  return { value, nextState: { value, index: state.index + 1 } };
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
@@ -181,6 +266,21 @@ export function CandlesChart({
   const markerApiRef = useRef<ReturnType<typeof createSeriesMarkers<Time>> | null>(null);
   const lastViewportKeyRef = useRef<string | undefined>(undefined);
 
+  // Epoch cache: avoids repeated Intl.DateTimeFormat calls for already-seen timestamps
+  const epochCacheRef = useRef<Map<string, number>>(new Map());
+
+  // Incremental VWAP state: state before and at the last bar
+  const vwapPreLastRef = useRef<VwapState>({ cumTPV: 0, cumVol: 0, prevTime: null });
+  const vwapLastRef = useRef<VwapState>({ cumTPV: 0, cumVol: 0, prevTime: null });
+
+  // Incremental EMA state per period
+  const emaPreLastRef = useRef<Map<number, EmaState>>(new Map());
+  const emaLastRef = useRef<Map<number, EmaState>>(new Map());
+
+  // Previous bars reference for detecting live updates
+  const prevBarsRef = useRef<BarRow[]>([]);
+
+  // Chart init effect — runs once
   useEffect(() => {
     if (!containerRef.current || chartRef.current) return;
 
@@ -243,39 +343,121 @@ export function CandlesChart({
     };
   }, []);
 
+  // Bar data effect — full setData on symbol/timeframe change, incremental update otherwise
   useEffect(() => {
     const chart = chartRef.current;
     const candle = candleRef.current;
     const vwap = vwapRef.current;
     if (!chart || !candle || !vwap) return;
 
-    candle.setData(toCandleData(bars));
-    vwap.setData(computeVwap(bars));
+    const cache = epochCacheRef.current;
+    const prevBars = prevBarsRef.current;
+    const isViewportChange = viewportKey !== lastViewportKeyRef.current;
 
-    // Reconcile EMA series
-    const wanted = new Set(emas.map((e) => e.period));
-    for (const [period, series] of emaSeriesRef.current) {
-      if (!wanted.has(period)) {
-        chart.removeSeries(series);
-        emaSeriesRef.current.delete(period);
+    // Detect whether this is a live update (only the last bar changed or a new bar appended).
+    // Conditions: same viewportKey, non-empty arrays, length diff ≤ 1, and second-to-last
+    // timestamp in new bars matches what we had before (confirming only the tail changed).
+    const isLiveUpdate =
+      !isViewportChange &&
+      bars.length > 0 &&
+      prevBars.length > 0 &&
+      (bars.length === prevBars.length || bars.length === prevBars.length + 1) &&
+      (bars.length < 2 ||
+        bars[bars.length - 2].timestamp ===
+          prevBars[prevBars.length - (bars.length === prevBars.length ? 2 : 1)]?.timestamp);
+
+    if (isLiveUpdate && bars.length > 0) {
+      const lastBar = bars[bars.length - 1];
+      const t = getCachedEpoch(cache, lastBar.timestamp);
+      const isNewBar = bars.length === prevBars.length + 1;
+
+      // Candle
+      candle.update({
+        time: t as Time,
+        open: Number(lastBar.open),
+        high: Number(lastBar.high),
+        low: Number(lastBar.low),
+        close: Number(lastBar.close),
+      });
+
+      // VWAP
+      const preLastVwap = isNewBar ? vwapLastRef.current : vwapPreLastRef.current;
+      const { value: vwapValue, nextState: newVwapState } = vwapPointFromState(preLastVwap, lastBar, t);
+      vwap.update({ time: t as Time, value: vwapValue });
+      if (isNewBar) vwapPreLastRef.current = vwapLastRef.current;
+      vwapLastRef.current = newVwapState;
+
+      // EMA
+      for (const { period } of emas) {
+        const preLastEma = isNewBar
+          ? emaLastRef.current.get(period)
+          : emaPreLastRef.current.get(period);
+        if (!preLastEma) continue;
+        if (preLastEma.index < period - 2) continue; // not yet warmed up
+        const { value: emaValue, nextState: newEmaState } = emaPointFromState(
+          preLastEma,
+          Number(lastBar.close),
+          period
+        );
+        if (newEmaState.index >= period - 1) {
+          emaSeriesRef.current.get(period)?.update({ time: t as Time, value: emaValue });
+        }
+        if (isNewBar) emaPreLastRef.current.set(period, emaLastRef.current.get(period)!);
+        emaLastRef.current.set(period, newEmaState);
+      }
+    } else {
+      // Full reset: rebuild all series data
+      candle.setData(buildCandleData(bars, cache));
+
+      const { data: vwapData, statePreLast, stateLast } = buildVwapData(bars, cache);
+      vwap.setData(vwapData);
+      vwapPreLastRef.current = statePreLast;
+      vwapLastRef.current = stateLast;
+
+      // Reconcile EMA series
+      const wanted = new Set(emas.map((e) => e.period));
+      for (const [period, series] of emaSeriesRef.current) {
+        if (!wanted.has(period)) {
+          chart.removeSeries(series);
+          emaSeriesRef.current.delete(period);
+        }
+      }
+      for (const { period, color } of emas) {
+        if (!emaSeriesRef.current.has(period)) {
+          const series = chart.addSeries(LineSeries, {
+            color,
+            lineWidth: 1,
+            priceLineVisible: false,
+            lastValueVisible: true,
+            crosshairMarkerVisible: false,
+            title: `EMA${period}`,
+          });
+          emaSeriesRef.current.set(period, series);
+        }
+        const { data: emaData, statePreLast: ePre, stateLast: eLast } = buildEmaData(
+          bars,
+          period,
+          cache
+        );
+        emaSeriesRef.current.get(period)!.setData(emaData);
+        if (ePre) emaPreLastRef.current.set(period, ePre);
+        if (eLast) emaLastRef.current.set(period, eLast);
+      }
+
+      if (isViewportChange) {
+        chart.timeScale().fitContent();
+        lastViewportKeyRef.current = viewportKey;
       }
     }
-    for (const { period, color } of emas) {
-      if (!emaSeriesRef.current.has(period)) {
-        const series = chart.addSeries(LineSeries, {
-          color,
-          lineWidth: 1,
-          priceLineVisible: false,
-          lastValueVisible: true,
-          crosshairMarkerVisible: false,
-          title: `EMA${period}`,
-        });
-        emaSeriesRef.current.set(period, series);
-      }
-      emaSeriesRef.current.get(period)!.setData(computeEma(bars, period));
-    }
 
-    // Setup level price lines (entry / SL / TP)
+    prevBarsRef.current = bars;
+  }, [bars, emas, viewportKey]);
+
+  // Overlay / marker effect — price lines and markers update independently of bar data
+  useEffect(() => {
+    const candle = candleRef.current;
+    if (!candle) return;
+
     candle.priceLines().forEach((line) => candle.removePriceLine(line));
     for (const overlay of overlays) {
       candle.createPriceLine({
@@ -288,12 +470,7 @@ export function CandlesChart({
       });
     }
     markerApiRef.current?.setMarkers(markers);
-
-    if (viewportKey !== lastViewportKeyRef.current) {
-      chart.timeScale().fitContent();
-      lastViewportKeyRef.current = viewportKey;
-    }
-  }, [bars, overlays, emas, markers, viewportKey]);
+  }, [overlays, markers]);
 
   return <div ref={containerRef} style={{ height: 420, width: "100%" }} />;
 }

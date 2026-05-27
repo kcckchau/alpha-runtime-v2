@@ -54,6 +54,7 @@ class LiveIngestionEngine(BaseEngine):
         self._trades_received: int = 0
         self._quotes_received: int = 0
         self._latest_bars: dict[str, BarEvent] = {}
+        self._latest_partial_bars: dict[str, BarEvent] = {}
         self._latest_quotes: dict[str, QuoteEvent] = {}
 
     @property
@@ -138,6 +139,9 @@ class LiveIngestionEngine(BaseEngine):
     def latest_bars(self) -> dict[str, BarEvent]:
         return dict(self._latest_bars)
 
+    def latest_partial_bars(self) -> dict[str, BarEvent]:
+        return dict(self._latest_partial_bars)
+
     def latest_quotes(self) -> dict[str, QuoteEvent]:
         return dict(self._latest_quotes)
 
@@ -145,6 +149,12 @@ class LiveIngestionEngine(BaseEngine):
 
     async def _on_bar(self, event: BarEvent) -> None:
         self._bars_received += 1
+        if event.is_partial:
+            # Partial (in-progress) bars are only used for live display — they
+            # are not published to the event bus so storage/downstream engines
+            # never see incomplete bar data.
+            self._latest_partial_bars[event.symbol] = event
+            return
         self._latest_bars[event.symbol] = event
         await self._event_bus.publish(event)
 

@@ -134,14 +134,21 @@ class IBKRLiveFeedAdapter(LiveFeedAdapter):
             # Capture loop variables in closure
             def make_callback(sym_ticker: str, tf: BarTimeframe, h: BarHandlerT) -> object:
                 def on_bar_update(bars: object, has_new_bar: bool) -> None:
-                    if not has_new_bar:
-                        return
                     bar_seq = list(bars)  # type: ignore[arg-type]
-                    if len(bar_seq) < 2:
+                    if not bar_seq:
                         return
-                    completed = bar_seq[-2]
-                    event = normalize_bar(completed, sym_ticker, tf, is_replay=False)
-                    asyncio.ensure_future(h(event))
+                    # Always emit the in-progress bar (bars[-1]) as a partial bar
+                    # so the dashboard can display the live candle and current price.
+                    partial_event = normalize_bar(
+                        bar_seq[-1], sym_ticker, tf, is_replay=False, is_partial=True
+                    )
+                    asyncio.ensure_future(h(partial_event))
+                    # When a bar completes, also emit it as a completed bar.
+                    if has_new_bar and len(bar_seq) >= 2:
+                        completed_event = normalize_bar(
+                            bar_seq[-2], sym_ticker, tf, is_replay=False
+                        )
+                        asyncio.ensure_future(h(completed_event))
                 return on_bar_update
 
             cb = make_callback(ticker, timeframe, handler)

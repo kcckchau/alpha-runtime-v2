@@ -83,6 +83,8 @@ class QuoteEvent(BaseEvent):
     bid_size: int
     ask_price: Decimal
     ask_size: int
+    last_price: Decimal | None = None   # last trade price from the exchange
+    last_size: int | None = None
     bid_exchange: str | None = None
     ask_exchange: str | None = None
 

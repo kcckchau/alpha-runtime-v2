@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import AsyncIterator
 
 from alpha.config.settings import IBKRSettings
@@ -54,22 +54,37 @@ def _previous_roll_date(as_of: date) -> date:
     return max(candidate for candidate in candidates if candidate < as_of)
 
 
+def _roll_start_for_contract_month(contract_month: str) -> datetime:
+    year = int(contract_month[:4])
+    month = int(contract_month[4:6])
+    return datetime.combine(_third_friday(year, month), time.min, tzinfo=_UTC)
+
+
 def _future_contract_segments(start: datetime, end: datetime) -> list[tuple[datetime, datetime, str]]:
     """Split a futures lookback into front-month segments bounded by quarterly rolls."""
     segments: list[tuple[datetime, datetime, str]] = []
-    segment_end = end
+    segment_start = start
 
-    while segment_end > start:
-        contract_month = quarterly_contract_month(segment_end.date())
-        previous_roll = _previous_roll_date(segment_end.date())
-        segment_start = max(
-            start,
-            datetime.combine(previous_roll + timedelta(days=1), datetime.min.time(), tzinfo=_UTC),
-        )
+    while segment_start < end:
+        contract_month = quarterly_contract_month(segment_start.date())
+        roll_start = _roll_start_for_contract_month(contract_month)
+        segment_end = min(end, roll_start)
+
+        # If we're already at or past the active contract's roll boundary,
+        # advance to the next loop iteration instead of stalling on a zero-width segment.
+        if segment_end <= segment_start:
+            segment_end = end
+
         segments.append((segment_start, segment_end, contract_month))
-        segment_end = segment_start
+        if segment_end <= segment_start:
+            break
+        segment_start = segment_end
 
-    return list(reversed(segments))
+    return segments
+
+
+def _should_retry_security_definition(exc: Exception) -> bool:
+    return "No security definition has been found" in str(exc)
 
 
 class IBKRHistoricalDataSource(HistoricalDataSource):
@@ -165,13 +180,51 @@ class IBKRHistoricalDataSource(HistoricalDataSource):
                         formatDate=2,   # 2 = return datetime objects
                     )
                 except Exception as exc:
-                    logger.error(
-                        "IBKR reqHistoricalData error for %s contract=%s: %s",
-                        symbol,
-                        contract_month or getattr(contract_symbol, "contract_month", ""),
-                        exc,
-                    )
-                    continue
+                    if sym.asset_class == AssetClass.FUTURE and _should_retry_security_definition(exc):
+                        fallback_month = quarterly_contract_month(chunk_end.date())
+                        attempted_month = contract_month or getattr(contract_symbol, "contract_month", "")
+                        if fallback_month and fallback_month != attempted_month:
+                            fallback_symbol = sym.model_copy(update={"contract_month": fallback_month})
+                            logger.warning(
+                                "Retrying %s %s historical fetch with fallback contract month %s (was %s)",
+                                symbol,
+                                timeframe,
+                                fallback_month,
+                                attempted_month,
+                            )
+                            try:
+                                raw_bars = await ib.reqHistoricalDataAsync(
+                                    make_contract(fallback_symbol),
+                                    endDateTime=chunk_end.strftime("%Y%m%d %H:%M:%S") + " UTC",
+                                    durationStr=duration,
+                                    barSizeSetting=bar_size,
+                                    whatToShow=self._settings.what_to_show,
+                                    useRTH=self._settings.use_rth,
+                                    formatDate=2,
+                                )
+                            except Exception:
+                                logger.error(
+                                    "IBKR reqHistoricalData retry failed for %s contract=%s",
+                                    symbol,
+                                    fallback_month,
+                                )
+                                continue
+                        else:
+                            logger.error(
+                                "IBKR reqHistoricalData error for %s contract=%s: %s",
+                                symbol,
+                                attempted_month,
+                                exc,
+                            )
+                            continue
+                    else:
+                        logger.error(
+                            "IBKR reqHistoricalData error for %s contract=%s: %s",
+                            symbol,
+                            contract_month or getattr(contract_symbol, "contract_month", ""),
+                            exc,
+                        )
+                        continue
 
                 for raw in raw_bars:
                     event = normalize_bar(raw, symbol, timeframe, is_replay=True)

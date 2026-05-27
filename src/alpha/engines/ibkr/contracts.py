@@ -114,6 +114,7 @@ def make_contract(sym: Symbol) -> "object":
             lastTradeDateOrContractMonth=contract_month,
             exchange=sym.exchange,
             currency=sym.currency,
+            includeExpired=True,
         )
 
     raise NotImplementedError(
@@ -127,6 +128,7 @@ def normalize_bar(
     timeframe: BarTimeframe,
     *,
     is_replay: bool,
+    is_partial: bool = False,
 ) -> BarEvent:
     """Convert an ib_insync BarData object into a normalized BarEvent."""
     # IBKR gives datetime for intraday, date for daily+
@@ -159,6 +161,7 @@ def normalize_bar(
         volume=int(raw.volume),
         vwap=Decimal(str(round(vwap_raw, 4))) if vwap_raw and vwap_raw > 0 else None,
         trade_count=int(bar_count) if bar_count and bar_count > 0 else None,
+        is_partial=is_partial,
     )
 
 
@@ -178,6 +181,8 @@ def normalize_quote(
     if bid_value is None or ask_value is None or bid_value <= 0 or ask_value <= 0:
         return None
 
+    last_value = _safe_float(getattr(ticker, "last", None))
+
     return QuoteEvent(
         symbol=symbol,
         timestamp=datetime.now(_UTC),
@@ -190,4 +195,6 @@ def normalize_quote(
         bid_size=_safe_int(bid_size),
         ask_price=Decimal(str(ask_value)),
         ask_size=_safe_int(ask_size),
+        last_price=Decimal(str(last_value)) if last_value and last_value > 0 else None,
+        last_size=_safe_int(getattr(ticker, "lastSize", None)),
     )
