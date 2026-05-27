@@ -173,6 +173,12 @@ async function fetchJson<T>(path: string): Promise<T> {
   return (await response.json()) as T;
 }
 
+function websocketBaseUrl(): string {
+  if (API_BASE.startsWith("https://")) return `wss://${API_BASE.slice("https://".length)}`;
+  if (API_BASE.startsWith("http://")) return `ws://${API_BASE.slice("http://".length)}`;
+  return `ws://${API_BASE}`;
+}
+
 function formatPrice(value: string | number | null | undefined): string {
   if (value === null || value === undefined) return "—";
   const price = Number(value);
@@ -205,6 +211,97 @@ function toETChartTime(timestamp: string): Time {
   const iso = `${g("year")}-${g("month")}-${g("day")}T${g("hour")}:${g("minute")}:${g("second")}Z`;
   return Math.floor(new Date(iso).getTime() / 1000) as Time;
 }
+
+function bucketTimestamp(timestamp: string, timeframe: Timeframe): string {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return timestamp;
+
+  if (timeframe === "1m") {
+    date.setUTCSeconds(0, 0);
+    return date.toISOString();
+  }
+
+  if (timeframe === "5m" || timeframe === "15m") {
+    const minutes = timeframe === "5m" ? 5 : 15;
+    date.setUTCMinutes(Math.floor(date.getUTCMinutes() / minutes) * minutes, 0, 0);
+    return date.toISOString();
+  }
+
+  if (timeframe === "1h") {
+    date.setUTCMinutes(0, 0, 0);
+    return date.toISOString();
+  }
+
+  return timestamp;
+}
+
+function mergeLiveBar(
+  existingBars: BarHistoryRow[],
+  incomingBar: BarHistoryRow,
+  timeframe: Timeframe
+): BarHistoryRow[] {
+  if (timeframe !== "1m") return existingBars;
+
+  const bucket = bucketTimestamp(incomingBar.timestamp, timeframe);
+  const nextBar: BarHistoryRow = {
+    ...incomingBar,
+    timeframe,
+    timestamp: bucket,
+  };
+
+  const merged = [...existingBars];
+  const lastIndex = merged.length - 1;
+  const lastBar = merged[lastIndex];
+
+  if (!lastBar) return [nextBar];
+
+  if (lastBar.timestamp === bucket) {
+    merged[lastIndex] = {
+      ...lastBar,
+      ...nextBar,
+      open: lastBar.open,
+      high: String(Math.max(Number(lastBar.high), Number(nextBar.high))),
+      low: String(Math.min(Number(lastBar.low), Number(nextBar.low))),
+    };
+    return merged;
+  }
+
+  if (new Date(lastBar.timestamp).getTime() > new Date(bucket).getTime()) {
+    const byTimestamp = new Map(merged.map((bar) => [bar.timestamp, bar]));
+    const existing = byTimestamp.get(bucket);
+    byTimestamp.set(
+      bucket,
+      existing
+        ? {
+            ...existing,
+            ...nextBar,
+            open: existing.open,
+            high: String(Math.max(Number(existing.high), Number(nextBar.high))),
+            low: String(Math.min(Number(existing.low), Number(nextBar.low))),
+          }
+        : nextBar
+    );
+    return [...byTimestamp.values()].sort(
+      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
+  }
+
+  return [...merged, nextBar];
+}
+
+type RuntimeWsMessage = {
+  type: "runtime_update";
+  symbol: string;
+  updated_at: string | null;
+  runtime_state: string;
+  mode: string;
+  runtime_available: boolean;
+  quote: QuoteRow | null;
+  bar: BarHistoryRow | null;
+  context: SymbolContext | null;
+  setup_context: SetupSessionContext | null;
+  setups: SetupRow[];
+};
 
 function gradeColor(grade: string | null): string {
   if (grade === "SSS") return "#fbbf24";
@@ -729,6 +826,59 @@ export function Dashboard() {
     return () => { cancelled = true; clearInterval(interval); };
   }, [selectedSymbol, selectedTimeframe]);
 
+  useEffect(() => {
+    const ws = new WebSocket(
+      `${websocketBaseUrl()}/runtime/ws?symbol=${encodeURIComponent(selectedSymbol)}`
+    );
+
+    ws.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data) as RuntimeWsMessage;
+        if (payload.type !== "runtime_update" || payload.symbol !== selectedSymbol) return;
+
+        setStatus((prev) =>
+          prev
+            ? {
+                ...prev,
+                mode: payload.mode,
+                runtime_state: payload.runtime_state,
+                runtime_available: payload.runtime_available,
+                updated_at: payload.updated_at,
+              }
+            : prev
+        );
+
+        if (payload.context) {
+          setContexts((prev) => ({ ...prev, [selectedSymbol]: payload.context }));
+        }
+        if (payload.quote) {
+          setQuotes((prev) => ({ ...prev, [selectedSymbol]: payload.quote }));
+        }
+        if (payload.setup_context) {
+          setSetupContexts((prev) => ({ ...prev, [selectedSymbol]: payload.setup_context }));
+        }
+        if (payload.setups) {
+          setSetups(payload.setups);
+        }
+        const liveBar = payload.bar;
+        if (liveBar) {
+          setBars((prev) => mergeLiveBar(prev, liveBar, selectedTimeframe));
+        }
+        setError(null);
+      } catch {
+        // Ignore malformed websocket payloads; polling remains the fallback path.
+      }
+    };
+
+    ws.onerror = () => {
+      // Polling remains active, so websocket failures should stay non-fatal.
+    };
+
+    return () => {
+      ws.close();
+    };
+  }, [selectedSymbol, selectedTimeframe]);
+
   const currentContext = contexts[selectedSymbol] ?? null;
   const currentQuote = quotes[selectedSymbol] ?? null;
   const currentSetupContext = setupContexts[selectedSymbol] ?? null;
@@ -951,7 +1101,13 @@ export function Dashboard() {
           </div>
 
           {/* Candlestick chart */}
-          <CandlesChart bars={bars} overlays={overlayLines} emas={emas} markers={historyMarkers} />
+          <CandlesChart
+            bars={bars}
+            overlays={overlayLines}
+            emas={emas}
+            markers={historyMarkers}
+            viewportKey={`${selectedSymbol}:${selectedTimeframe}`}
+          />
 
           {/* Quote bar */}
           {currentQuote && (

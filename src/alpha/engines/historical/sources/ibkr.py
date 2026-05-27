@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import AsyncIterator
 
 from alpha.config.settings import IBKRSettings
@@ -27,12 +27,49 @@ from alpha.engines.ibkr.contracts import (
     make_contract,
     normalize_bar,
 )
+from alpha.instruments import quarterly_contract_month
+from alpha.models.enums import AssetClass
 from alpha.models.enums import BarTimeframe, DataSourceId
 from alpha.models.events import BarEvent
 
 logger = logging.getLogger(__name__)
 
 _UTC = timezone.utc
+_QUARTERLY_MONTHS = (3, 6, 9, 12)
+
+
+def _third_friday(year: int, month: int) -> date:
+    first_day = date(year, month, 1)
+    days_until_friday = (4 - first_day.weekday()) % 7
+    first_friday = first_day + timedelta(days=days_until_friday)
+    return first_friday + timedelta(weeks=2)
+
+
+def _previous_roll_date(as_of: date) -> date:
+    candidates = [
+        _third_friday(year, month)
+        for year in (as_of.year - 1, as_of.year)
+        for month in _QUARTERLY_MONTHS
+    ]
+    return max(candidate for candidate in candidates if candidate < as_of)
+
+
+def _future_contract_segments(start: datetime, end: datetime) -> list[tuple[datetime, datetime, str]]:
+    """Split a futures lookback into front-month segments bounded by quarterly rolls."""
+    segments: list[tuple[datetime, datetime, str]] = []
+    segment_end = end
+
+    while segment_end > start:
+        contract_month = quarterly_contract_month(segment_end.date())
+        previous_roll = _previous_roll_date(segment_end.date())
+        segment_start = max(
+            start,
+            datetime.combine(previous_roll + timedelta(days=1), datetime.min.time(), tzinfo=_UTC),
+        )
+        segments.append((segment_start, segment_end, contract_month))
+        segment_end = segment_start
+
+    return list(reversed(segments))
 
 
 class IBKRHistoricalDataSource(HistoricalDataSource):
@@ -78,46 +115,68 @@ class IBKRHistoricalDataSource(HistoricalDataSource):
     ) -> AsyncIterator[BarEvent]:
         ib = await self._conn.get()
         sym = self._registry.get(symbol)
-        contract = make_contract(sym)
         bar_size = TIMEFRAME_TO_IBKR[timeframe]
         chunk_days = MAX_CHUNK_DAYS.get(timeframe, 7)
 
-        # Build list of (chunk_start, chunk_end) pairs, newest first
-        chunks: list[tuple[datetime, datetime]] = []
-        chunk_end = end
-        while chunk_end > start:
-            chunk_start = max(start, chunk_end - timedelta(days=chunk_days))
-            chunks.append((chunk_start, chunk_end))
-            chunk_end = chunk_start
+        if sym.asset_class == AssetClass.FUTURE:
+            contract_segments = _future_contract_segments(start, end)
+        else:
+            contract_segments = [(start, end, sym.contract_month or "")]
 
-        # Fetch oldest-first so bars are yielded in chronological order
-        for chunk_start, chunk_end in reversed(chunks):
-            days = max(1, (chunk_end - chunk_start).days)
-            duration = f"{days} D"
-
-            logger.debug(
-                "Fetching %s %s [%s] %s → %s (%s)",
-                symbol, timeframe, bar_size, chunk_start.date(), chunk_end.date(), duration,
+        for segment_start, segment_end, contract_month in contract_segments:
+            contract_symbol = (
+                sym.model_copy(update={"contract_month": contract_month})
+                if sym.asset_class == AssetClass.FUTURE
+                else sym
             )
+            contract = make_contract(contract_symbol)
 
-            try:
-                raw_bars = await ib.reqHistoricalDataAsync(
-                    contract,
-                    endDateTime=chunk_end.strftime("%Y%m%d %H:%M:%S") + " UTC",
-                    durationStr=duration,
-                    barSizeSetting=bar_size,
-                    whatToShow=self._settings.what_to_show,
-                    useRTH=self._settings.use_rth,
-                    formatDate=2,   # 2 = return datetime objects
+            chunks: list[tuple[datetime, datetime]] = []
+            chunk_end = segment_end
+            while chunk_end > segment_start:
+                chunk_start = max(segment_start, chunk_end - timedelta(days=chunk_days))
+                chunks.append((chunk_start, chunk_end))
+                chunk_end = chunk_start
+
+            # Fetch oldest-first so bars are yielded in chronological order
+            for chunk_start, chunk_end in reversed(chunks):
+                days = max(1, (chunk_end - chunk_start).days)
+                duration = f"{days} D"
+
+                logger.debug(
+                    "Fetching %s %s [%s] %s → %s (%s) contract=%s",
+                    symbol,
+                    timeframe,
+                    bar_size,
+                    chunk_start.date(),
+                    chunk_end.date(),
+                    duration,
+                    contract_month or getattr(contract_symbol, "contract_month", ""),
                 )
-            except Exception as exc:
-                logger.error("IBKR reqHistoricalData error for %s: %s", symbol, exc)
-                continue
 
-            for raw in raw_bars:
-                event = normalize_bar(raw, symbol, timeframe, is_replay=True)
-                if start <= event.timestamp <= end:
-                    yield event
+                try:
+                    raw_bars = await ib.reqHistoricalDataAsync(
+                        contract,
+                        endDateTime=chunk_end.strftime("%Y%m%d %H:%M:%S") + " UTC",
+                        durationStr=duration,
+                        barSizeSetting=bar_size,
+                        whatToShow=self._settings.what_to_show,
+                        useRTH=self._settings.use_rth,
+                        formatDate=2,   # 2 = return datetime objects
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "IBKR reqHistoricalData error for %s contract=%s: %s",
+                        symbol,
+                        contract_month or getattr(contract_symbol, "contract_month", ""),
+                        exc,
+                    )
+                    continue
 
-            if len(chunks) > 1:
-                await asyncio.sleep(self._settings.pacing_delay)
+                for raw in raw_bars:
+                    event = normalize_bar(raw, symbol, timeframe, is_replay=True)
+                    if start <= event.timestamp <= end:
+                        yield event
+
+                if len(chunks) > 1:
+                    await asyncio.sleep(self._settings.pacing_delay)

@@ -44,6 +44,7 @@ type CandlesChartProps = {
   overlays: OverlayLine[];
   emas?: EmaConfig[];
   markers?: SeriesMarker<Time>[];
+  viewportKey?: string;
 };
 
 // ─── ET timezone helpers ──────────────────────────────────────────────────────
@@ -165,13 +166,20 @@ function computeEma(bars: BarRow[], period: number): LineData<Time>[] {
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
-export function CandlesChart({ bars, overlays, emas = [], markers = [] }: CandlesChartProps) {
+export function CandlesChart({
+  bars,
+  overlays,
+  emas = [],
+  markers = [],
+  viewportKey,
+}: CandlesChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const vwapRef = useRef<ISeriesApi<"Line"> | null>(null);
   const emaSeriesRef = useRef<Map<number, ISeriesApi<"Line">>>(new Map());
   const markerApiRef = useRef<ReturnType<typeof createSeriesMarkers<Time>> | null>(null);
+  const lastViewportKeyRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     if (!containerRef.current || chartRef.current) return;
@@ -281,8 +289,11 @@ export function CandlesChart({ bars, overlays, emas = [], markers = [] }: Candle
     }
     markerApiRef.current?.setMarkers(markers);
 
-    chart.timeScale().fitContent();
-  }, [bars, overlays, emas, markers]);
+    if (viewportKey !== lastViewportKeyRef.current) {
+      chart.timeScale().fitContent();
+      lastViewportKeyRef.current = viewportKey;
+    }
+  }, [bars, overlays, emas, markers, viewportKey]);
 
   return <div ref={containerRef} style={{ height: 420, width: "100%" }} />;
 }
