@@ -83,9 +83,13 @@ class HistoricalSettings(BaseSettings):
     primary_source: DataSourceId = DataSourceId.INTERACTIVE_BROKERS
     lookback_days: int = 30
     max_gap_seconds: int = 300         # gaps larger than this are flagged
-    hourly_warmup_bars: int = 180
-    daily_warmup_bars: int = 220
-    monthly_warmup_months: int = 60
+    # Warmup bar counts by timeframe — sized to support the deepest indicator on each TF
+    minute1_warmup_bars: int = 300     # 1m: EMA9/21 + full session VWAP (~1 RTH session)
+    minute5_warmup_bars: int = 300     # 5m: EMA9/21 + full session VWAP (~4 RTH sessions)
+    hourly_warmup_bars: int = 1000     # 1h: EMA9/21/50 + SMA100/200 (~167 trading days)
+    daily_warmup_bars: int = 1000      # 1d: EMA9/21 + SMA50/100/200 (~4 trading years)
+    monthly_warmup_months: int = 60    # kept for backwards compatibility
+    vwap_session: str = "rth"          # "rth" (09:30 ET open) | "extended" (04:00 ET open)
 
 
 class LiveSettings(BaseSettings):

@@ -278,34 +278,45 @@ class BootstrapEngine(BaseEngine):
 
     async def _run_catchup(self) -> None:
         """Load recent history before connecting the live feed."""
+        hist = self._settings.historical
         logger.info(
-            "Running catch-up: last %d days | hourly_warmup_bars=%d | daily_warmup_bars=%d | monthly_warmup_months=%d",
-            self._settings.runtime.catchup_lookback_days,
-            self._settings.historical.hourly_warmup_bars,
-            self._settings.historical.daily_warmup_bars,
-            self._settings.historical.monthly_warmup_months,
+            "Running catch-up | symbols=%s | 1m_bars=%d | 5m_bars=%d | 1h_bars=%d | 1d_bars=%d | vwap=%s",
+            self._settings.runtime.symbols,
+            hist.minute1_warmup_bars,
+            hist.minute5_warmup_bars,
+            hist.hourly_warmup_bars,
+            hist.daily_warmup_bars,
+            hist.vwap_session,
         )
         if self._historical is None or self._storage is None:
             return
 
         end = datetime.now(timezone.utc)
-        minute_start = end - timedelta(days=self._settings.runtime.catchup_lookback_days)
-        hourly_start = end - timedelta(
-            days=max(30, self._settings.historical.hourly_warmup_bars // 6)
-        )
-        daily_start = end - timedelta(
-            days=max(
-                self._settings.historical.daily_warmup_bars * 2,
-                self._settings.historical.monthly_warmup_months * 22,
-            )
-        )
+        vwap_start = self._vwap_session_start(end)
+
+        # Per-timeframe warmup windows sized to the deepest indicator on each timeframe.
+        # M1/M5 windows are also extended to cover the full current VWAP session so that
+        # session-VWAP can be computed accurately regardless of when the system starts.
+        # Calendar-day multipliers account for overnight and weekend gaps (≈5/7 trading ratio).
+        m1_start = min(end - timedelta(days=max(3, hist.minute1_warmup_bars // 390 + 1)), vwap_start)
+        m5_start = min(end - timedelta(days=max(7, hist.minute5_warmup_bars // 78 + 2)), vwap_start)
+        h1_start = end - timedelta(days=int(hist.hourly_warmup_bars * 0.22) + 30)
+        d1_start = end - timedelta(days=int(hist.daily_warmup_bars * 1.5))
 
         for symbol in self._settings.runtime.symbols:
             logger.info("Catch-up starting for %s", symbol)
             minute_bars = await self._load_or_fetch_bars(
                 symbol=symbol,
                 timeframe=BarTimeframe.M1,
-                start=minute_start,
+                start=m1_start,
+                end=end,
+                emit=True,
+                persist_direct=False,
+            )
+            minute5_bars = await self._load_or_fetch_bars(
+                symbol=symbol,
+                timeframe=BarTimeframe.M5,
+                start=m5_start,
                 end=end,
                 emit=True,
                 persist_direct=False,
@@ -313,7 +324,7 @@ class BootstrapEngine(BaseEngine):
             hourly_bars = await self._load_or_fetch_bars(
                 symbol=symbol,
                 timeframe=BarTimeframe.H1,
-                start=hourly_start,
+                start=h1_start,
                 end=end,
                 emit=False,
                 persist_direct=True,
@@ -321,7 +332,7 @@ class BootstrapEngine(BaseEngine):
             daily_bars = await self._load_or_fetch_bars(
                 symbol=symbol,
                 timeframe=BarTimeframe.D1,
-                start=daily_start,
+                start=d1_start,
                 end=end,
                 emit=False,
                 persist_direct=True,
@@ -335,12 +346,40 @@ class BootstrapEngine(BaseEngine):
                 calendar=calendar_for_symbol(self._registry.get(symbol)),
             )
             logger.info(
-                "Catch-up complete for %s | 1m=%d 1h=%d 1d=%d",
+                "Catch-up complete for %s | 1m=%d 5m=%d 1h=%d 1d=%d",
                 symbol,
                 len(minute_bars),
+                len(minute5_bars),
                 len(hourly_bars),
                 len(daily_bars),
             )
+
+    def _vwap_session_start(self, now: datetime) -> datetime:
+        """Return the start of the current (or most recent completed) VWAP session in UTC.
+
+        Ensures M1/M5 catch-up windows always reach back to the session open so that
+        session-VWAP can be computed accurately from the first bar.
+        """
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/New_York")
+        now_et = now.astimezone(tz)
+        today = now_et.date()
+
+        if self._settings.historical.vwap_session == "extended":
+            hour, minute = 4, 0
+        else:  # "rth" (default): regular session opens at 09:30 ET
+            hour, minute = 9, 30
+
+        session_open_et = now_et.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+        # If we haven't reached today's open yet, fall back to the previous trading day
+        if now_et < session_open_et:
+            prev_day = self._calendar.prev_trading_day(today)
+            session_open_et = session_open_et.replace(
+                year=prev_day.year, month=prev_day.month, day=prev_day.day
+            )
+
+        return session_open_et.astimezone(timezone.utc)
 
     async def _load_or_fetch_bars(
         self,
@@ -407,6 +446,7 @@ class BootstrapEngine(BaseEngine):
     def _timeframe_delta(timeframe: BarTimeframe) -> timedelta:
         mapping = {
             BarTimeframe.M1: timedelta(minutes=1),
+            BarTimeframe.M5: timedelta(minutes=5),
             BarTimeframe.H1: timedelta(hours=1),
             BarTimeframe.D1: timedelta(days=1),
         }
@@ -457,8 +497,9 @@ class BootstrapEngine(BaseEngine):
         start: datetime,
         first: datetime,
     ) -> bool:
-        if timeframe in {BarTimeframe.H1, BarTimeframe.D1}:
-            return calendar.session_key(start) == calendar.session_key(first)
+        # Always fill if data starts after the requested window — applies to all timeframes.
+        # H1/D1 previously used a same-session check here which prevented filling when the
+        # head gap spanned session boundaries (e.g. fresh run after a weekend).
         return first > start
 
     @staticmethod
@@ -482,8 +523,9 @@ class BootstrapEngine(BaseEngine):
         last: datetime,
         end: datetime,
     ) -> bool:
-        if timeframe in {BarTimeframe.H1, BarTimeframe.D1}:
-            return calendar.session_key(last) == calendar.session_key(end)
+        # Always fill if stored data ends before the requested window — applies to all timeframes.
+        # H1/D1 previously used a same-session check here which caused stale caches to never
+        # catch up across session boundaries (e.g. running after a multi-day gap).
         return last < end
 
     async def _status_loop(self) -> None:
@@ -639,9 +681,74 @@ class BootstrapEngine(BaseEngine):
             logger.info("Runtime summary | %s", " | ".join(quote_chunks))
 
     async def _run_backfill(self) -> None:
-        """Full historical backfill without going live."""
-        logger.info("Running full historical backfill")
-        # TODO: drive HistoricalDataEngine across configured date range
+        """Full historical backfill for configured symbols and timeframes.
+
+        Uses replay.start_date / replay.end_date when set (via --start / --end CLI flags).
+        Falls back to warmup-driven windows sized to the deepest indicator per timeframe.
+        Idempotent: only fetches gaps not already in local Parquet cache.
+        """
+        if self._historical is None or self._storage is None:
+            logger.error("Cannot run backfill: historical or storage engine not initialized")
+            return
+
+        hist = self._settings.historical
+        replay = self._settings.replay
+
+        now = datetime.now(timezone.utc)
+        end = (
+            datetime(
+                replay.end_date.year, replay.end_date.month, replay.end_date.day,
+                23, 59, 59, tzinfo=timezone.utc,
+            )
+            if replay.end_date
+            else now
+        )
+
+        # Warmup-driven start dates (calendar-day adjusted: ≈1.4× trading days for weekends)
+        default_starts: dict[BarTimeframe, datetime] = {
+            BarTimeframe.M1: end - timedelta(days=max(3, hist.minute1_warmup_bars // 390 + 1)),
+            BarTimeframe.M5: end - timedelta(days=max(7, hist.minute5_warmup_bars // 78 + 2)),
+            BarTimeframe.H1: end - timedelta(days=int(hist.hourly_warmup_bars * 0.22) + 30),
+            BarTimeframe.D1: end - timedelta(days=int(hist.daily_warmup_bars * 1.5)),
+        }
+
+        # An explicit --start extends the window further back on all timeframes
+        if replay.start_date:
+            explicit = datetime(
+                replay.start_date.year, replay.start_date.month, replay.start_date.day,
+                tzinfo=timezone.utc,
+            )
+            starts: dict[BarTimeframe, datetime] = {
+                tf: min(default, explicit) for tf, default in default_starts.items()
+            }
+        else:
+            starts = default_starts
+
+        logger.info(
+            "Running full historical backfill | symbols=%s | end=%s"
+            " | 1m_start=%s | 5m_start=%s | 1h_start=%s | 1d_start=%s",
+            self._settings.runtime.symbols,
+            end.date().isoformat(),
+            starts[BarTimeframe.M1].date().isoformat(),
+            starts[BarTimeframe.M5].date().isoformat(),
+            starts[BarTimeframe.H1].date().isoformat(),
+            starts[BarTimeframe.D1].date().isoformat(),
+        )
+
+        for symbol in self._settings.runtime.symbols:
+            logger.info("Backfilling %s", symbol)
+            for timeframe in (BarTimeframe.M1, BarTimeframe.M5, BarTimeframe.H1, BarTimeframe.D1):
+                await self._load_or_fetch_bars(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    start=starts[timeframe],
+                    end=end,
+                    emit=False,
+                    persist_direct=True,
+                )
+
+        await self._storage.flush()
+        logger.info("Historical backfill complete")
 
     async def _run_replay(self) -> None:
         """Replay historical data through the full pipeline."""
