@@ -90,6 +90,7 @@ class SetupEngine(BaseEngine):
         self._session_contexts: dict[str, SessionSetupContext] = {}
         self._session_keys: dict[str, str] = {}
         self._symbol_calendars: dict[str, SessionCalendar] = {}
+        self._detector_truths: dict[str, dict[SetupType, bool]] = {}
         # Bars-in-forming counter for invalidation timers
         self._forming_bars: dict[UUID, int] = {}
         self._setups_detected: int = 0
@@ -112,6 +113,7 @@ class SetupEngine(BaseEngine):
             ticker = symbol.ticker
             self._active[ticker] = {}
             self._symbol_calendars[ticker] = calendar_for_symbol(symbol)
+            self._detector_truths[ticker] = {}
 
     async def _on_start(self) -> None:
         self._event_bus.subscribe(EventType.BAR, self._handle_bar)
@@ -179,6 +181,10 @@ class SetupEngine(BaseEngine):
             (SetupType.SWEEP_RECLAIM, self._detect_sweep_reclaim),
         ]
         for setup_type, detector in detectors:
+            truth = detector(snapshot, market_state)
+            was_true = self._detector_truths.setdefault(symbol, {}).get(setup_type, False)
+            self._detector_truths[symbol][setup_type] = truth
+
             if self._has_active(symbol, setup_type):
                 self._log_scan_detail(
                     "Setup scan skipped: %s %s reason=already_active",
@@ -192,6 +198,23 @@ class SetupEngine(BaseEngine):
                     symbol,
                     setup_type,
                     snapshot.session_phase,
+                )
+                continue
+            if not truth:
+                reason = self._detector_reason(setup_type, snapshot, market_state)
+                self._log_scan_detail(
+                    "Setup candidate rejected: %s %s reason=%s phase=%s",
+                    symbol,
+                    setup_type,
+                    reason,
+                    snapshot.session_phase,
+                )
+                continue
+            if was_true:
+                self._log_scan_detail(
+                    "Setup scan skipped: %s %s reason=detector_still_true",
+                    symbol,
+                    setup_type,
                 )
                 continue
             reason = self._detector_reason(setup_type, snapshot, market_state)
@@ -566,6 +589,7 @@ class SetupEngine(BaseEngine):
         self._session_keys[symbol] = session_key
         stale_ids = list(self._active.get(symbol, {}).keys())
         self._active[symbol] = {}
+        self._detector_truths[symbol] = {}
         for setup_id in stale_ids:
             self._forming_bars.pop(setup_id, None)
 

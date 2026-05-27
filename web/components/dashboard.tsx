@@ -785,7 +785,7 @@ export function Dashboard() {
       if (s.state !== "confirmed" && s.state !== "triggered") continue;
       if (s.entry_trigger) {
         overlays.push({
-          label: `${s.setup_type.replace(/_/g, " ")} E`,
+          label: `${s.setup_type.replace(/_/g, " ").toUpperCase()} E`,
           price: Number(s.entry_trigger),
           color: gradeColor(s.grade),
         });
@@ -798,29 +798,19 @@ export function Dashboard() {
       }
     }
 
-    for (const entry of currentSetupContext?.setups ?? []) {
-      if (!entry.entry_trigger) continue;
-      if (setups.some((active) => active.setup_id === entry.setup_id)) continue;
-      overlays.push({
-        label: `${entry.level_tag} ${entry.state}`,
-        price: Number(entry.entry_trigger),
-        color: `${levelColor(entry.level_tag)}cc`,
-        style: LineStyle.Dotted,
-      });
-    }
-
     return overlays;
-  }, [currentContext, setups, currentSetupContext]);
+  }, [currentContext, setups]);
 
   const historyMarkers = useMemo((): SeriesMarker<Time>[] => {
     return (currentSetupContext?.setups ?? [])
       .filter((entry) => !!entry.detected_at)
+      .filter((entry) => entry.state !== "forming")
       .map((entry) => ({
         time: toETChartTime(entry.detected_at),
         position: setupMarkerPosition(entry),
         color: levelColor(entry.level_tag),
         shape: setupMarkerShape(entry),
-        text: `${entry.level_tag.toUpperCase()} ${entry.state.toUpperCase()}`,
+        text: entry.state === "triggered" ? entry.level_tag.toUpperCase() : "",
       }));
   }, [currentSetupContext]);
 
