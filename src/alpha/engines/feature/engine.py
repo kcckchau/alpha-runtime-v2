@@ -64,6 +64,8 @@ class SymbolFeatureState:
         # ── Setup detection state ─────────────────────────────────────────────
         self.bars_above_vwap: int = 0
         self.bars_below_vwap: int = 0
+        self.bars_below_vwap_at_cross: int = 0   # bars below VWAP before the last cross-up
+        self.bars_above_vwap_at_cross: int = 0   # bars above VWAP before the last cross-down
         self.prev_above_vwap: bool | None = None
         self.prev_vwap_deviation_pct: float | None = None
         self.vwap_deviation_shrinking: bool = False
@@ -88,6 +90,8 @@ class SymbolFeatureState:
         self.orb_established = False
         self.bars_above_vwap = 0
         self.bars_below_vwap = 0
+        self.bars_below_vwap_at_cross = 0
+        self.bars_above_vwap_at_cross = 0
         self.prev_above_vwap = None
         self.prev_vwap_deviation_pct = None
         self.vwap_deviation_shrinking = False
@@ -259,6 +263,10 @@ class FeatureEngine(BaseEngine):
                 is_above = bar.close >= vwap
                 dev_pct = float((bar.close - vwap) / vwap * 100)
 
+                # Save counts before resetting — needed for cross-up/down context.
+                prev_bars_below = state.bars_below_vwap
+                prev_bars_above = state.bars_above_vwap
+
                 if is_above:
                     state.bars_above_vwap += 1
                     state.bars_below_vwap = 0
@@ -276,6 +284,10 @@ class FeatureEngine(BaseEngine):
                     and state.prev_above_vwap
                     and not is_above
                 )
+                if state.vwap_cross_up:
+                    state.bars_below_vwap_at_cross = prev_bars_below
+                if state.vwap_cross_down:
+                    state.bars_above_vwap_at_cross = prev_bars_above
                 state.prev_above_vwap = is_above
 
                 state.vwap_deviation_shrinking = (
@@ -409,7 +421,9 @@ class FeatureEngine(BaseEngine):
             bars_above_vwap=state.bars_above_vwap,
             bars_below_vwap=state.bars_below_vwap,
             vwap_cross_up=state.vwap_cross_up,
+            vwap_cross_up_after_bars=state.bars_below_vwap_at_cross,
             vwap_cross_down=state.vwap_cross_down,
+            vwap_cross_down_after_bars=state.bars_above_vwap_at_cross,
             vwap_deviation_shrinking=state.vwap_deviation_shrinking,
             bar_close_position_pct=bar_close_pos,
             intraday_high=state.intraday_high,

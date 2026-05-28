@@ -62,7 +62,9 @@ class BarSnapshot(BaseModel):
     bars_above_vwap: int = 0                    # consecutive bars closing above VWAP
     bars_below_vwap: int = 0                    # consecutive bars closing below VWAP
     vwap_cross_up: bool = False                 # this bar crossed above VWAP
+    vwap_cross_up_after_bars: int = 0           # how many consecutive bars were below VWAP before the cross
     vwap_cross_down: bool = False               # this bar crossed below VWAP
+    vwap_cross_down_after_bars: int = 0         # how many consecutive bars were above VWAP before the cross
     vwap_deviation_shrinking: bool = False      # distance to VWAP decreased vs prior bar (from above)
     bar_close_position_pct: float | None = None  # (close - low) / (high - low)
     intraday_high: Decimal | None = None        # session high so far

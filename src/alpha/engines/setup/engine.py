@@ -62,6 +62,8 @@ _SSS_TYPES = frozenset({
     SetupType.FAKE_BREAKDOWN,
     SetupType.HOD_BREAKOUT,
     SetupType.TREND_PULLBACK,
+    SetupType.VWAP_RECLAIM,
+    SetupType.VWAP_REJECTION,
 })
 
 
@@ -175,7 +177,9 @@ class SetupEngine(BaseEngine):
             (SetupType.HOD_BREAKOUT, self._detect_hod_breakout),
             (SetupType.TREND_PULLBACK, self._detect_trend_pullback),
             (SetupType.VWAP_RECLAIM, self._detect_vwap_reclaim),
+            (SetupType.VWAP_REJECTION, self._detect_vwap_rejection),
             (SetupType.ORB_BREAKOUT, self._detect_orb_breakout),
+            (SetupType.ORB_BREAKDOWN, self._detect_orb_breakdown),
             (SetupType.SWEEP_RECLAIM, self._detect_sweep_reclaim),
         ]
         for setup_type, detector in detectors:
@@ -301,10 +305,226 @@ class SetupEngine(BaseEngine):
             return "pullback_too_far_from_vwap"
         return None
 
-    # ── Stub detectors (not yet implemented) ─────────────────────────────────
+    def _advance_vwap_reclaim(
+        self, setup: Setup, snap: BarSnapshot
+    ) -> tuple[Setup, str]:
+        if setup.state == SetupState.FORMING:
+            self._forming_bars[setup.setup_id] = (
+                self._forming_bars.get(setup.setup_id, 0) + 1
+            )
+            # Invalidation: lost VWAP again
+            if snap.vwap_cross_down:
+                return setup.transition(SetupState.INVALIDATED, "VWAP lost after reclaim"), ""
+            # Confirm: hold above VWAP on next bar + rvol ≥ 1.0 + no lower low
+            if snap.is_above_vwap:
+                rvol_ok = snap.relative_volume is None or snap.relative_volume >= 1.0
+                no_lower_low = not snap.is_lower_low
+                if rvol_ok and no_lower_low:
+                    # Entry above the reclaim bar's high; stop = reclaim bar's low
+                    entry = setup.bar_snapshot.bar.high
+                    stop = setup.bar_snapshot.bar.low
+                    target = (
+                        snap.intraday_high
+                        if snap.intraday_high is not None and snap.intraday_high > entry
+                        else entry + (entry - stop) * Decimal("3")
+                    )
+                    confirmed = setup.transition(SetupState.CONFIRMED).model_copy(
+                        update={
+                            "entry_trigger": entry,
+                            "stop_reference": stop,
+                            "target_reference": target,
+                        }
+                    )
+                    logger.info(
+                        "Setup confirmed: %s %s entry=%.2f stop=%.2f target=%.2f",
+                        setup.symbol, setup.setup_type,
+                        float(entry), float(stop), float(target),
+                    )
+                    return confirmed, "confirmed"
+
+        elif setup.state == SetupState.CONFIRMED:
+            if snap.vwap_cross_down:
+                return setup.transition(SetupState.INVALIDATED, "VWAP lost while confirmed"), ""
+            if setup.entry_trigger and snap.bar.high >= setup.entry_trigger:
+                return setup.transition(SetupState.TRIGGERED), "triggered"
+            if setup.stop_reference and snap.bar.low <= setup.stop_reference:
+                return setup.transition(SetupState.FAILED), "stop hit"
+
+        return setup, ""
+
+    def _advance_vwap_rejection(
+        self, setup: Setup, snap: BarSnapshot
+    ) -> tuple[Setup, str]:
+        if setup.state == SetupState.FORMING:
+            self._forming_bars[setup.setup_id] = (
+                self._forming_bars.get(setup.setup_id, 0) + 1
+            )
+            # Invalidation: reclaimed VWAP
+            if snap.vwap_cross_up:
+                return setup.transition(SetupState.INVALIDATED, "VWAP reclaimed after rejection"), ""
+            # Confirm: hold below VWAP on next bar + rvol ≥ 1.0 + no higher high
+            if not snap.is_above_vwap:
+                rvol_ok = snap.relative_volume is None or snap.relative_volume >= 1.0
+                no_higher_high = not snap.is_higher_high
+                if rvol_ok and no_higher_high:
+                    # Entry below the rejection bar's low; stop = rejection bar's high
+                    entry = setup.bar_snapshot.bar.low
+                    stop = setup.bar_snapshot.bar.high
+                    target = (
+                        snap.intraday_low
+                        if snap.intraday_low is not None and snap.intraday_low < entry
+                        else entry - (stop - entry) * Decimal("3")
+                    )
+                    confirmed = setup.transition(SetupState.CONFIRMED).model_copy(
+                        update={
+                            "entry_trigger": entry,
+                            "stop_reference": stop,
+                            "target_reference": target,
+                        }
+                    )
+                    logger.info(
+                        "Setup confirmed: %s %s entry=%.2f stop=%.2f target=%.2f",
+                        setup.symbol, setup.setup_type,
+                        float(entry), float(stop), float(target),
+                    )
+                    return confirmed, "confirmed"
+
+        elif setup.state == SetupState.CONFIRMED:
+            if snap.vwap_cross_up:
+                return setup.transition(SetupState.INVALIDATED, "VWAP reclaimed while confirmed"), ""
+            if setup.entry_trigger and snap.bar.low <= setup.entry_trigger:
+                return setup.transition(SetupState.TRIGGERED), "triggered"
+            if setup.stop_reference and snap.bar.high >= setup.stop_reference:
+                return setup.transition(SetupState.FAILED), "stop hit"
+
+        return setup, ""
+
+    def _advance_orb_breakdown(
+        self, setup: Setup, snap: BarSnapshot
+    ) -> tuple[Setup, str]:
+        if setup.state == SetupState.FORMING:
+            self._forming_bars[setup.setup_id] = (
+                self._forming_bars.get(setup.setup_id, 0) + 1
+            )
+            # Invalidation: reclaimed ORB low or VWAP
+            if snap.orb_low is not None and snap.bar.close > snap.orb_low:
+                return setup.transition(SetupState.INVALIDATED, "ORB low reclaimed"), ""
+            if snap.is_above_vwap:
+                return setup.transition(SetupState.INVALIDATED, "reclaimed VWAP"), ""
+            # Confirm: hold below ORB low on next bar + rvol ≥ 1.0
+            if snap.orb_low is not None and snap.bar.close < snap.orb_low:
+                rvol_ok = snap.relative_volume is None or snap.relative_volume >= 1.0
+                if rvol_ok:
+                    entry = snap.orb_low
+                    # Stop: just above ORB low (failed breakdown = reclaim)
+                    stop = snap.orb_low * Decimal("1.001")
+                    orb_range = (
+                        (snap.orb_high - snap.orb_low)
+                        if snap.orb_high and snap.orb_low else None
+                    )
+                    target = (
+                        entry - orb_range
+                        if orb_range else entry - (stop - entry) * Decimal("2")
+                    )
+                    confirmed = setup.transition(SetupState.CONFIRMED).model_copy(
+                        update={
+                            "entry_trigger": entry,
+                            "stop_reference": stop,
+                            "target_reference": target,
+                        }
+                    )
+                    logger.info(
+                        "Setup confirmed: %s %s entry=%.2f stop=%.2f target=%.2f",
+                        setup.symbol, setup.setup_type,
+                        float(entry), float(stop), float(target),
+                    )
+                    return confirmed, "confirmed"
+
+        elif setup.state == SetupState.CONFIRMED:
+            # Invalidation: price reclaims ORB low
+            if snap.orb_low is not None and snap.bar.close > snap.orb_low:
+                return setup.transition(SetupState.INVALIDATED, "ORB low reclaimed while confirmed"), ""
+            if setup.entry_trigger and snap.bar.low <= setup.entry_trigger:
+                return setup.transition(SetupState.TRIGGERED), "triggered"
+            if setup.stop_reference and snap.bar.high >= setup.stop_reference:
+                return setup.transition(SetupState.FAILED), "stop hit"
+
+        return setup, ""
 
     def _detect_vwap_reclaim(self, snap: BarSnapshot, ms: MarketState) -> bool:
-        return False
+        """
+        FORMING: price crossed above VWAP from at least 2 bars below, closing
+        with conviction (>0.05% above VWAP, upper half of bar).
+        """
+        if not snap.vwap_cross_up:
+            return False
+        if snap.vwap_cross_up_after_bars < 2:
+            return False
+        if snap.vwap_deviation_pct < 0.05:
+            return False
+        if snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.5:
+            return False
+        return True
+
+    def _reason_vwap_reclaim(self, snap: BarSnapshot, ms: MarketState) -> str | None:
+        if not snap.vwap_cross_up:
+            return "no_vwap_cross_up"
+        if snap.vwap_cross_up_after_bars < 2:
+            return "bars_below_vwap_before_cross_lt_2"
+        if snap.vwap_deviation_pct < 0.05:
+            return "close_not_above_vwap_with_conviction"
+        if snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.5:
+            return "close_in_lower_half_of_bar"
+        return None
+
+    def _detect_vwap_rejection(self, snap: BarSnapshot, ms: MarketState) -> bool:
+        """
+        FORMING: price crossed below VWAP from at least 2 bars above, closing
+        with conviction (>0.05% below VWAP, lower half of bar).
+        """
+        if not snap.vwap_cross_down:
+            return False
+        if snap.vwap_cross_down_after_bars < 2:
+            return False
+        if snap.vwap_deviation_pct > -0.05:
+            return False
+        if snap.bar_close_position_pct is not None and snap.bar_close_position_pct > 0.5:
+            return False
+        return True
+
+    def _reason_vwap_rejection(self, snap: BarSnapshot, ms: MarketState) -> str | None:
+        if not snap.vwap_cross_down:
+            return "no_vwap_cross_down"
+        if snap.vwap_cross_down_after_bars < 2:
+            return "bars_above_vwap_before_cross_lt_2"
+        if snap.vwap_deviation_pct > -0.05:
+            return "close_not_below_vwap_with_conviction"
+        if snap.bar_close_position_pct is not None and snap.bar_close_position_pct > 0.5:
+            return "close_in_upper_half_of_bar"
+        return None
+
+    def _detect_orb_breakdown(self, snap: BarSnapshot, ms: MarketState) -> bool:
+        """
+        FORMING: price breaks below ORB low, below VWAP, setting a new LOD.
+        """
+        if snap.orb_state != ORBState.BREAKOUT_DOWN or snap.orb_low is None:
+            return False
+        if snap.is_above_vwap:
+            return False
+        if not snap.is_new_lod:
+            return False
+        return True
+
+    def _reason_orb_breakdown(self, snap: BarSnapshot, ms: MarketState) -> str | None:
+        if snap.orb_state != ORBState.BREAKOUT_DOWN or snap.orb_low is None:
+            return "orb_not_in_breakdown"
+        if snap.is_above_vwap:
+            return "above_vwap"
+        if not snap.is_new_lod:
+            return "not_new_lod"
+        return None
+
+    # ── Stub detectors (not yet implemented) ─────────────────────────────────
 
     def _detect_orb_breakout(self, snap: BarSnapshot, ms: MarketState) -> bool:
         return False
@@ -325,7 +545,11 @@ class SetupEngine(BaseEngine):
         if setup_type == SetupType.TREND_PULLBACK:
             return self._reason_trend_pullback(snapshot, market_state)
         if setup_type == SetupType.VWAP_RECLAIM:
-            return "not_implemented"
+            return self._reason_vwap_reclaim(snapshot, market_state)
+        if setup_type == SetupType.VWAP_REJECTION:
+            return self._reason_vwap_rejection(snapshot, market_state)
+        if setup_type == SetupType.ORB_BREAKDOWN:
+            return self._reason_orb_breakdown(snapshot, market_state)
         if setup_type == SetupType.ORB_BREAKOUT:
             return "not_implemented"
         if setup_type == SetupType.SWEEP_RECLAIM:
@@ -399,6 +623,12 @@ class SetupEngine(BaseEngine):
             return self._advance_hod_breakout(setup, snapshot)
         if setup.setup_type == SetupType.TREND_PULLBACK:
             return self._advance_trend_pullback(setup, snapshot)
+        if setup.setup_type == SetupType.VWAP_RECLAIM:
+            return self._advance_vwap_reclaim(setup, snapshot)
+        if setup.setup_type == SetupType.VWAP_REJECTION:
+            return self._advance_vwap_rejection(setup, snapshot)
+        if setup.setup_type == SetupType.ORB_BREAKDOWN:
+            return self._advance_orb_breakdown(setup, snapshot)
         return setup, ""
 
     # ── Per-type advance methods ───────────────────────────────────────────────
@@ -461,7 +691,9 @@ class SetupEngine(BaseEngine):
                 rvol_ok = snap.relative_volume is None or snap.relative_volume >= 1.2
                 if rvol_ok:
                     entry = snap.intraday_high
-                    stop = snap.vwap * Decimal("0.999")
+                    # Use breakout bar's low as stop — tighter and more logical
+                    # than vwap-based stop which can be 100+ pts wide on MNQ.
+                    stop = snap.bar.low
                     target = entry + (entry - stop) * Decimal("2")
                     confirmed = setup.transition(SetupState.CONFIRMED).model_copy(
                         update={
