@@ -28,7 +28,7 @@ from alpha.core.clock import Clock
 from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
-from alpha.models.enums import EventType, HealthStatus, ORBState, SessionPhase
+from alpha.models.enums import AssetClass, EventType, HealthStatus, ORBState, SessionPhase
 from alpha.models.events import AnyEvent, BarEvent, QuoteEvent
 from alpha.models.snapshot import BarSnapshot
 
@@ -58,6 +58,8 @@ class SymbolFeatureState:
         self.latest_ask: Decimal | None = None
         self.atr_buffer: Deque[Decimal] = deque(maxlen=14)
         self.prev_close: Decimal | None = None
+        self.volume_buffer: Deque[int] = deque(maxlen=20)  # completed bar volumes for RVOL
+        self.relative_volume: float | None = None
 
         # ── Setup detection state ─────────────────────────────────────────────
         self.bars_above_vwap: int = 0
@@ -167,6 +169,21 @@ class FeatureEngine(BaseEngine):
     def get_snapshot(self, symbol: str) -> BarSnapshot | None:
         return self._snapshots.get(symbol)
 
+    def record_trade(self, symbol: str, price: float, size: int) -> None:
+        """Sync tick handler: update intraday high/low from raw trade ticks.
+
+        Called directly from the live adapter on every trade tick — no asyncio.
+        Keeps intraday_high / intraday_low accurate between bar completions.
+        """
+        state = self._states.get(symbol)
+        if state is None:
+            return
+        p = Decimal(str(price))
+        if state.intraday_high is None or p > state.intraday_high:
+            state.intraday_high = p
+        if state.intraday_low is None or p < state.intraday_low:
+            state.intraday_low = p
+
     # ── Handlers ──────────────────────────────────────────────────────────────
 
     async def _handle_bar(self, event: AnyEvent) -> None:
@@ -212,20 +229,29 @@ class FeatureEngine(BaseEngine):
 
         state.bars.append(bar)
 
-        if phase not in {SessionPhase.PRE_MARKET, SessionPhase.AFTER_HOURS, SessionPhase.CLOSED}:
-            state.bars_since_open += 1
+        is_rth = phase not in {SessionPhase.PRE_MARKET, SessionPhase.AFTER_HOURS, SessionPhase.CLOSED}
+        # Futures trade ~23h/day — compute VWAP and setup flags for all non-CLOSED
+        # phases so premarket detection works. Equities keep the RTH-only gate.
+        sym = self._registry.get(bar.symbol)
+        is_futures = sym is not None and sym.asset_class == AssetClass.FUTURE
+        active_session = is_rth or (is_futures and phase != SessionPhase.CLOSED)
+
+        if active_session:
             state.cumulative_volume += bar.volume
             typical = (bar.high + bar.low + bar.close) / 3
             state.cumulative_vwap_num += typical * bar.volume
 
-            orb_end = calendar.opening_range_end(session_date, state.orb_minutes)
-            if not state.orb_established and bar.timestamp < orb_end:
-                if state.orb_high is None or bar.high > state.orb_high:
-                    state.orb_high = bar.high
-                if state.orb_low is None or bar.low < state.orb_low:
-                    state.orb_low = bar.low
-            elif not state.orb_established and bar.timestamp >= orb_end:
-                state.orb_established = True
+            # ORB and bars_since_open are cash-session concepts — RTH only.
+            if is_rth:
+                state.bars_since_open += 1
+                orb_end = calendar.opening_range_end(session_date, state.orb_minutes)
+                if not state.orb_established and bar.timestamp < orb_end:
+                    if state.orb_high is None or bar.high > state.orb_high:
+                        state.orb_high = bar.high
+                    if state.orb_low is None or bar.low < state.orb_low:
+                        state.orb_low = bar.low
+                elif not state.orb_established and bar.timestamp >= orb_end:
+                    state.orb_established = True
 
             # ── Setup detection features ──────────────────────────────────────
             vwap = state.vwap
@@ -301,6 +327,14 @@ class FeatureEngine(BaseEngine):
             state.atr_buffer.append(tr)
         state.prev_close = bar.close
 
+        # RVOL — compare this bar's volume to the average of the last 20 bars.
+        if state.volume_buffer:
+            avg_vol = sum(state.volume_buffer) / len(state.volume_buffer)
+            state.relative_volume = float(bar.volume) / avg_vol if avg_vol > 0 else None
+        else:
+            state.relative_volume = None
+        state.volume_buffer.append(bar.volume)
+
     def _build_snapshot(self, state: SymbolFeatureState, bar: BarEvent) -> BarSnapshot:
         from alpha.models.bar import Bar
 
@@ -353,6 +387,7 @@ class FeatureEngine(BaseEngine):
             vwap=vwap,
             vwap_deviation_pct=vwap_dev,
             cumulative_volume=state.cumulative_volume,
+            relative_volume=state.relative_volume,
             orb_high=state.orb_high,
             orb_low=state.orb_low,
             orb_range=(state.orb_high - state.orb_low)

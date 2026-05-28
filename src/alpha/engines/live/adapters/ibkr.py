@@ -30,6 +30,7 @@ from alpha.engines.live.adapters.base import (
     BookHandlerT,
     LiveFeedAdapter,
     QuoteHandlerT,
+    TickHandlerT,
     TradeHandlerT,
 )
 from alpha.models.enums import BarTimeframe, DataSourceId
@@ -60,9 +61,11 @@ class IBKRLiveFeedAdapter(LiveFeedAdapter):
         self._symbols = {sym.ticker: sym for sym in symbols}
         # Active ib_insync subscription handles
         self._bar_lists: dict[str, object] = {}    # ticker → BarDataList
-        self._tickers: dict[str, object] = {}       # ticker → Ticker
+        self._tickers: dict[str, object] = {}       # ticker → Ticker (reqMktData)
+        self._tick_tickers: dict[str, object] = {}  # ticker → Ticker (reqTickByTickData)
         self._bar_callbacks: dict[str, object] = {}
         self._quote_callbacks: dict[str, object] = {}
+        self._tick_callbacks: dict[str, object] = {}
 
     @property
     def source_id(self) -> DataSourceId:
@@ -90,8 +93,14 @@ class IBKRLiveFeedAdapter(LiveFeedAdapter):
                 ib.cancelMktData(ticker.contract)
             except Exception:
                 pass
+        for symbol, ticker in self._tick_tickers.items():
+            try:
+                ib.cancelTickByTickData(ticker.contract)  # type: ignore[union-attr]
+            except Exception:
+                pass
         self._bar_lists.clear()
         self._tickers.clear()
+        self._tick_tickers.clear()
         logger.info("IBKR live feed adapter disconnected")
 
     # ── Subscriptions ─────────────────────────────────────────────────────────
@@ -195,6 +204,54 @@ class IBKRLiveFeedAdapter(LiveFeedAdapter):
             self._quote_callbacks[ticker_str] = cb
 
         logger.info("Subscribed to quotes for %d symbols", len(symbols))
+
+    async def subscribe_tick_trades(
+        self,
+        symbols: list[str],
+        handler: TickHandlerT,
+    ) -> None:
+        """Subscribe to tick-by-tick Last trades via reqTickByTickData.
+
+        Fires handler(symbol, price, size) synchronously for each new trade tick.
+        The handler must be non-blocking — it runs on the ib_insync event loop thread.
+        """
+        ib = await self._conn.get()
+
+        for ticker_str in symbols:
+            if ticker_str in self._tick_tickers:
+                continue
+
+            sym = self._symbols.get(ticker_str)
+            if sym is None:
+                logger.warning("Symbol %s not in registry, skipping tick subscription", ticker_str)
+                continue
+
+            contract = make_contract(sym)
+            ticker = ib.reqTickByTickData(contract, "Last", 0, True)
+            self._tick_tickers[ticker_str] = ticker
+
+            def make_tick_cb(sym_ticker: str, h: TickHandlerT) -> object:
+                last_seen: list[int] = [0]  # tracks how many tickByTicks we've processed
+
+                def on_tick_update(t: object) -> None:
+                    ticks = getattr(t, "tickByTicks", [])
+                    new_count = len(ticks)
+                    if new_count <= last_seen[0]:
+                        return
+                    for tick in ticks[last_seen[0]:]:
+                        price = getattr(tick, "price", None)
+                        size = getattr(tick, "size", None)
+                        if price and size and price > 0:
+                            h(sym_ticker, float(price), int(size))
+                    last_seen[0] = new_count
+
+                return on_tick_update
+
+            cb = make_tick_cb(ticker_str, handler)
+            ticker.updateEvent += cb  # type: ignore[union-attr]
+            self._tick_callbacks[ticker_str] = cb
+
+        logger.info("Subscribed to tick trades for %d symbols", len(symbols))
 
     # ── Symbol management ─────────────────────────────────────────────────────
 

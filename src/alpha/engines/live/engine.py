@@ -20,7 +20,7 @@ from alpha.config.settings import AlphaSettings
 from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
-from alpha.engines.live.adapters.base import LiveFeedAdapter
+from alpha.engines.live.adapters.base import LiveFeedAdapter, TickHandlerT
 from alpha.models.enums import BarTimeframe, HealthStatus
 from alpha.models.events import BarEvent, OrderBookEvent, QuoteEvent, TradeEvent
 
@@ -144,6 +144,12 @@ class LiveIngestionEngine(BaseEngine):
 
     def latest_quotes(self) -> dict[str, QuoteEvent]:
         return dict(self._latest_quotes)
+
+    async def subscribe_tick_trades(self, handler: TickHandlerT) -> None:
+        """Wire a sync tick handler to the primary adapter's tick-by-tick feed."""
+        symbols = self._registry.tickers()
+        adapter = self.primary_adapter
+        await adapter.subscribe_tick_trades(symbols, handler)
 
     # ── Handlers — called by adapter, forwarded to EventBus ──────────────────
 

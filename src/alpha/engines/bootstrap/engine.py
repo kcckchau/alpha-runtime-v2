@@ -145,6 +145,10 @@ class BootstrapEngine(BaseEngine):
             if self._live is not None:
                 await self._live.start()
                 self._write_runtime_snapshot()
+                # Wire tick-by-tick trade feed directly into the feature engine
+                # so intraday_high/low stay accurate between bar completions.
+                if self._feature is not None:
+                    await self._live.subscribe_tick_trades(self._feature.record_trade)
             await self._run_catchup()
             if self._storage is not None:
                 await self._storage.flush()

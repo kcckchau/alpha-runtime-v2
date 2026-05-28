@@ -216,21 +216,21 @@ class SetupEngine(BaseEngine):
 
     def _detect_fake_breakdown(self, snap: BarSnapshot, ms: MarketState) -> bool:
         """
-        FORMING: at least 1 bar below VWAP, low near VWAP (within 0.1%).
-        MNQ opposed → blocked (not yet implemented; skipped until MNQ lead is wired).
+        FORMING: at least 1 bar closed below VWAP, but the wick didn't sweep
+        more than 0.1% below (shallow dip, not a true breakdown).
         """
         if snap.bars_below_vwap < 1:
             return False
-        # Low must be at or near VWAP (within 0.1% above)
-        if snap.bar.low > snap.vwap * Decimal("1.001"):
+        # Reject deep breakdowns — low more than 0.1% below VWAP is a real breakdown
+        if snap.bar.low < snap.vwap * Decimal("0.999"):
             return False
         return True
 
     def _reason_fake_breakdown(self, snap: BarSnapshot, ms: MarketState) -> str | None:
         if snap.bars_below_vwap < 1:
             return "bars_below_vwap_lt_1"
-        if snap.bar.low > snap.vwap * Decimal("1.001"):
-            return "low_not_near_vwap"
+        if snap.bar.low < snap.vwap * Decimal("0.999"):
+            return "low_too_far_below_vwap"
         return None
 
     def _detect_hod_breakout(self, snap: BarSnapshot, ms: MarketState) -> bool:

@@ -18,6 +18,9 @@ BarHandlerT = Callable[[BarEvent], Coroutine[Any, Any, None]]
 TradeHandlerT = Callable[[TradeEvent], Coroutine[Any, Any, None]]
 QuoteHandlerT = Callable[[QuoteEvent], Coroutine[Any, Any, None]]
 BookHandlerT = Callable[[OrderBookEvent], Coroutine[Any, Any, None]]
+# Synchronous tick handler — bypasses the event bus for high-frequency trade ticks.
+# Called directly from the adapter callback with (symbol, price, size).
+TickHandlerT = Callable[[str, float, int], None]
 
 
 class LiveFeedAdapter(ABC):
@@ -83,6 +86,18 @@ class LiveFeedAdapter(ABC):
     ) -> None:
         """Subscribe to L2 order book. Optional — default raises."""
         raise NotImplementedError(f"{self.source_id} does not support order book")
+
+    async def subscribe_tick_trades(
+        self,
+        symbols: list[str],
+        handler: TickHandlerT,
+    ) -> None:
+        """Subscribe to individual trade ticks (tick-by-tick). Optional — default no-ops.
+
+        Handler is synchronous and called directly from the adapter callback —
+        bypasses the event bus to support 200+ ticks/sec without asyncio overhead.
+        Signature: handler(symbol: str, price: float, size: int) -> None
+        """
 
     # ── Symbol management ─────────────────────────────────────────────────────
 
