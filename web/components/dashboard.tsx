@@ -184,8 +184,8 @@ const S = {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-async function fetchJson<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
+async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, { cache: "no-store", ...init });
   if (!response.ok) throw new Error(`${path}: ${response.status}`);
   return (await response.json()) as T;
 }
@@ -770,12 +770,34 @@ function RiskPanel({ risk }: { risk: RiskState | null }) {
   );
 }
 
+// ─── Backfill types ───────────────────────────────────────────────────────────
+
+type BackfillJob = {
+  job_id: string;
+  symbol: string;
+  date: string;
+  status: "pending" | "fetching_bars" | "detecting_setups" | "done" | "error";
+  bars_fetched: number;
+  setups_detected: number;
+  error: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+};
+
+type AvailableDates = {
+  symbol: string;
+  bar_dates: string[];
+  context_dates: string[];
+};
+
 // ─── Main Dashboard ───────────────────────────────────────────────────────────
 
 export function Dashboard() {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState("MNQ");
   const [selectedTimeframe, setSelectedTimeframe] = useState<Timeframe>("1m");
+  // null = live mode; string = historical date "YYYY-MM-DD"
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
   const [contexts, setContexts] = useState<Record<string, SymbolContext | null>>({});
   const [quotes, setQuotes] = useState<Record<string, QuoteRow | null>>({});
   const [bars, setBars] = useState<BarHistoryRow[]>([]);
@@ -785,6 +807,9 @@ export function Dashboard() {
   const [riskState, setRiskState] = useState<RiskState | null>(null);
   const [clock, setClock] = useState("--:--:-- ET");
   const [error, setError] = useState<string | null>(null);
+  // Backfill state
+  const [backfillJob, setBackfillJob] = useState<BackfillJob | null>(null);
+  const [availableDates, setAvailableDates] = useState<AvailableDates | null>(null);
 
   // ET clock — ticks every second
   useEffect(() => {
@@ -799,9 +824,17 @@ export function Dashboard() {
     return () => clearInterval(id);
   }, []);
 
-  // Data polling
+  // Available dates — fetched once when symbol changes, enables date picker
+  useEffect(() => {
+    fetchJson<AvailableDates>(`/runtime/available-dates?symbol=${selectedSymbol}`)
+      .then(setAvailableDates)
+      .catch(() => setAvailableDates(null));
+  }, [selectedSymbol]);
+
+  // Data polling — paused for historical dates (WS handles live updates instead)
   useEffect(() => {
     let cancelled = false;
+    const isHistorical = selectedDate !== null;
 
     async function loadAll() {
       try {
@@ -810,33 +843,82 @@ export function Dashboard() {
           ? selectedSymbol
           : (statusData.symbols[0] ?? "MNQ");
 
-        const [contextData, quoteData, barData, latestBarData, setupData, setupContextData, prevSetupContextData] = await Promise.all([
-          fetchJson<Record<string, SymbolContext | null>>(`/runtime/contexts?symbol=${symbol}`),
-          fetchJson<Record<string, QuoteRow | null>>(`/runtime/quotes?symbol=${symbol}`),
-          fetchJson<BarHistoryRow[]>(
-            `/runtime/bars/history?symbol=${symbol}&timeframe=${selectedTimeframe}&start=${historyStartDate(symbol)}&end=${todayDate()}`
-          ),
-          fetchJson<Record<string, BarHistoryRow | null>>(`/runtime/bars?symbol=${symbol}`),
-          fetchJson<SetupRow[]>(`/runtime/setups?symbol=${symbol}`),
-          fetchJson<Record<string, SetupSessionContext | null>>(`/runtime/setup-contexts?symbol=${symbol}`),
-          fetchJson<Record<string, SetupSessionContext | null>>(`/runtime/prev-setup-contexts?symbol=${symbol}`),
-        ]);
+        // Date bounds: historical uses the selected date, live uses rolling lookback
+        const histStart = isHistorical ? selectedDate : historyStartDate(symbol);
+        const histEnd   = isHistorical ? selectedDate : todayDate();
+        const dateSuffix = isHistorical ? `&date=${selectedDate}` : "";
 
-        // Optional endpoint — silently ignore if not yet implemented
-        const riskData = await fetchJson<RiskState>(`/runtime/risk?symbol=${symbol}`).catch(() => null);
+        const requests: Promise<unknown>[] = [
+          // [0] contexts
+          isHistorical
+            ? Promise.resolve({})
+            : fetchJson<Record<string, SymbolContext | null>>(`/runtime/contexts?symbol=${symbol}`),
+          // [1] quotes
+          isHistorical
+            ? Promise.resolve({})
+            : fetchJson<Record<string, QuoteRow | null>>(`/runtime/quotes?symbol=${symbol}`),
+          // [2] bar history
+          fetchJson<BarHistoryRow[]>(
+            `/runtime/bars/history?symbol=${symbol}&timeframe=${selectedTimeframe}&start=${histStart}&end=${histEnd}`
+          ),
+          // [3] latest live bar (only useful in live mode)
+          isHistorical
+            ? Promise.resolve({})
+            : fetchJson<Record<string, BarHistoryRow | null>>(`/runtime/bars?symbol=${symbol}`),
+          // [4] setups (live only — no historical setups in the active list)
+          isHistorical
+            ? Promise.resolve([])
+            : fetchJson<SetupRow[]>(`/runtime/setups?symbol=${symbol}`),
+          // [5] setup context
+          fetchJson<Record<string, SetupSessionContext | null>>(
+            `/runtime/setup-contexts?symbol=${symbol}${dateSuffix}`
+          ),
+          // [6] prev setup context
+          fetchJson<Record<string, SetupSessionContext | null>>(
+            `/runtime/prev-setup-contexts?symbol=${symbol}${dateSuffix}`
+          ),
+        ];
+
+        const [
+          contextData,
+          quoteData,
+          barData,
+          latestBarData,
+          setupData,
+          setupContextData,
+          prevSetupContextData,
+        ] = await Promise.all(requests) as [
+          Record<string, SymbolContext | null>,
+          Record<string, QuoteRow | null>,
+          BarHistoryRow[],
+          Record<string, BarHistoryRow | null>,
+          SetupRow[],
+          Record<string, SetupSessionContext | null>,
+          Record<string, SetupSessionContext | null>,
+        ];
+
+        const riskData = isHistorical
+          ? null
+          : await fetchJson<RiskState>(`/runtime/risk?symbol=${symbol}`).catch(() => null);
 
         if (cancelled) return;
 
         setStatus(statusData);
         setSelectedSymbol(symbol);
-        setContexts((prev) => ({ ...prev, ...contextData }));
-        setQuotes((prev) => ({ ...prev, ...quoteData }));
-        const latestLiveBar = latestBarData[symbol] ?? null;
+
+        if (!isHistorical) {
+          setContexts((prev) => ({ ...prev, ...contextData }));
+          setQuotes((prev) => ({ ...prev, ...quoteData }));
+        }
+
+        const latestLiveBar = !isHistorical ? (latestBarData[symbol] ?? null) : null;
         setBars(latestLiveBar ? mergeLiveBar(barData, latestLiveBar, selectedTimeframe) : barData);
         setSetups(setupData);
         setSetupContexts((prev) => ({ ...prev, ...setupContextData }));
         setPrevSetupContexts((prev) => ({ ...prev, ...prevSetupContextData }));
-        setRiskState(riskData);
+
+        if (!isHistorical) setRiskState(riskData);
+
         setError(null);
       } catch (err) {
         if (cancelled) return;
@@ -845,11 +927,17 @@ export function Dashboard() {
     }
 
     void loadAll();
-    const interval = setInterval(() => void loadAll(), 15000);
+    // In historical mode, poll less aggressively (data is static)
+    const interval = setInterval(() => void loadAll(), isHistorical ? 60000 : 15000);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [selectedSymbol, selectedTimeframe]);
+  }, [selectedSymbol, selectedTimeframe, selectedDate]);
 
   useEffect(() => {
+    // In historical mode the WebSocket is kept alive only for runtime status
+    // updates (mode, health). Bar, quote, and setup updates are suppressed so
+    // they don't overwrite the historical view.
+    const isHistorical = selectedDate !== null;
+
     const ws = new WebSocket(
       `${websocketBaseUrl()}/runtime/ws?symbol=${encodeURIComponent(selectedSymbol)}`
     );
@@ -859,6 +947,7 @@ export function Dashboard() {
         const payload = JSON.parse(event.data) as RuntimeWsMessage;
         if (payload.type !== "runtime_update" || payload.symbol !== selectedSymbol) return;
 
+        // Always update runtime status (mode / health)
         setStatus((prev) =>
           prev
             ? {
@@ -870,6 +959,9 @@ export function Dashboard() {
               }
             : prev
         );
+
+        // All live data updates are suppressed when viewing a historical date
+        if (isHistorical) return;
 
         if (payload.context) {
           setContexts((prev) => ({ ...prev, [selectedSymbol]: payload.context }));
@@ -932,7 +1024,43 @@ export function Dashboard() {
     return () => {
       ws.close();
     };
-  }, [selectedSymbol, selectedTimeframe]);
+  }, [selectedSymbol, selectedTimeframe, selectedDate]);
+
+  // Backfill job polling — only runs while a job is active
+  useEffect(() => {
+    if (!backfillJob || backfillJob.status === "done" || backfillJob.status === "error") return;
+
+    const id = setInterval(async () => {
+      try {
+        const updated = await fetchJson<BackfillJob>(
+          `/runtime/backfill-jobs/${encodeURIComponent(backfillJob.job_id)}`
+        );
+        setBackfillJob(updated);
+        // When done, reload data for the selected date
+        if (updated.status === "done") {
+          clearInterval(id);
+          // Trigger a re-fetch by bumping a dependency via selectedDate reassignment
+          setSelectedDate((d) => d);
+        }
+      } catch {
+        // non-fatal
+      }
+    }, 2000);
+    return () => clearInterval(id);
+  }, [backfillJob]);
+
+  async function triggerBackfill(symbol: string, date: string) {
+    try {
+      const job = await fetchJson<BackfillJob>(`/runtime/backfill-date`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol, date }),
+      } as Parameters<typeof fetchJson>[1]);
+      setBackfillJob(job as BackfillJob);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Backfill request failed");
+    }
+  }
 
   const currentContext = contexts[selectedSymbol] ?? null;
   const currentQuote = quotes[selectedSymbol] ?? null;
@@ -1055,6 +1183,7 @@ export function Dashboard() {
           display: "flex", alignItems: "center", justifyContent: "space-between",
           padding: "7px 12px", background: "#111111",
           border: "0.5px solid rgba(255,255,255,0.06)", borderRadius: 6, marginBottom: 8,
+          flexWrap: "wrap", gap: 6,
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -1065,15 +1194,27 @@ export function Dashboard() {
             <Dot color={modeDotColor} />
             {modeStr}
           </Pill>
-          <Pill color={sessionPillColor}>
-            <Dot color={sessionDotColor} />
-            {sessionPhase}
-          </Pill>
+          {selectedDate === null && (
+            <Pill color={sessionPillColor}>
+              <Dot color={sessionDotColor} />
+              {sessionPhase}
+            </Pill>
+          )}
+          {selectedDate !== null && (
+            <Pill color="blue">
+              <Dot color="#60a5fa" />
+              HISTORY · {selectedDate}
+            </Pill>
+          )}
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
           <select
             value={selectedSymbol}
-            onChange={(e) => setSelectedSymbol(e.target.value)}
+            onChange={(e) => {
+              setSelectedSymbol(e.target.value);
+              setSelectedDate(null);
+              setBackfillJob(null);
+            }}
             style={{
               background: "rgba(255,255,255,0.06)",
               border: "0.5px solid rgba(255,255,255,0.12)",
@@ -1087,7 +1228,49 @@ export function Dashboard() {
               <option key={s} value={s}>{s}</option>
             ))}
           </select>
-          <Pill color="green">{activeSetupCount} setups</Pill>
+
+          {/* Date picker */}
+          <input
+            type="date"
+            value={selectedDate ?? ""}
+            max={todayDate()}
+            onChange={(e) => {
+              const val = e.target.value;
+              setSelectedDate(val || null);
+              setBackfillJob(null);
+              setBars([]);
+              setSetups([]);
+            }}
+            style={{
+              background: "rgba(255,255,255,0.06)",
+              border: `0.5px solid ${selectedDate ? "rgba(96,165,250,0.4)" : "rgba(255,255,255,0.12)"}`,
+              color: "rgba(255,255,255,0.88)",
+              borderRadius: 4, padding: "2px 8px",
+              ...S.mono, fontSize: 10,
+              cursor: "pointer",
+              colorScheme: "dark",
+            }}
+          />
+          {selectedDate !== null && (
+            <button
+              onClick={() => {
+                setSelectedDate(null);
+                setBackfillJob(null);
+                setBars([]);
+              }}
+              style={{
+                ...S.mono, fontSize: 10, fontWeight: 500,
+                padding: "3px 8px", borderRadius: 4, cursor: "pointer",
+                border: "0.5px solid rgba(255,255,255,0.12)",
+                background: "rgba(255,255,255,0.06)",
+                color: "rgba(255,255,255,0.6)",
+              }}
+            >
+              Live ▸
+            </button>
+          )}
+
+          {selectedDate === null && <Pill color="green">{activeSetupCount} setups</Pill>}
           <Pill color="gray">{clock}</Pill>
         </div>
       </div>
@@ -1104,6 +1287,103 @@ export function Dashboard() {
           {error}
         </div>
       )}
+
+      {/* ── Historical data banner ── */}
+      {selectedDate !== null && (() => {
+        const hasBarData = bars.length > 0;
+        const jobRunning = backfillJob && (
+          backfillJob.status === "pending" ||
+          backfillJob.status === "fetching_bars" ||
+          backfillJob.status === "detecting_setups"
+        );
+        const jobDone    = backfillJob?.status === "done";
+        const jobError   = backfillJob?.status === "error";
+
+        const statusLabel: Record<string, string> = {
+          pending: "Queued…",
+          fetching_bars: `Fetching bars from IBKR…`,
+          detecting_setups: `Detecting setups… (${backfillJob?.bars_fetched ?? 0} bars)`,
+          done: `Done — ${backfillJob?.setups_detected ?? 0} setups detected`,
+          error: `Error: ${backfillJob?.error ?? "unknown"}`,
+        };
+
+        if (jobRunning || jobDone || jobError) {
+          return (
+            <div
+              style={{
+                display: "flex", alignItems: "center", gap: 10,
+                background: jobError ? "rgba(239,68,68,0.07)" : "rgba(96,165,250,0.07)",
+                border: `0.5px solid ${jobError ? "rgba(239,68,68,0.3)" : "rgba(96,165,250,0.3)"}`,
+                color: jobError ? "#ef4444" : "#60a5fa",
+                borderRadius: 6, padding: "8px 12px", marginBottom: 8,
+                ...S.mono, fontSize: 11,
+              }}
+            >
+              {jobRunning && (
+                <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: "#60a5fa", animation: "pulse 1.5s ease-in-out infinite" }} />
+              )}
+              {statusLabel[backfillJob!.status]}
+            </div>
+          );
+        }
+
+        if (!hasBarData) {
+          return (
+            <div
+              style={{
+                display: "flex", alignItems: "center", justifyContent: "space-between",
+                background: "rgba(251,191,36,0.07)", border: "0.5px solid rgba(251,191,36,0.3)",
+                borderRadius: 6, padding: "8px 12px", marginBottom: 8,
+              }}
+            >
+              <span style={{ ...S.mono, fontSize: 11, color: "#fbbf24" }}>
+                No data for {selectedDate}. Fetch 1m bars and detect setups?
+              </span>
+              <button
+                onClick={() => void triggerBackfill(selectedSymbol, selectedDate)}
+                style={{
+                  ...S.mono, fontSize: 10, fontWeight: 600,
+                  padding: "4px 12px", borderRadius: 4, cursor: "pointer",
+                  border: "0.5px solid rgba(251,191,36,0.5)",
+                  background: "rgba(251,191,36,0.12)", color: "#fbbf24",
+                }}
+              >
+                Backfill
+              </button>
+            </div>
+          );
+        }
+
+        const hasContext = (setupContexts[selectedSymbol]?.setups?.length ?? 0) > 0;
+        if (!hasContext) {
+          return (
+            <div
+              style={{
+                display: "flex", alignItems: "center", justifyContent: "space-between",
+                background: "rgba(96,165,250,0.07)", border: "0.5px solid rgba(96,165,250,0.3)",
+                borderRadius: 6, padding: "8px 12px", marginBottom: 8,
+              }}
+            >
+              <span style={{ ...S.mono, fontSize: 11, color: "#60a5fa" }}>
+                Bars loaded — setup context not found for {selectedDate}. Run setup detection?
+              </span>
+              <button
+                onClick={() => void triggerBackfill(selectedSymbol, selectedDate)}
+                style={{
+                  ...S.mono, fontSize: 10, fontWeight: 600,
+                  padding: "4px 12px", borderRadius: 4, cursor: "pointer",
+                  border: "0.5px solid rgba(96,165,250,0.5)",
+                  background: "rgba(96,165,250,0.12)", color: "#60a5fa",
+                }}
+              >
+                Detect Setups
+              </button>
+            </div>
+          );
+        }
+
+        return null;
+      })()}
 
       {/* ── Main layout: chart + sidebar ── */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 220px", gap: 8 }}>

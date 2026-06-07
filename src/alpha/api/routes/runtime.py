@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel
 
 from alpha.config.loader import get_settings
 from alpha.config.settings import StorageSettings
 from alpha.engines.storage.parquet import ParquetStore
+from alpha.engines.storage.session_context_store import SessionContextStore
 from alpha.models.enums import BarTimeframe, EngineState, HealthStatus
 from alpha.runtime_status import read_snapshot
 from alpha.timeframe_context import aggregate_monthly_history, rows_to_history_payload
@@ -69,6 +71,12 @@ def _snapshot_or_default() -> dict[str, Any]:
 def _parquet_store() -> ParquetStore:
     settings = get_settings()
     return ParquetStore(StorageSettings(parquet_root=settings.storage.parquet_root))
+
+
+def _session_context_store() -> SessionContextStore:
+    settings = get_settings()
+    data_root = settings.storage.parquet_root.parent
+    return SessionContextStore(data_root)
 
 
 def _sorted_history_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -156,7 +164,28 @@ async def list_active_setups(symbol: str | None = None) -> list[dict]:  # type: 
 
 
 @router.get("/setup-contexts")
-async def list_setup_contexts(symbol: str | None = None) -> dict[str, Any]:
+async def list_setup_contexts(
+    symbol: str | None = None,
+    date: date | None = None,
+) -> dict[str, Any]:
+    """
+    Return setup contexts.
+
+    - No `date`: live snapshot (current session).
+    - With `date`: read from per-date JSON store (historical view).
+    """
+    if date is not None:
+        store = _session_context_store()
+        if symbol is not None:
+            raw = store.load_raw(symbol.upper(), date)
+            return {symbol.upper(): raw}
+        # All symbols for that date
+        settings = get_settings()
+        result: dict[str, Any] = {}
+        for sym in settings.runtime.symbols:
+            result[sym] = store.load_raw(sym, date)
+        return result
+
     snapshot = _snapshot_or_default()
     contexts = snapshot["setup_contexts"]
     if symbol is None:
@@ -165,12 +194,118 @@ async def list_setup_contexts(symbol: str | None = None) -> dict[str, Any]:
 
 
 @router.get("/prev-setup-contexts")
-async def list_prev_setup_contexts(symbol: str | None = None) -> dict[str, Any]:
+async def list_prev_setup_contexts(
+    symbol: str | None = None,
+    date: date | None = None,
+) -> dict[str, Any]:
+    """
+    Return previous-session setup contexts.
+
+    - No `date`: live snapshot (previous session relative to current).
+    - With `date`: the session immediately before `date` from the JSON store.
+    """
+    if date is not None:
+        store = _session_context_store()
+        if symbol is not None:
+            raw = store.load_prev_raw(symbol.upper(), date)
+            return {symbol.upper(): raw}
+        settings = get_settings()
+        result: dict[str, Any] = {}
+        for sym in settings.runtime.symbols:
+            result[sym] = store.load_prev_raw(sym, date)
+        return result
+
     snapshot = _snapshot_or_default()
     contexts = snapshot["prev_setup_contexts"]
     if symbol is None:
         return contexts
     return {symbol: contexts.get(symbol)}
+
+
+# ─── Backfill endpoints ───────────────────────────────────────────────────────
+
+
+class BackfillRequest(BaseModel):
+    symbol: str
+    date: date
+
+
+class BackfillJobResponse(BaseModel):
+    job_id: str
+    symbol: str
+    date: str
+    status: str
+    bars_fetched: int = 0
+    setups_detected: int = 0
+    error: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
+@router.post("/backfill-date", response_model=BackfillJobResponse)
+async def trigger_backfill(
+    req: BackfillRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+) -> BackfillJobResponse:
+    """
+    Trigger a background backfill for a specific symbol + date.
+
+    - If 1m bars are missing from Parquet, fetches them from IBKR first.
+    - Replays bars through the feature → market state → setup pipeline.
+    - Persists the resulting SessionSetupContext to disk.
+
+    Poll GET /runtime/backfill-jobs/{job_id} for progress.
+    """
+    from alpha.api.date_replay import JobStatus, _make_job
+    from alpha.api.date_replay import job_id as make_jid
+    from alpha.api.date_replay import run_date_backfill
+
+    symbol = req.symbol.upper()
+    d = req.date
+    jid = make_jid(symbol, d)
+
+    jobs: dict[str, Any] = request.app.state.backfill_jobs
+
+    # Idempotent: if the job is already running/done return its current state
+    existing = jobs.get(jid)
+    if existing and existing["status"] in (JobStatus.PENDING, JobStatus.FETCHING_BARS, JobStatus.DETECTING_SETUPS):
+        return BackfillJobResponse(**existing)
+
+    settings = get_settings()
+    job = _make_job(symbol, d)
+    jobs[jid] = job
+
+    background_tasks.add_task(run_date_backfill, symbol, d, settings, jobs)
+
+    return BackfillJobResponse(**job)
+
+
+@router.get("/backfill-jobs/{job_id_path:path}", response_model=BackfillJobResponse)
+async def get_backfill_job(job_id_path: str, request: Request) -> BackfillJobResponse:
+    """Return current status for a backfill job."""
+    jobs: dict[str, Any] = request.app.state.backfill_jobs
+    job = jobs.get(job_id_path)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id_path}' not found")
+    return BackfillJobResponse(**job)
+
+
+@router.get("/available-dates")
+async def available_dates(symbol: str) -> dict[str, Any]:
+    """
+    Return the list of trading dates for which 1m bar data and/or
+    session context files exist locally.
+    """
+    store = _parquet_store()
+    parquet_dates = store.list_dates(f"bars/{BarTimeframe.M1}", symbol.upper())
+    ctx_store = _session_context_store()
+    context_dates = ctx_store.list_dates(symbol.upper())
+    return {
+        "symbol": symbol.upper(),
+        "bar_dates": [d.isoformat() for d in parquet_dates],
+        "context_dates": [d.isoformat() for d in context_dates],
+    }
 
 
 @router.get("/quotes")

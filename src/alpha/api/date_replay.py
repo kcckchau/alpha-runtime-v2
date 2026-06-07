@@ -1,0 +1,317 @@
+"""
+On-demand date backfill worker.
+
+Runs as an asyncio background task triggered by POST /runtime/backfill-date.
+
+Flow for a given (symbol, date):
+  1. Check whether 1m bars exist in Parquet.
+     - If missing, connect to IBKR and fetch them, saving to Parquet.
+  2. Load all 1m BarEvents from Parquet for the date.
+  3. Wire a fresh EventBus + FeatureEngine + MarketStateEngine + SetupEngine.
+  4. Replay every bar event through the pipeline (no speed throttle).
+  5. Extract the resulting SessionSetupContext from the SetupEngine.
+  6. Persist it via SessionContextStore.
+  7. Update the job record so the API can report progress.
+
+The worker is self-contained — it does not touch the live runtime state.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import date, datetime, timezone
+from typing import Any
+
+from alpha.config.settings import AlphaSettings
+from alpha.core.clock import WallClock
+from alpha.core.event_bus import EventBus
+from alpha.core.registry import SymbolRegistry
+from alpha.engines.historical.sources.base import HistoricalDataSource
+from alpha.engines.storage.parquet import ParquetStore
+from alpha.engines.storage.session_context_store import SessionContextStore
+from alpha.models.enums import AssetClass, BarTimeframe
+from alpha.models.symbol import Symbol
+
+logger = logging.getLogger(__name__)
+
+# ─── Known futures tickers (infer asset class without broker call) ────────────
+
+_FUTURES_TICKERS = frozenset({
+    "MNQ", "NQ", "ES", "MES", "RTY", "M2K",
+    "YM", "MYM", "GC", "MGC", "SI", "CL", "QM", "NG",
+})
+
+# ─── Job state ────────────────────────────────────────────────────────────────
+
+class JobStatus:
+    PENDING = "pending"
+    FETCHING_BARS = "fetching_bars"
+    DETECTING_SETUPS = "detecting_setups"
+    DONE = "done"
+    ERROR = "error"
+
+
+def _make_job(symbol: str, d: date) -> dict[str, Any]:
+    return {
+        "job_id": f"{symbol}:{d.isoformat()}",
+        "symbol": symbol,
+        "date": d.isoformat(),
+        "status": JobStatus.PENDING,
+        "bars_fetched": 0,
+        "setups_detected": 0,
+        "error": None,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+    }
+
+
+def job_id(symbol: str, d: date) -> str:
+    return f"{symbol}:{d.isoformat()}"
+
+
+# ─── Symbol inference ─────────────────────────────────────────────────────────
+
+def _infer_symbol(ticker: str) -> Symbol:
+    root = ticker.rstrip("0123456789")
+    asset_class = (
+        AssetClass.FUTURE if root.upper() in _FUTURES_TICKERS else AssetClass.EQUITY
+    )
+    exchange = "CME" if asset_class == AssetClass.FUTURE else "NASDAQ"
+    return Symbol(ticker=ticker.upper(), exchange=exchange, asset_class=asset_class)
+
+
+# ─── Main worker ──────────────────────────────────────────────────────────────
+
+async def run_date_backfill(
+    symbol: str,
+    d: date,
+    settings: AlphaSettings,
+    jobs: dict[str, dict[str, Any]],
+) -> None:
+    """
+    Background task. Updates `jobs[job_id(symbol, d)]` in-place as it runs.
+    Safe to run concurrently for different (symbol, date) pairs.
+    """
+    jid = job_id(symbol, d)
+    job = jobs.get(jid)
+    if job is None:
+        logger.error("Job %s not found in registry", jid)
+        return
+
+    data_root = settings.storage.parquet_root.parent
+    parquet = ParquetStore(settings.storage)
+    context_store = SessionContextStore(data_root)
+
+    try:
+        # ── Step 1: ensure 1m bars are in Parquet ────────────────────────────
+        has_bars = parquet.exists(f"bars/{BarTimeframe.M1}", symbol.upper(), d)
+
+        if not has_bars:
+            job["status"] = JobStatus.FETCHING_BARS
+            logger.info("[backfill] Fetching 1m bars for %s %s", symbol, d)
+            bars_count = await _fetch_bars_from_best_source(symbol, d, settings, parquet)
+            job["bars_fetched"] = bars_count
+            if bars_count == 0:
+                raise RuntimeError(
+                    f"No bars found for {symbol} on {d}. "
+                    "Provide a JSON file in data/imports/{symbol}/{date}.json "
+                    "or ensure IBKR (TWS/Gateway) is running."
+                )
+        else:
+            # Count existing bars
+            table = parquet.read(f"bars/{BarTimeframe.M1}", symbol.upper(), d)
+            job["bars_fetched"] = len(table) if table is not None else 0
+            logger.info(
+                "[backfill] 1m bars already exist for %s %s (%d bars)",
+                symbol, d, job["bars_fetched"],
+            )
+
+        # ── Step 2: replay through feature+setup pipeline ────────────────────
+        job["status"] = JobStatus.DETECTING_SETUPS
+        logger.info("[backfill] Running setup detection replay for %s %s", symbol, d)
+        context = await _replay_setup_detection(symbol, d, settings, parquet)
+
+        if context is not None:
+            context_store.save(symbol.upper(), d, context)
+            job["setups_detected"] = len(context.setups)
+            logger.info(
+                "[backfill] Done: %s %s — %d setups detected",
+                symbol, d, len(context.setups),
+            )
+        else:
+            logger.warning("[backfill] Replay produced no session context for %s %s", symbol, d)
+
+        job["status"] = JobStatus.DONE
+
+    except Exception as exc:
+        logger.exception("[backfill] Failed for %s %s: %s", symbol, d, exc)
+        job["status"] = JobStatus.ERROR
+        job["error"] = str(exc)
+
+    finally:
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+# ─── Bar fetch: JSON first, IBKR fallback ────────────────────────────────────
+
+async def _fetch_bars_from_best_source(
+    symbol: str,
+    d: date,
+    settings: AlphaSettings,
+    parquet: ParquetStore,
+) -> int:
+    """
+    Fetch 1m bars for symbol+date and write them to Parquet.
+
+    Priority:
+      1. JSON import file  → data/imports/{SYMBOL}/{YYYY-MM-DD}.json
+      2. IBKR              → requires live TWS/Gateway connection
+
+    Returns the number of bars written (0 if nothing was found).
+    """
+    from alpha.engines.historical.sources.json_file import JSONFileHistoricalSource
+
+    data_root = settings.storage.parquet_root.parent
+    imports_dir = data_root / "imports"
+    json_source = JSONFileHistoricalSource(imports_dir)
+
+    if json_source.has_date(symbol, d):
+        logger.info("[backfill] Using JSON import file for %s %s", symbol, d)
+        return await _drain_source_to_parquet(json_source, symbol, d, parquet)
+
+    # No local file — try IBKR
+    logger.info("[backfill] No JSON file found, trying IBKR for %s %s", symbol, d)
+    return await _fetch_bars_from_ibkr(symbol, d, settings, parquet)
+
+
+async def _drain_source_to_parquet(
+    source: "HistoricalDataSource",
+    symbol: str,
+    d: date,
+    parquet: ParquetStore,
+) -> int:
+    """Stream BarEvents from any source and write them all to Parquet."""
+    import pyarrow as pa
+
+    start_dt = datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc)
+    end_dt = datetime.combine(d, datetime.max.time().replace(microsecond=0), tzinfo=timezone.utc)
+
+    count = 0
+    rows: list[dict] = []
+
+    async for event in source.fetch_bars(symbol, BarTimeframe.M1, start_dt, end_dt):
+        rows.append({
+            "event_id": str(event.metadata.event_id),
+            "event_type": str(event.event_type),
+            "symbol": event.symbol,
+            "timestamp": event.timestamp.isoformat(),
+            "source": str(event.metadata.source),
+            "received_at": event.metadata.received_at.isoformat(),
+            "is_replay": True,
+            "sequence_num": event.metadata.sequence_num,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "timeframe": str(event.timeframe),
+            "open": str(event.open),
+            "high": str(event.high),
+            "low": str(event.low),
+            "close": str(event.close),
+            "volume": event.volume,
+            "vwap": str(event.vwap) if event.vwap is not None else None,
+            "trade_count": event.trade_count,
+            "is_partial": event.is_partial,
+        })
+        count += 1
+
+    if rows:
+        table = pa.Table.from_pylist(rows)
+        parquet.write(table, f"bars/{BarTimeframe.M1}", symbol.upper(), d)
+        logger.info("[backfill] Wrote %d bars to Parquet for %s %s", count, symbol, d)
+
+    return count
+
+
+async def _fetch_bars_from_ibkr(
+    symbol: str,
+    d: date,
+    settings: AlphaSettings,
+    parquet: ParquetStore,
+) -> int:
+    """Connect to IBKR, fetch 1m bars for symbol+date, write to Parquet."""
+    from alpha.engines.historical.sources.ibkr import IBKRHistoricalDataSource
+    from alpha.engines.ibkr.connection import IBKRConnection
+
+    sym = _infer_symbol(symbol)
+    registry = SymbolRegistry()
+    registry.register(sym)
+
+    conn = IBKRConnection(settings.ibkr)
+    source = IBKRHistoricalDataSource(conn, registry, settings.ibkr)
+
+    try:
+        return await _drain_source_to_parquet(source, symbol, d, parquet)
+    finally:
+        await conn.disconnect()
+
+
+# ─── Setup detection replay ───────────────────────────────────────────────────
+
+async def _replay_setup_detection(
+    symbol: str,
+    d: date,
+    settings: AlphaSettings,
+    parquet: ParquetStore,
+) -> "SessionSetupContext | None":
+    """
+    Load stored 1m bars for symbol+date and replay them through a fresh
+    FeatureEngine → MarketStateEngine → SetupEngine pipeline.
+
+    Returns the resulting SessionSetupContext, or None if the pipeline
+    produced no session context (e.g. no bars in session).
+    """
+    from alpha.calendar.resolver import calendar_for_symbol
+    from alpha.engines.feature.engine import FeatureEngine
+    from alpha.engines.market_state.engine import MarketStateEngine
+    from alpha.engines.setup.engine import SetupEngine
+    from alpha.engines.storage.engine import StorageEngine
+
+    sym = _infer_symbol(symbol)
+    registry = SymbolRegistry()
+    registry.register(sym)
+
+    calendar = calendar_for_symbol(sym)
+    clock = WallClock()
+    bus = EventBus()
+
+    feature_engine = FeatureEngine(settings, bus, registry, calendar, clock)
+    market_state_engine = MarketStateEngine(settings, bus, registry)
+    setup_engine = SetupEngine(settings, bus, registry)
+
+    market_state_engine.set_feature_engine(feature_engine)
+    setup_engine.set_feature_engine(feature_engine)
+    setup_engine.set_market_state_engine(market_state_engine)
+
+    await feature_engine.initialize()
+    await market_state_engine.initialize()
+    await setup_engine.initialize()
+
+    await feature_engine.start()
+    await market_state_engine.start()
+    await setup_engine.start()
+
+    # Load BarEvents from Parquet and publish them in chronological order.
+    # Use StorageEngine.load_bar_events for typed deserialization.
+    storage = StorageEngine(settings, bus)
+    bar_events = await storage.load_bar_events(symbol.upper(), BarTimeframe.M1, d, d)
+    bar_events.sort(key=lambda e: e.timestamp)
+
+    for event in bar_events:
+        await bus.publish(event)
+        # Yield control briefly so subscribed handlers can process
+        await asyncio.sleep(0)
+
+    await setup_engine.stop()
+    await market_state_engine.stop()
+    await feature_engine.stop()
+
+    return setup_engine.session_setup_context(symbol.upper())

@@ -27,6 +27,7 @@ class DataSourceId(StrEnum):
     INTERACTIVE_BROKERS = "interactive_brokers"
     TASTYTRADE = "tastytrade"
     CSV = "csv"
+    JSON_FILE = "json_file"
     PARQUET = "parquet"
     SYNTHETIC = "synthetic"
     UNKNOWN = "unknown"

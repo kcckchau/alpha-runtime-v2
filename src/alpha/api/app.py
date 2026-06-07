@@ -15,6 +15,9 @@ logger = structlog.get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("API starting")
+    # In-memory job registry for backfill background tasks.
+    # Keyed by "{SYMBOL}:{YYYY-MM-DD}". Lives for the process lifetime only.
+    app.state.backfill_jobs: dict = {}  # type: ignore[assignment]
     yield
     logger.info("API shutting down")
 
