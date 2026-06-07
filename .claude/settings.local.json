@@ -10,7 +10,8 @@
       "Bash(node_modules/.bin/tsc --noEmit)",
       "Bash(docker compose:*)",
       "Bash(git add:*)",
-      "Bash(git commit -m ':*)"
+      "Bash(git commit -m ':*)",
+      "Bash(docker start alpha_db:*)"
     ]
   }
 }

@@ -45,6 +45,8 @@ type CandlesChartProps = {
   emas?: EmaConfig[];
   markers?: SeriesMarker<Time>[];
   viewportKey?: string;
+  onMarkerClick?: (setupId: string) => void;
+  focusTime?: Time;
 };
 
 // ─── ET timezone helpers ──────────────────────────────────────────────────────
@@ -257,9 +259,14 @@ export function CandlesChart({
   emas = [],
   markers = [],
   viewportKey,
+  onMarkerClick,
+  focusTime,
 }: CandlesChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
+  // Stable refs so subscribeClick closure doesn't go stale
+  const markersRef = useRef<SeriesMarker<Time>[]>(markers);
+  const onMarkerClickRef = useRef<((setupId: string) => void) | undefined>(onMarkerClick);
   const candleRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const vwapRef = useRef<ISeriesApi<"Line"> | null>(null);
   const emaSeriesRef = useRef<Map<number, ISeriesApi<"Line">>>(new Map());
@@ -332,6 +339,12 @@ export function CandlesChart({
     candleRef.current = candle;
     vwapRef.current = vwap;
     markerApiRef.current = markerApi;
+
+    chart.subscribeClick((param) => {
+      if (!param.time || !onMarkerClickRef.current) return;
+      const matched = markersRef.current.find((m) => m.time === param.time && m.id);
+      if (matched?.id) onMarkerClickRef.current(matched.id as string);
+    });
 
     return () => {
       chart.remove();
@@ -470,7 +483,26 @@ export function CandlesChart({
       });
     }
     markerApiRef.current?.setMarkers(markers);
+    markersRef.current = markers;
   }, [overlays, markers]);
+
+  // Keep callback ref in sync
+  useEffect(() => {
+    onMarkerClickRef.current = onMarkerClick;
+  }, [onMarkerClick]);
+
+  // Scroll chart to focusTime, preserving current zoom level
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || focusTime === undefined) return;
+    const range = chart.timeScale().getVisibleRange();
+    if (!range) return;
+    const half = ((range.to as number) - (range.from as number)) / 2;
+    chart.timeScale().setVisibleRange({
+      from: ((focusTime as number) - half) as Time,
+      to: ((focusTime as number) + half) as Time,
+    });
+  }, [focusTime]);
 
   return <div ref={containerRef} style={{ height: 420, width: "100%" }} />;
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { LineStyle, SeriesMarker, Time } from "lightweight-charts";
 import { CandlesChart, EmaConfig } from "@/components/candles-chart";
 
@@ -357,6 +357,11 @@ function regimeColor(regime: string | null | undefined): string {
   return "rgba(255,255,255,0.88)";
 }
 
+const SHORT_SETUP_TYPES = new Set(["vwap_rejection", "orb_breakdown"]);
+function setupTypeColor(setupType: string): string {
+  return SHORT_SETUP_TYPES.has(setupType.toLowerCase()) ? "#ef4444" : "#22c55e";
+}
+
 function levelColor(levelTag: string): string {
   if (levelTag === "hod") return "#60a5fa";
   if (levelTag === "vwap") return "#fbbf24";
@@ -467,7 +472,7 @@ function SetupItem({ setup, past }: { setup: SetupRow; past?: boolean }) {
       }}
     >
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
-        <span style={{ ...S.mono, fontSize: 10, fontWeight: 500 }}>
+        <span style={{ ...S.mono, fontSize: 10, fontWeight: 500, color: setupTypeColor(setup.setup_type) }}>
           {setup.setup_type.toUpperCase()}
         </span>
         {setup.grade && (
@@ -684,11 +689,24 @@ function computeRR(entry: SetupHistoryEntry): number | null {
 function SetupHistoryPanel({
   context,
   selectedDate,
+  selectedSetupId,
+  onSelectSetup,
+  flashSetupId,
 }: {
   context: SetupSessionContext | null;
   selectedDate: string | null;
+  selectedSetupId?: string | null;
+  onSelectSetup?: (id: string) => void;
+  flashSetupId?: string | null;
 }) {
   const [expanded, setExpanded] = React.useState<string | null>(null);
+  const itemRefs = React.useRef<Map<string, HTMLDivElement>>(new Map());
+
+  React.useEffect(() => {
+    if (!selectedSetupId) return;
+    const el = itemRefs.current.get(selectedSetupId);
+    el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [selectedSetupId]);
 
   const sorted = [...(context?.setups ?? [])].sort(
     (a, b) => new Date(b.detected_at).getTime() - new Date(a.detected_at).getTime()
@@ -740,26 +758,45 @@ function SetupHistoryPanel({
         ) : (
           sorted.map((entry) => {
             const isOpen = expanded === entry.setup_id;
+            const isSelected = selectedSetupId === entry.setup_id;
+            const isFlashing = flashSetupId === entry.setup_id;
             const rules = SETUP_RULES[entry.setup_type.toLowerCase()];
             const rr = computeRR(entry);
             const entryColor = entry.side === "buy" ? "#22c55e" : "#ef4444";
 
             return (
-              <div key={entry.setup_id} style={{ marginBottom: 4 }}>
+              <div
+                key={entry.setup_id}
+                style={{ marginBottom: 4 }}
+                ref={(el) => {
+                  if (el) itemRefs.current.set(entry.setup_id, el);
+                  else itemRefs.current.delete(entry.setup_id);
+                }}
+              >
                 <div
                   style={{
-                    borderLeft: `2px solid ${levelColor(entry.level_tag)}`,
+                    borderLeft: `2px solid ${isSelected || isFlashing ? entryColor : levelColor(entry.level_tag)}`,
                     padding: "6px 9px",
                     borderRadius: "0 4px 4px 0",
-                    background: isOpen ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.02)",
+                    background: isFlashing
+                      ? `${entryColor}28`
+                      : isSelected
+                      ? `${entryColor}14`
+                      : isOpen
+                      ? "rgba(255,255,255,0.05)"
+                      : "rgba(255,255,255,0.02)",
                     cursor: "pointer",
                     userSelect: "none",
+                    transition: "background 0.3s ease, border-color 0.3s ease",
                   }}
-                  onClick={() => setExpanded(isOpen ? null : entry.setup_id)}
+                  onClick={() => {
+                    setExpanded(isOpen ? null : entry.setup_id);
+                    onSelectSetup?.(entry.setup_id);
+                  }}
                 >
                   {/* Top row: type + state */}
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
-                    <span style={{ ...S.mono, fontSize: 10, fontWeight: 500 }}>
+                    <span style={{ ...S.mono, fontSize: 10, fontWeight: 500, color: entry.side === "buy" ? "#22c55e" : "#ef4444" }}>
                       {entry.setup_type.replaceAll("_", " ").toUpperCase()}
                     </span>
                     <span
@@ -1101,6 +1138,15 @@ export function Dashboard() {
   const [availableDates, setAvailableDates] = useState<AvailableDates | null>(null);
   // Incremented after a backfill completes to force a data reload
   const [refreshKey, setRefreshKey] = useState(0);
+  const [selectedSetupId, setSelectedSetupId] = useState<string | null>(null);
+  // Replay mode — only active in historical (selectedDate !== null)
+  const [replayMode, setReplayMode] = useState(false);
+  const [replayIndex, setReplayIndex] = useState(0);   // 0 = empty, bars.length = full
+  const [replayPlaying, setReplayPlaying] = useState(false);
+  const [replaySpeed, setReplaySpeed] = useState(5);   // bars per second
+  const [replayEpoch, setReplayEpoch] = useState(0);   // incremented to trigger chart fitContent
+  const flashRef = useRef<Set<string>>(new Set());
+  const [flashSetupId, setFlashSetupId] = useState<string | null>(null);
 
   // ET clock — ticks every second
   useEffect(() => {
@@ -1352,6 +1398,37 @@ export function Dashboard() {
     }
   }
 
+  // Exit replay when switching to live or changing date
+  useEffect(() => {
+    if (selectedDate === null) {
+      setReplayMode(false);
+      setReplayPlaying(false);
+    }
+  }, [selectedDate]);
+
+  // Reset position when entering replay or data reloads
+  useEffect(() => {
+    if (replayMode) {
+      setReplayIndex(0);
+      setReplayPlaying(false);
+      flashRef.current.clear();
+      setReplayEpoch((e) => e + 1);
+    }
+  }, [replayMode]);
+
+  // Replay timer
+  useEffect(() => {
+    if (!replayPlaying || !replayMode) return;
+    const ms = Math.round(1000 / replaySpeed);
+    const id = setInterval(() => {
+      setReplayIndex((prev) => {
+        if (prev >= bars.length) { setReplayPlaying(false); return prev; }
+        return prev + 1;
+      });
+    }, ms);
+    return () => clearInterval(id);
+  }, [replayPlaying, replayMode, replaySpeed, bars.length]);
+
   const currentContext = contexts[selectedSymbol] ?? null;
   const currentQuote = quotes[selectedSymbol] ?? null;
   const _rawSetupContext = setupContexts[selectedSymbol] ?? null;
@@ -1361,10 +1438,35 @@ export function Dashboard() {
   const currentSetupContext =
     (_rawSetupContext?.setups?.length ?? 0) > 0 ? _rawSetupContext : (_prevSetupContext ?? _rawSetupContext);
 
+  // ── Replay derived data ──────────────────────────────────────────────────────
+  const displayBars = replayMode ? bars.slice(0, replayIndex) : bars;
+  const replayBarTime = replayMode && replayIndex > 0 ? bars[replayIndex - 1]?.timestamp : null;
+
+  const replaySetupContext = useMemo(() => {
+    if (!replayMode || !replayBarTime || !currentSetupContext) return currentSetupContext;
+    const filtered = currentSetupContext.setups.filter((s) => s.detected_at <= replayBarTime);
+    return { ...currentSetupContext, setups: filtered };
+  }, [replayMode, replayBarTime, currentSetupContext]);
+
+  const activeSetupCtx = replayMode ? replaySetupContext : currentSetupContext;
+
+  // Flash animation when a new setup appears during replay
+  useEffect(() => {
+    if (!replayMode || !replaySetupContext) return;
+    const ids = new Set(replaySetupContext.setups.map((s) => s.setup_id));
+    for (const id of ids) {
+      if (!flashRef.current.has(id)) {
+        flashRef.current.add(id);
+        setFlashSetupId(id);
+        setTimeout(() => setFlashSetupId((cur) => (cur === id ? null : cur)), 1800);
+      }
+    }
+  }, [replayMode, replaySetupContext]);
+
   // Price / change
   // Preference order: last trade price (tick-level) → bar close (few-second partial bar) → stale
-  const lastBar = bars[bars.length - 1];
-  const prevBar = bars[bars.length - 2];
+  const lastBar = displayBars[displayBars.length - 1];
+  const prevBar = displayBars[displayBars.length - 2];
   const lastTradePrice =
     currentQuote?.last_price != null ? Number(currentQuote.last_price) : null;
   const lastPrice = lastTradePrice ?? (lastBar ? Number(lastBar.close) : null);
@@ -1435,15 +1537,29 @@ export function Dashboard() {
   }, [currentContext, setups, currentSetupContext]);
 
   const historyMarkers = useMemo((): SeriesMarker<Time>[] => {
-    return (currentSetupContext?.setups ?? [])
+    return (activeSetupCtx?.setups ?? [])
       .filter((entry) => !!entry.detected_at && ["triggered", "failed", "invalidated"].includes(entry.state))
-      .map((entry) => ({
-        time: toETChartTime(entry.detected_at),
-        position: setupMarkerPosition(entry),
-        color: levelColor(entry.level_tag),
-        shape: setupMarkerShape(entry),
-      }));
-  }, [currentSetupContext]);
+      .map((entry) => {
+        const isSelected = entry.setup_id === selectedSetupId;
+        const sideColor = entry.side === "buy" ? "#22c55e" : "#ef4444";
+        return {
+          id: entry.setup_id,
+          time: toETChartTime(entry.detected_at),
+          position: setupMarkerPosition(entry),
+          color: isSelected ? "#ffffff" : sideColor,
+          shape: setupMarkerShape(entry),
+          size: isSelected ? 2 : 1,
+          borderColor: isSelected ? sideColor : undefined,
+          borderWidth: isSelected ? 2 : undefined,
+        };
+      });
+  }, [activeSetupCtx, selectedSetupId]);
+
+  const focusTime = useMemo((): Time | undefined => {
+    if (!selectedSetupId) return undefined;
+    const entry = activeSetupCtx?.setups.find((e) => e.setup_id === selectedSetupId);
+    return entry ? toETChartTime(entry.detected_at) : undefined;
+  }, [selectedSetupId, activeSetupCtx]);
 
   // EMA indicator configs — computed from bar data as line series in the chart
   const emas = useMemo((): EmaConfig[] => {
@@ -1541,22 +1657,36 @@ export function Dashboard() {
             }}
           />
           {selectedDate !== null && (
-            <button
-              onClick={() => {
-                setSelectedDate(null);
-                setBackfillJob(null);
-                setBars([]);
-              }}
-              style={{
-                ...S.mono, fontSize: 10, fontWeight: 500,
-                padding: "3px 8px", borderRadius: 4, cursor: "pointer",
-                border: "0.5px solid rgba(255,255,255,0.12)",
-                background: "rgba(255,255,255,0.06)",
-                color: "rgba(255,255,255,0.6)",
-              }}
-            >
-              Live ▸
-            </button>
+            <>
+              <button
+                onClick={() => setReplayMode((m) => !m)}
+                style={{
+                  ...S.mono, fontSize: 10, fontWeight: 500,
+                  padding: "3px 8px", borderRadius: 4, cursor: "pointer",
+                  border: `0.5px solid ${replayMode ? "rgba(96,165,250,0.5)" : "rgba(255,255,255,0.12)"}`,
+                  background: replayMode ? "rgba(96,165,250,0.15)" : "rgba(255,255,255,0.06)",
+                  color: replayMode ? "#60a5fa" : "rgba(255,255,255,0.6)",
+                }}
+              >
+                {replayMode ? "▶ Replay" : "▶ Replay"}
+              </button>
+              <button
+                onClick={() => {
+                  setSelectedDate(null);
+                  setBackfillJob(null);
+                  setBars([]);
+                }}
+                style={{
+                  ...S.mono, fontSize: 10, fontWeight: 500,
+                  padding: "3px 8px", borderRadius: 4, cursor: "pointer",
+                  border: "0.5px solid rgba(255,255,255,0.12)",
+                  background: "rgba(255,255,255,0.06)",
+                  color: "rgba(255,255,255,0.6)",
+                }}
+              >
+                Live ▸
+              </button>
+            </>
           )}
 
           {selectedDate === null && <Pill color="green">{activeSetupCount} setups</Pill>}
@@ -1748,13 +1878,65 @@ export function Dashboard() {
             </div>
           </div>
 
+          {/* Replay controls */}
+          {replayMode && (
+            <div
+              style={{
+                display: "flex", alignItems: "center", gap: 8,
+                padding: "6px 12px",
+                borderBottom: "0.5px solid rgba(255,255,255,0.06)",
+                background: "rgba(96,165,250,0.04)",
+              }}
+            >
+              <button
+                onClick={() => setReplayIndex((i) => Math.max(0, i - 1))}
+                style={{ ...S.mono, fontSize: 11, padding: "2px 7px", borderRadius: 4, cursor: "pointer", border: "0.5px solid rgba(255,255,255,0.12)", background: "rgba(255,255,255,0.05)", color: "rgba(255,255,255,0.6)" }}
+              >◀</button>
+              <button
+                onClick={() => setReplayPlaying((p) => !p)}
+                style={{ ...S.mono, fontSize: 11, padding: "2px 10px", borderRadius: 4, cursor: "pointer", border: "0.5px solid rgba(96,165,250,0.4)", background: "rgba(96,165,250,0.12)", color: "#60a5fa", fontWeight: 600 }}
+              >{replayPlaying ? "⏸" : "▶"}</button>
+              <button
+                onClick={() => setReplayIndex((i) => Math.min(bars.length, i + 1))}
+                style={{ ...S.mono, fontSize: 11, padding: "2px 7px", borderRadius: 4, cursor: "pointer", border: "0.5px solid rgba(255,255,255,0.12)", background: "rgba(255,255,255,0.05)", color: "rgba(255,255,255,0.6)" }}
+              >▶</button>
+              <div style={{ width: 0.5, height: 12, background: "rgba(255,255,255,0.1)" }} />
+              {([1, 5, 15, 30] as const).map((spd) => (
+                <button
+                  key={spd}
+                  onClick={() => setReplaySpeed(spd)}
+                  style={{ ...S.mono, fontSize: 10, padding: "2px 6px", borderRadius: 4, cursor: "pointer", border: `0.5px solid ${replaySpeed === spd ? "rgba(96,165,250,0.5)" : "rgba(255,255,255,0.08)"}`, background: replaySpeed === spd ? "rgba(96,165,250,0.15)" : "transparent", color: replaySpeed === spd ? "#60a5fa" : "rgba(255,255,255,0.4)" }}
+                >{spd}x</button>
+              ))}
+              <div style={{ flex: 1, height: 3, background: "rgba(255,255,255,0.08)", borderRadius: 2, cursor: "pointer", position: "relative" }}
+                onClick={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const pct = (e.clientX - rect.left) / rect.width;
+                  setReplayIndex(Math.round(pct * bars.length));
+                  setReplayPlaying(false);
+                }}
+              >
+                <div style={{ height: "100%", width: `${bars.length > 0 ? (replayIndex / bars.length) * 100 : 0}%`, background: "#60a5fa", borderRadius: 2 }} />
+              </div>
+              <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.4)", whiteSpace: "nowrap" }}>
+                {replayIndex}/{bars.length}
+              </span>
+              <button
+                onClick={() => { setReplayMode(false); setReplayPlaying(false); }}
+                style={{ ...S.mono, fontSize: 10, padding: "2px 7px", borderRadius: 4, cursor: "pointer", border: "0.5px solid rgba(255,255,255,0.12)", background: "rgba(255,255,255,0.04)", color: "rgba(255,255,255,0.35)" }}
+              >✕</button>
+            </div>
+          )}
+
           {/* Candlestick chart */}
           <CandlesChart
-            bars={bars}
+            bars={displayBars}
             overlays={overlayLines}
             emas={emas}
             markers={historyMarkers}
-            viewportKey={`${selectedSymbol}:${selectedTimeframe}`}
+            viewportKey={replayMode ? `${selectedSymbol}:${selectedTimeframe}:replay:${replayEpoch}` : `${selectedSymbol}:${selectedTimeframe}`}
+            onMarkerClick={setSelectedSetupId}
+            focusTime={focusTime}
           />
 
           {/* Quote bar */}
@@ -1783,7 +1965,13 @@ export function Dashboard() {
 
         {/* Sidebar */}
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <SetupHistoryPanel context={currentSetupContext} selectedDate={selectedDate} />
+          <SetupHistoryPanel
+            context={activeSetupCtx}
+            selectedDate={selectedDate}
+            selectedSetupId={selectedSetupId}
+            onSelectSetup={setSelectedSetupId}
+            flashSetupId={flashSetupId}
+          />
           <SetupsPanel setups={setups} />
           <FeaturesPanel context={currentContext} isHistorical={!!selectedDate} />
           <MarketStatePanel context={currentContext} isHistorical={!!selectedDate} />
