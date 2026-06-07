@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter
@@ -32,12 +32,22 @@ class RuntimeStatusResponse(BaseModel):
     runtime_available: bool = False
 
 
+_SNAPSHOT_STALE_SECONDS = 60
+
+
 def _snapshot_or_default() -> dict[str, Any]:
     settings = get_settings()
     snapshot = read_snapshot(settings)
     if snapshot is not None:
-        snapshot["runtime_available"] = True
-        return snapshot
+        updated_at = snapshot.get("updated_at")
+        if updated_at:
+            try:
+                age = datetime.now(timezone.utc) - datetime.fromisoformat(updated_at)
+                if age.total_seconds() <= _SNAPSHOT_STALE_SECONDS:
+                    snapshot["runtime_available"] = True
+                    return snapshot
+            except ValueError:
+                pass
     return {
         "mode": str(settings.runtime.mode),
         "symbols": settings.runtime.symbols,
@@ -51,6 +61,7 @@ def _snapshot_or_default() -> dict[str, Any]:
         "market_states": {},
         "setups": [],
         "setup_contexts": {},
+        "prev_setup_contexts": {},
         "orders": [],
     }
 
@@ -148,6 +159,15 @@ async def list_active_setups(symbol: str | None = None) -> list[dict]:  # type: 
 async def list_setup_contexts(symbol: str | None = None) -> dict[str, Any]:
     snapshot = _snapshot_or_default()
     contexts = snapshot["setup_contexts"]
+    if symbol is None:
+        return contexts
+    return {symbol: contexts.get(symbol)}
+
+
+@router.get("/prev-setup-contexts")
+async def list_prev_setup_contexts(symbol: str | None = None) -> dict[str, Any]:
+    snapshot = _snapshot_or_default()
+    contexts = snapshot["prev_setup_contexts"]
     if symbol is None:
         return contexts
     return {symbol: contexts.get(symbol)}

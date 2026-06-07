@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install dev lint format type-check test test-unit test-cov \
+.PHONY: help install setup dev lint format type-check test test-unit test-cov \
         docker-up docker-down docker-logs migrate clean
 
 help:
@@ -9,9 +9,16 @@ help:
 install: ## Install project
 	pip install -e .
 
-dev: ## Install with dev deps
+setup: ## Install with dev deps and copy .env
 	pip install -e ".[dev]"
 	cp -n .env.example .env || true
+
+dev: ## Start DB, runtime API, and web dashboard (Ctrl-C stops all)
+	docker compose up -d
+	@ALPHA_PID=""; \
+	alpha run & ALPHA_PID=$$!; \
+	trap "kill $$ALPHA_PID 2>/dev/null; docker compose down" EXIT INT TERM; \
+	cd web && pnpm dev
 
 lint: ## Run ruff linter
 	ruff check src/ tests/
@@ -43,7 +50,8 @@ docker-down: ## Stop all Docker services
 docker-logs: ## Tail Docker logs
 	docker compose logs -f
 
-migrate: ## Run DB migrations
+migrate: ## Run DB migrations (requires alembic.ini)
+	@test -f alembic.ini || { echo "No alembic.ini found — schema is managed by Docker init SQL"; exit 0; }
 	alembic upgrade head
 
 clean: ## Remove build artifacts

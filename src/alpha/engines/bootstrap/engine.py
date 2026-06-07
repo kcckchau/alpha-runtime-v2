@@ -570,6 +570,7 @@ class BootstrapEngine(BaseEngine):
             "market_states": self._serialize_market_states(),
             "setups": self._serialize_setups(),
             "setup_contexts": self._serialize_setup_contexts(),
+            "prev_setup_contexts": self._serialize_prev_setup_contexts(),
             "orders": self._serialize_orders(),
         }
 
@@ -680,6 +681,16 @@ class BootstrapEngine(BaseEngine):
         contexts: dict[str, Any] = {}
         for symbol in self._settings.runtime.symbols:
             context = self._setup.session_setup_context(symbol)
+            if context is not None:
+                contexts[symbol] = context.model_dump(mode="json")
+        return contexts
+
+    def _serialize_prev_setup_contexts(self) -> dict[str, Any]:
+        if self._setup is None:
+            return {}
+        contexts: dict[str, Any] = {}
+        for symbol in self._settings.runtime.symbols:
+            context = self._setup.prev_session_setup_context(symbol)
             if context is not None:
                 contexts[symbol] = context.model_dump(mode="json")
         return contexts

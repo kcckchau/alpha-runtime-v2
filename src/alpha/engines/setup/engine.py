@@ -90,6 +90,7 @@ class SetupEngine(BaseEngine):
         # Active setups: symbol → {setup_id → Setup}
         self._active: dict[str, dict[UUID, Setup]] = {}
         self._session_contexts: dict[str, SessionSetupContext] = {}
+        self._prev_session_contexts: dict[str, SessionSetupContext] = {}
         self._session_keys: dict[str, str] = {}
         self._symbol_calendars: dict[str, SessionCalendar] = {}
         # Bars-in-forming counter for invalidation timers
@@ -140,6 +141,9 @@ class SetupEngine(BaseEngine):
 
     def session_setup_context(self, symbol: str) -> SessionSetupContext | None:
         return self._session_contexts.get(symbol)
+
+    def prev_session_setup_context(self, symbol: str) -> SessionSetupContext | None:
+        return self._prev_session_contexts.get(symbol)
 
     # ── Handler ───────────────────────────────────────────────────────────────
 
@@ -800,6 +804,10 @@ class SetupEngine(BaseEngine):
         self._active[symbol] = {}
         for setup_id in stale_ids:
             self._forming_bars.pop(setup_id, None)
+
+        old_context = self._session_contexts.get(symbol)
+        if old_context is not None:
+            self._prev_session_contexts[symbol] = old_context
 
         session_date = calendar.session_date(timestamp)
         self._session_contexts[symbol] = SessionSetupContext(

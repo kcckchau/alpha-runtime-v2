@@ -23,6 +23,7 @@ def _symbol_payload(snapshot: dict[str, Any], symbol: str) -> dict[str, Any]:
         "bar": snapshot.get("bars", {}).get(symbol),
         "context": snapshot.get("contexts", {}).get(symbol),
         "setup_context": snapshot.get("setup_contexts", {}).get(symbol),
+        "prev_setup_context": snapshot.get("prev_setup_contexts", {}).get(symbol),
         "setups": [
             setup for setup in snapshot.get("setups", []) if setup.get("symbol") == symbol
         ],

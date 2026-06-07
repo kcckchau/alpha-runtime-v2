@@ -317,6 +317,7 @@ type RuntimeWsMessage = {
   bar: BarHistoryRow | null;
   context: SymbolContext | null;
   setup_context: SetupSessionContext | null;
+  prev_setup_context: SetupSessionContext | null;
   setups: SetupRow[];
 };
 
@@ -780,6 +781,7 @@ export function Dashboard() {
   const [bars, setBars] = useState<BarHistoryRow[]>([]);
   const [setups, setSetups] = useState<SetupRow[]>([]);
   const [setupContexts, setSetupContexts] = useState<Record<string, SetupSessionContext | null>>({});
+  const [prevSetupContexts, setPrevSetupContexts] = useState<Record<string, SetupSessionContext | null>>({});
   const [riskState, setRiskState] = useState<RiskState | null>(null);
   const [clock, setClock] = useState("--:--:-- ET");
   const [error, setError] = useState<string | null>(null);
@@ -808,7 +810,7 @@ export function Dashboard() {
           ? selectedSymbol
           : (statusData.symbols[0] ?? "MNQ");
 
-        const [contextData, quoteData, barData, latestBarData, setupData, setupContextData] = await Promise.all([
+        const [contextData, quoteData, barData, latestBarData, setupData, setupContextData, prevSetupContextData] = await Promise.all([
           fetchJson<Record<string, SymbolContext | null>>(`/runtime/contexts?symbol=${symbol}`),
           fetchJson<Record<string, QuoteRow | null>>(`/runtime/quotes?symbol=${symbol}`),
           fetchJson<BarHistoryRow[]>(
@@ -817,6 +819,7 @@ export function Dashboard() {
           fetchJson<Record<string, BarHistoryRow | null>>(`/runtime/bars?symbol=${symbol}`),
           fetchJson<SetupRow[]>(`/runtime/setups?symbol=${symbol}`),
           fetchJson<Record<string, SetupSessionContext | null>>(`/runtime/setup-contexts?symbol=${symbol}`),
+          fetchJson<Record<string, SetupSessionContext | null>>(`/runtime/prev-setup-contexts?symbol=${symbol}`),
         ]);
 
         // Optional endpoint — silently ignore if not yet implemented
@@ -832,6 +835,7 @@ export function Dashboard() {
         setBars(latestLiveBar ? mergeLiveBar(barData, latestLiveBar, selectedTimeframe) : barData);
         setSetups(setupData);
         setSetupContexts((prev) => ({ ...prev, ...setupContextData }));
+        setPrevSetupContexts((prev) => ({ ...prev, ...prevSetupContextData }));
         setRiskState(riskData);
         setError(null);
       } catch (err) {
@@ -905,6 +909,9 @@ export function Dashboard() {
         if (payload.setup_context) {
           setSetupContexts((prev) => ({ ...prev, [selectedSymbol]: payload.setup_context }));
         }
+        if (payload.prev_setup_context) {
+          setPrevSetupContexts((prev) => ({ ...prev, [selectedSymbol]: payload.prev_setup_context }));
+        }
         if (payload.setups) {
           setSetups(payload.setups);
         }
@@ -929,7 +936,12 @@ export function Dashboard() {
 
   const currentContext = contexts[selectedSymbol] ?? null;
   const currentQuote = quotes[selectedSymbol] ?? null;
-  const currentSetupContext = setupContexts[selectedSymbol] ?? null;
+  const _rawSetupContext = setupContexts[selectedSymbol] ?? null;
+  const _prevSetupContext = prevSetupContexts[selectedSymbol] ?? null;
+  // Fall back to previous session's history when the current session has no setups yet
+  // (e.g. after 6 PM ET when CME session rolls but today's setups should remain visible)
+  const currentSetupContext =
+    (_rawSetupContext?.setups?.length ?? 0) > 0 ? _rawSetupContext : (_prevSetupContext ?? _rawSetupContext);
 
   // Price / change
   // Preference order: last trade price (tick-level) → bar close (few-second partial bar) → stale
@@ -999,29 +1011,19 @@ export function Dashboard() {
       }
     }
 
-    for (const entry of currentSetupContext?.setups ?? []) {
-      if (!entry.entry_trigger) continue;
-      if (setups.some((active) => active.setup_id === entry.setup_id)) continue;
-      overlays.push({
-        label: `${entry.level_tag} ${entry.state}`,
-        price: Number(entry.entry_trigger),
-        color: `${levelColor(entry.level_tag)}cc`,
-        style: LineStyle.Dotted,
-      });
-    }
+    // Historical setup price lines intentionally omitted — too noisy with many setups.
 
     return overlays;
   }, [currentContext, setups, currentSetupContext]);
 
   const historyMarkers = useMemo((): SeriesMarker<Time>[] => {
     return (currentSetupContext?.setups ?? [])
-      .filter((entry) => !!entry.detected_at)
+      .filter((entry) => !!entry.detected_at && ["triggered", "failed", "invalidated"].includes(entry.state))
       .map((entry) => ({
         time: toETChartTime(entry.detected_at),
         position: setupMarkerPosition(entry),
         color: levelColor(entry.level_tag),
         shape: setupMarkerShape(entry),
-        text: `${entry.level_tag.toUpperCase()} ${entry.state.toUpperCase()}`,
       }));
   }, [currentSetupContext]);
 
