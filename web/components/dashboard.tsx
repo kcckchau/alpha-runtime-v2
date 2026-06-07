@@ -916,7 +916,7 @@ function SetupHistoryPanel({
   );
 }
 
-function FeaturesPanel({ context }: { context: SymbolContext | null }) {
+function FeaturesPanel({ context, isHistorical }: { context: SymbolContext | null; isHistorical?: boolean }) {
   const rvol = context?.relative_volume;
   const atr = context?.atr_14;
   const vwapDev = context?.vwap_deviation_pct;
@@ -949,6 +949,9 @@ function FeaturesPanel({ context }: { context: SymbolContext | null }) {
     <div style={S.panel}>
       <div style={S.panelHd}>
         <span style={S.panelLbl}>Features</span>
+        {isHistorical && (
+          <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.3)", fontStyle: "italic" }}>live only</span>
+        )}
       </div>
       <div style={{ padding: 8, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
         {items.map(({ label, value, color }) => (
@@ -962,7 +965,7 @@ function FeaturesPanel({ context }: { context: SymbolContext | null }) {
   );
 }
 
-function MarketStatePanel({ context }: { context: SymbolContext | null }) {
+function MarketStatePanel({ context, isHistorical }: { context: SymbolContext | null; isHistorical?: boolean }) {
   const trend = context?.trend;
   const regime = context?.vwap_regime;
   const orb = context?.orb_state;
@@ -973,6 +976,9 @@ function MarketStatePanel({ context }: { context: SymbolContext | null }) {
     <div style={S.panel}>
       <div style={S.panelHd}>
         <span style={S.panelLbl}>Market State</span>
+        {isHistorical && (
+          <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.3)", fontStyle: "italic" }}>live only</span>
+        )}
       </div>
       <div style={{ padding: "4px 12px 8px" }}>
         <MsRow label="Trend" value={(trend ?? "—").toUpperCase()} valueColor={trendColor(trend)} />
@@ -1779,8 +1785,8 @@ export function Dashboard() {
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           <SetupHistoryPanel context={currentSetupContext} selectedDate={selectedDate} />
           <SetupsPanel setups={setups} />
-          <FeaturesPanel context={currentContext} />
-          <MarketStatePanel context={currentContext} />
+          <FeaturesPanel context={currentContext} isHistorical={!!selectedDate} />
+          <MarketStatePanel context={currentContext} isHistorical={!!selectedDate} />
           <RiskPanel risk={riskState} />
         </div>
       </div>

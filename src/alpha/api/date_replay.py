@@ -259,7 +259,7 @@ async def _fetch_bars_from_ibkr(
 
 # ─── Setup detection replay ───────────────────────────────────────────────────
 
-_WARMUP_DAYS = 2  # trading days of prior M1 bars fed to the feature engine before target date
+_WARMUP_DAYS = 5  # trading days of prior M1 bars fed to the feature engine before target date
 
 
 async def _replay_setup_detection(
