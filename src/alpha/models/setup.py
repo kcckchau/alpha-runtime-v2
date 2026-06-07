@@ -44,13 +44,25 @@ class Setup(BaseModel):
     notes: str = ""
     tags: list[str] = Field(default_factory=list)
 
-    def transition(self, new_state: SetupState, reason: str = "") -> "Setup":
-        """Return a new Setup with updated state. Immutable transition."""
-        updates: dict[str, object] = {"state": new_state, "updated_at": datetime.utcnow()}
+    def transition(
+        self,
+        new_state: SetupState,
+        reason: str = "",
+        bar_time: "datetime | None" = None,
+    ) -> "Setup":
+        """Return a new Setup with updated state. Immutable transition.
+
+        Pass bar_time to use the bar's timestamp instead of wall-clock time.
+        This is required during replay so that setup timestamps reflect the
+        historical bar time rather than the moment the replay runs.
+        """
+        from datetime import timezone
+        t = bar_time if bar_time is not None else datetime.now(timezone.utc)
+        updates: dict[str, object] = {"state": new_state, "updated_at": t}
         if new_state == SetupState.TRIGGERED:
-            updates["triggered_at"] = datetime.utcnow()
+            updates["triggered_at"] = t
         if new_state in {SetupState.FAILED, SetupState.INVALIDATED}:
-            updates["invalidated_at"] = datetime.utcnow()
+            updates["invalidated_at"] = t
             if reason:
                 updates["invalidation_reason"] = reason
         return self.model_copy(update=updates)

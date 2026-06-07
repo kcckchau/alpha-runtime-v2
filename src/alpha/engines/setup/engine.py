@@ -318,7 +318,7 @@ class SetupEngine(BaseEngine):
             )
             # Invalidation: lost VWAP again
             if snap.vwap_cross_down:
-                return setup.transition(SetupState.INVALIDATED, "VWAP lost after reclaim"), ""
+                return setup.transition(SetupState.INVALIDATED, "VWAP lost after reclaim", bar_time=snap.timestamp), ""
             # Confirm: hold above VWAP on next bar + rvol ≥ 1.0 + no lower low
             if snap.is_above_vwap:
                 rvol_ok = snap.relative_volume is None or snap.relative_volume >= 1.0
@@ -332,7 +332,7 @@ class SetupEngine(BaseEngine):
                         if snap.intraday_high is not None and snap.intraday_high > entry
                         else entry + (entry - stop) * Decimal("3")
                     )
-                    confirmed = setup.transition(SetupState.CONFIRMED).model_copy(
+                    confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
                             "entry_trigger": entry,
                             "stop_reference": stop,
@@ -348,11 +348,11 @@ class SetupEngine(BaseEngine):
 
         elif setup.state == SetupState.CONFIRMED:
             if snap.vwap_cross_down:
-                return setup.transition(SetupState.INVALIDATED, "VWAP lost while confirmed"), ""
+                return setup.transition(SetupState.INVALIDATED, "VWAP lost while confirmed", bar_time=snap.timestamp), ""
             if setup.entry_trigger and snap.bar.high >= setup.entry_trigger:
-                return setup.transition(SetupState.TRIGGERED), "triggered"
+                return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"
             if setup.stop_reference and snap.bar.low <= setup.stop_reference:
-                return setup.transition(SetupState.FAILED), "stop hit"
+                return setup.transition(SetupState.FAILED, bar_time=snap.timestamp), "stop hit"
 
         return setup, ""
 
@@ -365,7 +365,7 @@ class SetupEngine(BaseEngine):
             )
             # Invalidation: reclaimed VWAP
             if snap.vwap_cross_up:
-                return setup.transition(SetupState.INVALIDATED, "VWAP reclaimed after rejection"), ""
+                return setup.transition(SetupState.INVALIDATED, "VWAP reclaimed after rejection", bar_time=snap.timestamp), ""
             # Confirm: hold below VWAP on next bar + rvol ≥ 1.0 + no higher high
             if not snap.is_above_vwap:
                 rvol_ok = snap.relative_volume is None or snap.relative_volume >= 1.0
@@ -379,7 +379,7 @@ class SetupEngine(BaseEngine):
                         if snap.intraday_low is not None and snap.intraday_low < entry
                         else entry - (stop - entry) * Decimal("3")
                     )
-                    confirmed = setup.transition(SetupState.CONFIRMED).model_copy(
+                    confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
                             "entry_trigger": entry,
                             "stop_reference": stop,
@@ -395,11 +395,11 @@ class SetupEngine(BaseEngine):
 
         elif setup.state == SetupState.CONFIRMED:
             if snap.vwap_cross_up:
-                return setup.transition(SetupState.INVALIDATED, "VWAP reclaimed while confirmed"), ""
+                return setup.transition(SetupState.INVALIDATED, "VWAP reclaimed while confirmed", bar_time=snap.timestamp), ""
             if setup.entry_trigger and snap.bar.low <= setup.entry_trigger:
-                return setup.transition(SetupState.TRIGGERED), "triggered"
+                return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"
             if setup.stop_reference and snap.bar.high >= setup.stop_reference:
-                return setup.transition(SetupState.FAILED), "stop hit"
+                return setup.transition(SetupState.FAILED, bar_time=snap.timestamp), "stop hit"
 
         return setup, ""
 
@@ -570,14 +570,14 @@ class SetupEngine(BaseEngine):
         market_state: MarketState,
         trigger: BarEvent,
     ) -> None:
-        now = datetime.now(timezone.utc)
+        bar_time = trigger.timestamp
         grade = SetupGrade.SSS if setup_type in _SSS_TYPES else None
         setup = Setup(
             symbol=symbol,
             setup_type=setup_type,
             state=SetupState.FORMING,
-            detected_at=now,
-            updated_at=now,
+            detected_at=bar_time,
+            updated_at=bar_time,
             market_state=market_state,
             bar_snapshot=snapshot,
             grade=grade,
