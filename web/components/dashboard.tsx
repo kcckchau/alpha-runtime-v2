@@ -545,90 +545,373 @@ function SetupsPanel({ setups }: { setups: SetupRow[] }) {
   );
 }
 
-function SetupHistoryPanel({ context }: { context: SetupSessionContext | null }) {
-  const recent = [...(context?.setups ?? [])]
-    .sort((a, b) => new Date(b.detected_at).getTime() - new Date(a.detected_at).getTime())
-    .slice(0, 6);
+// ─── Setup detection rules (mirrors engine logic in readable form) ────────────
+
+type SetupRule = {
+  description: string;
+  forming: string[];
+  confirmation: string[];
+  invalidation: string[];
+};
+
+const SETUP_RULES: Record<string, SetupRule> = {
+  fake_breakdown: {
+    description: "Price dips briefly below VWAP but recovers — shallow wick, not a true breakdown.",
+    forming: [
+      "≥1 bar closed below VWAP",
+      "Bar's low is NOT >0.1% below VWAP (shallow dip only)",
+    ],
+    confirmation: [
+      "VWAP cross up occurs",
+      "RVOL ≥ 1.2 (volume confirmation)",
+      "Close ≥ 50% of the bar's range",
+      "Close > Opening Range midpoint",
+    ],
+    invalidation: [
+      "Price stays below VWAP for >15 bars",
+    ],
+  },
+  hod_breakout: {
+    description: "Price breaks above session high with momentum after ORB is established.",
+    forming: [
+      "ORB (Opening Range Breakout) established",
+      "Intraday high already above ORB high",
+      "Price above VWAP",
+      "Making higher highs (is_higher_high)",
+      "Close within 0.2% of intraday HOD",
+    ],
+    confirmation: [
+      "New HOD printed on next bar",
+      "RVOL ≥ 1.2 (volume confirmation)",
+    ],
+    invalidation: [
+      "Stop hit (bar's low ≤ stop_reference)",
+    ],
+  },
+  trend_pullback: {
+    description: "Price in uptrend pulls back toward VWAP — buy the dip.",
+    forming: [
+      "≥5 consecutive bars above VWAP",
+      "VWAP deviation is shrinking (pullback in progress)",
+      "VWAP deviation between 0% and 0.5% (close to VWAP)",
+    ],
+    confirmation: [
+      "VWAP deviation ≤ 0.25% (very close to VWAP)",
+      "Still above VWAP",
+      "RVOL ≥ 0.8",
+      "No lower low (downtrend not resuming)",
+    ],
+    invalidation: [
+      "VWAP cross down (trend broken)",
+    ],
+  },
+  vwap_reclaim: {
+    description: "Price reclaims VWAP from below with conviction.",
+    forming: [
+      "VWAP cross up (crossed from below)",
+      "≥2 bars were below VWAP before the cross",
+      "Close >0.05% above VWAP (conviction)",
+      "Close in upper half of the bar's range",
+    ],
+    confirmation: [
+      "Hold above VWAP on next bar",
+      "RVOL ≥ 1.0",
+      "No lower low",
+    ],
+    invalidation: [
+      "VWAP cross down after reclaim",
+    ],
+  },
+  vwap_rejection: {
+    description: "Price fails at VWAP from above — rejection with conviction.",
+    forming: [
+      "VWAP cross down (crossed from above)",
+      "≥2 bars were above VWAP before the cross",
+      "Close >0.05% below VWAP (conviction)",
+      "Close in lower half of the bar's range",
+    ],
+    confirmation: [
+      "Hold below VWAP on next bar",
+      "RVOL ≥ 1.0",
+      "No higher high",
+    ],
+    invalidation: [
+      "VWAP cross up after rejection",
+    ],
+  },
+  orb_breakout: {
+    description: "Price breaks above Opening Range high. (Not yet implemented)",
+    forming: [],
+    confirmation: [],
+    invalidation: [],
+  },
+  orb_breakdown: {
+    description: "Price breaks below Opening Range low with momentum.",
+    forming: [
+      "ORB state = BREAKOUT_DOWN (below ORB low)",
+      "Price below VWAP",
+      "New LOD (is_new_lod)",
+    ],
+    confirmation: [
+      "Hold below ORB low on next bar",
+      "RVOL ≥ 1.0",
+    ],
+    invalidation: [
+      "Price reclaims ORB low",
+      "Price reclaims VWAP",
+    ],
+  },
+  sweep_reclaim: {
+    description: "Price sweeps a key level then reclaims it. (Not yet implemented)",
+    forming: [],
+    confirmation: [],
+    invalidation: [],
+  },
+};
+
+function computeRR(entry: SetupHistoryEntry): number | null {
+  if (!entry.entry_trigger || !entry.stop_reference || !entry.target_reference) return null;
+  const e = Number(entry.entry_trigger);
+  const sl = Number(entry.stop_reference);
+  const tp = Number(entry.target_reference);
+  if (!isFinite(e) || !isFinite(sl) || !isFinite(tp)) return null;
+  const risk = Math.abs(e - sl);
+  const reward = Math.abs(tp - e);
+  if (risk === 0) return null;
+  return reward / risk;
+}
+
+function SetupHistoryPanel({
+  context,
+  selectedDate,
+}: {
+  context: SetupSessionContext | null;
+  selectedDate: string | null;
+}) {
+  const [expanded, setExpanded] = React.useState<string | null>(null);
+
+  const sorted = [...(context?.setups ?? [])].sort(
+    (a, b) => new Date(b.detected_at).getTime() - new Date(a.detected_at).getTime()
+  );
+
+  const title = selectedDate ? `Setups — ${selectedDate}` : "Today's Setup History";
+
+  const statChip = (label: string, value: number, color: string) =>
+    value > 0 ? (
+      <span
+        key={label}
+        style={{
+          ...S.mono, fontSize: 9, padding: "2px 6px", borderRadius: 4,
+          background: `${color}18`, border: `0.5px solid ${color}55`, color,
+        }}
+      >
+        {label} {value}
+      </span>
+    ) : null;
 
   return (
     <div style={S.panel}>
       <div style={S.panelHd}>
-        <span style={S.panelLbl}>Today&apos;s Setup History</span>
+        <span style={S.panelLbl}>{title}</span>
         {context && <Pill color="blue">{context.session_key}</Pill>}
       </div>
-      <div style={{ padding: 8 }}>
-        {!context || recent.length === 0 ? (
-          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", ...S.mono, padding: "6px 0" }}>
+
+      {/* Summary stat chips */}
+      {context && (
+        <div
+          style={{
+            display: "flex", gap: 4, padding: "5px 8px", flexWrap: "wrap",
+            borderBottom: "0.5px solid rgba(255,255,255,0.06)",
+          }}
+        >
+          {statChip("DET", context.counts.detected_total ?? 0, "rgba(255,255,255,0.5)")}
+          {statChip("CFM", context.counts.confirmed_total ?? 0, "#fbbf24")}
+          {statChip("TRG", context.counts.triggered_total ?? 0, "#22c55e")}
+          {statChip("FAI", context.counts.failed_total ?? 0, "#ef4444")}
+          {statChip("INV", context.counts.invalidated_total ?? 0, "rgba(255,255,255,0.3)")}
+        </div>
+      )}
+
+      <div style={{ padding: 8, maxHeight: 480, overflowY: "auto" }}>
+        {sorted.length === 0 ? (
+          <div style={{ ...S.mono, fontSize: 11, color: "rgba(255,255,255,0.4)", padding: "6px 0" }}>
             No setups recorded this session
           </div>
         ) : (
-          <>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 8 }}>
-              <div style={{ background: "rgba(255,255,255,0.03)", borderRadius: 5, padding: "6px 8px" }}>
-                <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", ...S.mono, marginBottom: 2 }}>Detected</div>
-                <div style={{ ...S.mono, fontSize: 13, fontWeight: 500 }}>{context.counts.detected_total ?? 0}</div>
-              </div>
-              <div style={{ background: "rgba(255,255,255,0.03)", borderRadius: 5, padding: "6px 8px" }}>
-                <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", ...S.mono, marginBottom: 2 }}>Triggered</div>
-                <div style={{ ...S.mono, fontSize: 13, fontWeight: 500, color: "#22c55e" }}>{context.counts.triggered_total ?? 0}</div>
-              </div>
-            </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
-              {Object.entries(context.counts_by_level).map(([level, count]) => (
-                <span
-                  key={level}
+          sorted.map((entry) => {
+            const isOpen = expanded === entry.setup_id;
+            const rules = SETUP_RULES[entry.setup_type.toLowerCase()];
+            const rr = computeRR(entry);
+            const entryColor = entry.side === "buy" ? "#22c55e" : "#ef4444";
+
+            return (
+              <div key={entry.setup_id} style={{ marginBottom: 4 }}>
+                <div
                   style={{
-                    ...S.mono,
-                    fontSize: 10,
-                    padding: "2px 6px",
-                    borderRadius: 100,
-                    background: "rgba(255,255,255,0.05)",
-                    border: `0.5px solid ${levelColor(level)}55`,
-                    color: levelColor(level),
+                    borderLeft: `2px solid ${levelColor(entry.level_tag)}`,
+                    padding: "6px 9px",
+                    borderRadius: "0 4px 4px 0",
+                    background: isOpen ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.02)",
+                    cursor: "pointer",
+                    userSelect: "none",
                   }}
+                  onClick={() => setExpanded(isOpen ? null : entry.setup_id)}
                 >
-                  {level.toUpperCase()} {count}
-                </span>
-              ))}
-            </div>
-            {recent.map((entry) => (
-              <div
-                key={entry.setup_id}
-                style={{
-                  borderLeft: `2px solid ${levelColor(entry.level_tag)}`,
-                  padding: "7px 9px",
-                  marginBottom: 5,
-                  borderRadius: "0 4px 4px 0",
-                  background: "rgba(255,255,255,0.03)",
-                }}
-              >
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 3 }}>
-                  <span style={{ ...S.mono, fontSize: 10, fontWeight: 500 }}>
-                    {entry.setup_type.toUpperCase()}
-                  </span>
-                  <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.4)" }}>
-                    {new Date(entry.detected_at).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false })}
-                  </span>
+                  {/* Top row: type + state */}
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+                    <span style={{ ...S.mono, fontSize: 10, fontWeight: 500 }}>
+                      {entry.setup_type.replaceAll("_", " ").toUpperCase()}
+                    </span>
+                    <span
+                      style={{
+                        ...S.mono, fontSize: 9, padding: "1px 5px", borderRadius: 3,
+                        background: `${stateColor(entry.state)}18`,
+                        border: `0.5px solid ${stateColor(entry.state)}55`,
+                        color: stateColor(entry.state),
+                      }}
+                    >
+                      {entry.state.toUpperCase()}
+                    </span>
+                  </div>
+
+                  {/* Meta row: time, side, level, grade, phase */}
+                  <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", marginBottom: 3 }}>
+                    <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.3)" }}>
+                      {new Date(entry.detected_at).toLocaleTimeString("en-US", {
+                        hour: "2-digit", minute: "2-digit", hour12: false,
+                        timeZone: "America/New_York",
+                      })}{" "}ET
+                    </span>
+                    <span style={{ ...S.mono, fontSize: 9, color: entryColor }}>{entry.side.toUpperCase()}</span>
+                    <span style={{ ...S.mono, fontSize: 9, color: levelColor(entry.level_tag) }}>
+                      {entry.level_tag.toUpperCase()}
+                    </span>
+                    {entry.grade && (
+                      <span style={{ ...S.mono, fontSize: 9, padding: "1px 4px", borderRadius: 3, background: gradeBg(entry.grade), color: gradeColor(entry.grade) }}>
+                        {entry.grade}
+                      </span>
+                    )}
+                    {entry.score != null && (
+                      <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.4)" }}>
+                        score {entry.score}
+                      </span>
+                    )}
+                    <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.2)" }}>
+                      {entry.session_phase.toUpperCase()}
+                    </span>
+                  </div>
+
+                  {/* Price levels + R:R */}
+                  {(entry.entry_trigger || entry.stop_reference) && (
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.35)" }}>
+                        E <span style={{ color: "rgba(255,255,255,0.85)" }}>{formatPrice(entry.entry_trigger)}</span>
+                      </span>
+                      <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.35)" }}>
+                        SL <span style={{ color: "#ef4444" }}>{formatPrice(entry.stop_reference)}</span>
+                      </span>
+                      <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.35)" }}>
+                        TP <span style={{ color: "#22c55e" }}>{formatPrice(entry.target_reference)}</span>
+                      </span>
+                      {rr !== null && (
+                        <span
+                          style={{
+                            ...S.mono, fontSize: 10,
+                            color: rr >= 2.5 ? "#22c55e" : rr >= 1.5 ? "#fbbf24" : "#ef4444",
+                          }}
+                        >
+                          {rr.toFixed(1)}R
+                        </span>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Invalidation reason */}
+                  {entry.invalidation_reason && (
+                    <div style={{ ...S.mono, fontSize: 9, color: "#ef4444", marginTop: 3, opacity: 0.7 }}>
+                      ✕ {entry.invalidation_reason}
+                    </div>
+                  )}
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", marginBottom: 3 }}>
-                  <span style={{ ...S.mono, fontSize: 9, color: levelColor(entry.level_tag) }}>{entry.level_tag.toUpperCase()}</span>
-                  <span style={{ ...S.mono, fontSize: 9, color: entry.side === "buy" ? "#22c55e" : "#ef4444" }}>{entry.side.toUpperCase()}</span>
-                  <span style={{ ...S.mono, fontSize: 9, color: stateColor(entry.state) }}>{entry.state.toUpperCase()}</span>
-                  {entry.grade && <span style={{ ...S.mono, fontSize: 9, color: gradeColor(entry.grade) }}>{entry.grade}</span>}
-                </div>
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                  <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.4)" }}>
-                    E <span style={{ color: "rgba(255,255,255,0.88)" }}>{formatPrice(entry.entry_trigger)}</span>
-                  </span>
-                  <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.4)" }}>
-                    SL <span style={{ color: "#ef4444" }}>{formatPrice(entry.stop_reference)}</span>
-                  </span>
-                </div>
+
+                {/* Expanded: detection rules */}
+                {isOpen && rules && (
+                  <div
+                    style={{
+                      background: "rgba(255,255,255,0.015)",
+                      borderLeft: "2px solid rgba(255,255,255,0.08)",
+                      marginLeft: 2,
+                      padding: "8px 10px",
+                      fontSize: 10, ...S.mono,
+                    }}
+                  >
+                    <div style={{ color: "rgba(255,255,255,0.35)", marginBottom: 4, fontSize: 9 }}>
+                      {rules.description}
+                    </div>
+                    {rules.forming.length > 0 && (
+                      <>
+                        <div style={{ color: "rgba(255,255,255,0.25)", fontSize: 9, marginBottom: 3, letterSpacing: "0.1em" }}>
+                          FORMING CONDITIONS
+                        </div>
+                        {rules.forming.map((c, i) => (
+                          <div key={i} style={{ display: "flex", gap: 5, marginBottom: 2, color: "rgba(255,255,255,0.5)" }}>
+                            <span style={{ color: "#fbbf24", flexShrink: 0 }}>◆</span>{c}
+                          </div>
+                        ))}
+                      </>
+                    )}
+                    {rules.confirmation.length > 0 && (
+                      <>
+                        <div style={{ color: "rgba(255,255,255,0.25)", fontSize: 9, margin: "6px 0 3px", letterSpacing: "0.1em" }}>
+                          CONFIRMATION
+                        </div>
+                        {rules.confirmation.map((c, i) => (
+                          <div key={i} style={{ display: "flex", gap: 5, marginBottom: 2, color: "rgba(255,255,255,0.5)" }}>
+                            <span style={{ color: "#22c55e", flexShrink: 0 }}>✓</span>{c}
+                          </div>
+                        ))}
+                      </>
+                    )}
+                    {rules.invalidation.length > 0 && (
+                      <>
+                        <div style={{ color: "rgba(255,255,255,0.25)", fontSize: 9, margin: "6px 0 3px", letterSpacing: "0.1em" }}>
+                          INVALIDATION
+                        </div>
+                        {rules.invalidation.map((c, i) => (
+                          <div key={i} style={{ display: "flex", gap: 5, marginBottom: 2, color: "rgba(255,255,255,0.5)" }}>
+                            <span style={{ color: "#ef4444", flexShrink: 0 }}>✗</span>{c}
+                          </div>
+                        ))}
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
-            ))}
-          </>
+            );
+          })
         )}
       </div>
+
+      {/* By-type breakdown */}
+      {context && Object.keys(context.counts_by_type).length > 0 && (
+        <div style={{ borderTop: "0.5px solid rgba(255,255,255,0.06)", padding: "6px 8px" }}>
+          <div style={{ ...S.panelLbl, marginBottom: 5 }}>By Type</div>
+          {Object.entries(context.counts_by_type).map(([type, counts]) => (
+            <div key={type} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.35)" }}>
+                {type.replaceAll("_", " ").toUpperCase()}
+              </span>
+              <div style={{ display: "flex", gap: 5 }}>
+                {(counts.triggered ?? 0) > 0 && <span style={{ ...S.mono, fontSize: 9, color: "#22c55e" }}>▲{counts.triggered}</span>}
+                {(counts.failed ?? 0) > 0 && <span style={{ ...S.mono, fontSize: 9, color: "#ef4444" }}>✗{counts.failed}</span>}
+                {(counts.invalidated ?? 0) > 0 && <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.3)" }}>⊘{counts.invalidated}</span>}
+                {(counts.forming ?? 0) > 0 && <span style={{ ...S.mono, fontSize: 9, color: "#fbbf24" }}>◆{counts.forming}</span>}
+                {(counts.confirmed ?? 0) > 0 && <span style={{ ...S.mono, fontSize: 9, color: "#60a5fa" }}>●{counts.confirmed}</span>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -810,6 +1093,8 @@ export function Dashboard() {
   // Backfill state
   const [backfillJob, setBackfillJob] = useState<BackfillJob | null>(null);
   const [availableDates, setAvailableDates] = useState<AvailableDates | null>(null);
+  // Incremented after a backfill completes to force a data reload
+  const [refreshKey, setRefreshKey] = useState(0);
 
   // ET clock — ticks every second
   useEffect(() => {
@@ -930,7 +1215,7 @@ export function Dashboard() {
     // In historical mode, poll less aggressively (data is static)
     const interval = setInterval(() => void loadAll(), isHistorical ? 60000 : 15000);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [selectedSymbol, selectedTimeframe, selectedDate]);
+  }, [selectedSymbol, selectedTimeframe, selectedDate, refreshKey]);
 
   useEffect(() => {
     // In historical mode the WebSocket is kept alive only for runtime status
@@ -1039,8 +1324,7 @@ export function Dashboard() {
         // When done, reload data for the selected date
         if (updated.status === "done") {
           clearInterval(id);
-          // Trigger a re-fetch by bumping a dependency via selectedDate reassignment
-          setSelectedDate((d) => d);
+          setRefreshKey((k) => k + 1);
         }
       } catch {
         // non-fatal
@@ -1212,7 +1496,6 @@ export function Dashboard() {
             value={selectedSymbol}
             onChange={(e) => {
               setSelectedSymbol(e.target.value);
-              setSelectedDate(null);
               setBackfillJob(null);
             }}
             style={{
@@ -1355,6 +1638,8 @@ export function Dashboard() {
         }
 
         const hasContext = (setupContexts[selectedSymbol]?.setups?.length ?? 0) > 0;
+
+        // Bars loaded but no setups context yet — first-run detection prompt
         if (!hasContext) {
           return (
             <div
@@ -1365,7 +1650,7 @@ export function Dashboard() {
               }}
             >
               <span style={{ ...S.mono, fontSize: 11, color: "#60a5fa" }}>
-                Bars loaded — setup context not found for {selectedDate}. Run setup detection?
+                Bars loaded — no setup context for {selectedDate}. Run detection with warmup?
               </span>
               <button
                 onClick={() => void triggerBackfill(selectedSymbol, selectedDate)}
@@ -1382,7 +1667,31 @@ export function Dashboard() {
           );
         }
 
-        return null;
+        // Bars + context exist — show a subtle re-detect option for when
+        // the user wants to re-run detection (e.g. after a logic update)
+        return (
+          <div
+            style={{
+              display: "flex", alignItems: "center", justifyContent: "flex-end",
+              gap: 8, marginBottom: 8,
+            }}
+          >
+            <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.25)" }}>
+              {setupContexts[selectedSymbol]?.counts?.detected_total ?? 0} setups on record
+            </span>
+            <button
+              onClick={() => void triggerBackfill(selectedSymbol, selectedDate)}
+              style={{
+                ...S.mono, fontSize: 10,
+                padding: "3px 10px", borderRadius: 4, cursor: "pointer",
+                border: "0.5px solid rgba(255,255,255,0.12)",
+                background: "rgba(255,255,255,0.04)", color: "rgba(255,255,255,0.4)",
+              }}
+            >
+              ↺ Re-detect
+            </button>
+          </div>
+        );
       })()}
 
       {/* ── Main layout: chart + sidebar ── */}
@@ -1468,7 +1777,7 @@ export function Dashboard() {
 
         {/* Sidebar */}
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <SetupHistoryPanel context={currentSetupContext} />
+          <SetupHistoryPanel context={currentSetupContext} selectedDate={selectedDate} />
           <SetupsPanel setups={setups} />
           <FeaturesPanel context={currentContext} />
           <MarketStatePanel context={currentContext} />

@@ -572,6 +572,7 @@ class BootstrapEngine(BaseEngine):
             "setup_contexts": self._serialize_setup_contexts(),
             "prev_setup_contexts": self._serialize_prev_setup_contexts(),
             "orders": self._serialize_orders(),
+            "risk": self._serialize_risk(),
         }
 
     def _serialize_engine(self, engine: BaseEngine) -> dict[str, Any]:
@@ -674,6 +675,12 @@ class BootstrapEngine(BaseEngine):
         if self._order is None:
             return []
         return [order.model_dump(mode="json") for order in self._order.get_open_orders()]
+
+    def _serialize_risk(self) -> dict[str, Any]:
+        if self._risk is None or self._risk.daily_state is None:  # type: ignore[union-attr]
+            return {}
+        state = self._risk.daily_state  # type: ignore[union-attr]
+        return state.model_dump(mode="json")
 
     def _serialize_setup_contexts(self) -> dict[str, Any]:
         if self._setup is None:

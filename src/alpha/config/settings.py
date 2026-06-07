@@ -104,6 +104,10 @@ class IBKRSettings(BaseSettings):
     # 4001 = Gateway paper  |  4002 = Gateway live
     port: int = 7497
     client_id: int = 1
+    # Separate clientId for on-demand backfill connections (alpha api process).
+    # Must differ from client_id so the two processes can coexist in TWS.
+    # Set IBKR__BACKFILL_CLIENT_ID in .env to override.
+    backfill_client_id: int = 2
     timeout: float = 20.0
     use_rth: bool = False       # False = include pre/after-hours bars
     what_to_show: str = "TRADES"

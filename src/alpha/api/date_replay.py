@@ -245,8 +245,11 @@ async def _fetch_bars_from_ibkr(
     registry = SymbolRegistry()
     registry.register(sym)
 
-    conn = IBKRConnection(settings.ibkr)
-    source = IBKRHistoricalDataSource(conn, registry, settings.ibkr)
+    # Use backfill_client_id so this connection does not conflict with the
+    # live trading engine (alpha run) which uses the primary client_id.
+    backfill_ibkr = settings.ibkr.model_copy(update={"client_id": settings.ibkr.backfill_client_id})
+    conn = IBKRConnection(backfill_ibkr)
+    source = IBKRHistoricalDataSource(conn, registry, backfill_ibkr)
 
     try:
         return await _drain_source_to_parquet(source, symbol, d, parquet)
@@ -256,6 +259,9 @@ async def _fetch_bars_from_ibkr(
 
 # ─── Setup detection replay ───────────────────────────────────────────────────
 
+_WARMUP_DAYS = 2  # trading days of prior M1 bars fed to the feature engine before target date
+
+
 async def _replay_setup_detection(
     symbol: str,
     d: date,
@@ -263,11 +269,14 @@ async def _replay_setup_detection(
     parquet: ParquetStore,
 ) -> "SessionSetupContext | None":
     """
-    Load stored 1m bars for symbol+date and replay them through a fresh
-    FeatureEngine → MarketStateEngine → SetupEngine pipeline.
+    Replay bars through a fresh FeatureEngine → MarketStateEngine → SetupEngine pipeline.
 
-    Returns the resulting SessionSetupContext, or None if the pipeline
-    produced no session context (e.g. no bars in session).
+    Warm-up phase: replay the 2 prior trading days so that ATR(14), RVOL,
+    EMA, and session-phase indicators are properly seeded before the target
+    date starts.  The SetupEngine rolls its session on the first bar of the
+    target date, so warmup-day setups are discarded automatically.
+
+    Returns the SessionSetupContext for date `d`, or None if no bars exist.
     """
     from alpha.calendar.resolver import calendar_for_symbol
     from alpha.engines.feature.engine import FeatureEngine
@@ -282,6 +291,7 @@ async def _replay_setup_detection(
     calendar = calendar_for_symbol(sym)
     clock = WallClock()
     bus = EventBus()
+    await bus.start()  # must start bus before publish() calls are live
 
     feature_engine = FeatureEngine(settings, bus, registry, calendar, clock)
     market_state_engine = MarketStateEngine(settings, bus, registry)
@@ -299,19 +309,56 @@ async def _replay_setup_detection(
     await market_state_engine.start()
     await setup_engine.start()
 
-    # Load BarEvents from Parquet and publish them in chronological order.
-    # Use StorageEngine.load_bar_events for typed deserialization.
     storage = StorageEngine(settings, bus)
+
+    # ── Warmup: prior trading days ──────────────────────────────────────────
+    warmup_dates: list[date] = []
+    prev = d
+    for _ in range(_WARMUP_DAYS):
+        prev = calendar.prev_trading_day(prev)
+        warmup_dates.insert(0, prev)
+
+    for warmup_date in warmup_dates:
+        warmup_bars = await storage.load_bar_events(
+            symbol.upper(), BarTimeframe.M1, warmup_date, warmup_date
+        )
+        if warmup_bars:
+            warmup_bars.sort(key=lambda e: e.timestamp)
+            logger.warning(
+                "[backfill] Warmup: replaying %d bars for %s %s",
+                len(warmup_bars), symbol, warmup_date,
+            )
+            for event in warmup_bars:
+                await bus.publish(event)
+                await asyncio.sleep(0)
+            await bus.flush()
+        else:
+            logger.warning(
+                "[backfill] Warmup: no bars in Parquet for %s %s (skipping)",
+                symbol, warmup_date,
+            )
+
+    # ── Target date replay ──────────────────────────────────────────────────
     bar_events = await storage.load_bar_events(symbol.upper(), BarTimeframe.M1, d, d)
     bar_events.sort(key=lambda e: e.timestamp)
+    logger.warning("[backfill] Replaying %d target bars for %s %s", len(bar_events), symbol, d)
 
     for event in bar_events:
         await bus.publish(event)
-        # Yield control briefly so subscribed handlers can process
         await asyncio.sleep(0)
+
+    # Wait for all queued events to finish processing before reading state.
+    await bus.flush()
 
     await setup_engine.stop()
     await market_state_engine.stop()
     await feature_engine.stop()
+    await bus.stop()
 
-    return setup_engine.session_setup_context(symbol.upper())
+    # For CME futures the last ~2 h of bars (18:00–19:59 ET) roll the session
+    # key forward to the *next* trading day.  Capture the target-date context
+    # before that roll happens by falling back to prev_session_setup_context.
+    context = setup_engine.session_setup_context(symbol.upper())
+    if context is not None and context.session_date != d.isoformat():
+        context = setup_engine.prev_session_setup_context(symbol.upper())
+    return context

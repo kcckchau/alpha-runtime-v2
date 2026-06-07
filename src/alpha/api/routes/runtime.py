@@ -163,6 +163,15 @@ async def list_active_setups(symbol: str | None = None) -> list[dict]:  # type: 
     return [setup for setup in setups if setup.get("symbol") == symbol]
 
 
+@router.get("/risk")
+async def get_risk_state(symbol: str | None = None) -> dict[str, Any]:
+    """Return the current daily risk state (P&L, drawdown, halt status)."""
+    snapshot = _snapshot_or_default()
+    risk = snapshot.get("risk") or {}
+    # symbol param reserved for per-symbol risk in future; currently one global state
+    return risk
+
+
 @router.get("/setup-contexts")
 async def list_setup_contexts(
     symbol: str | None = None,

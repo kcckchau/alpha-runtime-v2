@@ -67,6 +67,12 @@ class EventBus:
         self._running = True
         logger.debug("EventBus started")
 
+    async def flush(self) -> None:
+        """Block until every subscriber queue has been fully drained."""
+        for subs in self._subscriptions.values():
+            for sub in subs:
+                await sub.queue.join()
+
     async def stop(self) -> None:
         self._running = False
         async with self._lock:
