@@ -22,7 +22,7 @@ Output: SetupEvent
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
@@ -412,9 +412,9 @@ class SetupEngine(BaseEngine):
             )
             # Invalidation: reclaimed ORB low or VWAP
             if snap.orb_low is not None and snap.bar.close > snap.orb_low:
-                return setup.transition(SetupState.INVALIDATED, "ORB low reclaimed"), ""
+                return setup.transition(SetupState.INVALIDATED, "ORB low reclaimed", bar_time=snap.timestamp), ""
             if snap.is_above_vwap:
-                return setup.transition(SetupState.INVALIDATED, "reclaimed VWAP"), ""
+                return setup.transition(SetupState.INVALIDATED, "reclaimed VWAP", bar_time=snap.timestamp), ""
             # Confirm: hold below ORB low on next bar + rvol ≥ 1.0
             if snap.orb_low is not None and snap.bar.close < snap.orb_low:
                 rvol_ok = snap.relative_volume is None or snap.relative_volume >= 1.0
@@ -430,7 +430,7 @@ class SetupEngine(BaseEngine):
                         entry - orb_range
                         if orb_range else entry - (stop - entry) * Decimal("2")
                     )
-                    confirmed = setup.transition(SetupState.CONFIRMED).model_copy(
+                    confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
                             "entry_trigger": entry,
                             "stop_reference": stop,
@@ -447,11 +447,11 @@ class SetupEngine(BaseEngine):
         elif setup.state == SetupState.CONFIRMED:
             # Invalidation: price reclaims ORB low
             if snap.orb_low is not None and snap.bar.close > snap.orb_low:
-                return setup.transition(SetupState.INVALIDATED, "ORB low reclaimed while confirmed"), ""
+                return setup.transition(SetupState.INVALIDATED, "ORB low reclaimed while confirmed", bar_time=snap.timestamp), ""
             if setup.entry_trigger and snap.bar.low <= setup.entry_trigger:
-                return setup.transition(SetupState.TRIGGERED), "triggered"
+                return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"
             if setup.stop_reference and snap.bar.high >= setup.stop_reference:
-                return setup.transition(SetupState.FAILED), "stop hit"
+                return setup.transition(SetupState.FAILED, bar_time=snap.timestamp), "stop hit"
 
         return setup, ""
 
@@ -646,7 +646,7 @@ class SetupEngine(BaseEngine):
 
             # Invalidation: below VWAP for >15 bars
             if bars > 15 and not snap.is_above_vwap:
-                return setup.transition(SetupState.INVALIDATED, "below VWAP >15 bars"), ""
+                return setup.transition(SetupState.INVALIDATED, "below VWAP >15 bars", bar_time=snap.timestamp), ""
 
             # Confirm: VWAP cross up + rvol ≥ 1.2 + close ≥ 50% of bar + close > OR mid
             if snap.vwap_cross_up:
@@ -661,7 +661,7 @@ class SetupEngine(BaseEngine):
                     # Stop: sweep low (FORMING bar's low) × 0.9995
                     stop = setup.bar_snapshot.bar.low * Decimal("0.9995")
                     target = entry + (entry - stop) * Decimal("2.5")
-                    confirmed = setup.transition(SetupState.CONFIRMED).model_copy(
+                    confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
                             "entry_trigger": entry,
                             "stop_reference": stop,
@@ -677,9 +677,9 @@ class SetupEngine(BaseEngine):
 
         elif setup.state == SetupState.CONFIRMED:
             if setup.entry_trigger and snap.bar.high >= setup.entry_trigger:
-                return setup.transition(SetupState.TRIGGERED), "triggered"
+                return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"
             if setup.stop_reference and snap.bar.low <= setup.stop_reference:
-                return setup.transition(SetupState.FAILED), "stop hit"
+                return setup.transition(SetupState.FAILED, bar_time=snap.timestamp), "stop hit"
 
         return setup, ""
 
@@ -699,7 +699,7 @@ class SetupEngine(BaseEngine):
                     # than vwap-based stop which can be 100+ pts wide on MNQ.
                     stop = snap.bar.low
                     target = entry + (entry - stop) * Decimal("2")
-                    confirmed = setup.transition(SetupState.CONFIRMED).model_copy(
+                    confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
                             "entry_trigger": entry,
                             "stop_reference": stop,
@@ -715,9 +715,9 @@ class SetupEngine(BaseEngine):
 
         elif setup.state == SetupState.CONFIRMED:
             if setup.entry_trigger and snap.bar.high >= setup.entry_trigger:
-                return setup.transition(SetupState.TRIGGERED), "triggered"
+                return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"
             if setup.stop_reference and snap.bar.low <= setup.stop_reference:
-                return setup.transition(SetupState.FAILED), "stop hit"
+                return setup.transition(SetupState.FAILED, bar_time=snap.timestamp), "stop hit"
 
         return setup, ""
 
@@ -731,7 +731,7 @@ class SetupEngine(BaseEngine):
             # Invalidation: VWAP cross down
             if snap.vwap_cross_down:
                 return setup.transition(
-                    SetupState.INVALIDATED, "VWAP cross down while forming"
+                    SetupState.INVALIDATED, "VWAP cross down while forming", bar_time=snap.timestamp
                 ), ""
             # Confirm: within 0.25% of VWAP, still above, rvol ≥ 0.8, no lower low
             if (
@@ -748,7 +748,7 @@ class SetupEngine(BaseEngine):
                         if snap.intraday_high is not None
                         else entry + (entry - stop) * Decimal("3")
                     )
-                    confirmed = setup.transition(SetupState.CONFIRMED).model_copy(
+                    confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
                             "entry_trigger": entry,
                             "stop_reference": stop,
@@ -766,12 +766,12 @@ class SetupEngine(BaseEngine):
             # Invalidation still applies after confirm
             if snap.vwap_cross_down:
                 return setup.transition(
-                    SetupState.INVALIDATED, "VWAP cross down while confirmed"
+                    SetupState.INVALIDATED, "VWAP cross down while confirmed", bar_time=snap.timestamp
                 ), ""
             if setup.entry_trigger and snap.bar.high >= setup.entry_trigger:
-                return setup.transition(SetupState.TRIGGERED), "triggered"
+                return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"
             if setup.stop_reference and snap.bar.low <= setup.stop_reference:
-                return setup.transition(SetupState.FAILED), "stop hit"
+                return setup.transition(SetupState.FAILED, bar_time=snap.timestamp), "stop hit"
 
         return setup, ""
 
