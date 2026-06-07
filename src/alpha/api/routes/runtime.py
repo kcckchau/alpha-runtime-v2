@@ -265,6 +265,8 @@ async def trigger_backfill(
     d = req.date
     jid = make_jid(symbol, d)
 
+    if not hasattr(request.app.state, "backfill_jobs"):
+        request.app.state.backfill_jobs = {}
     jobs: dict[str, Any] = request.app.state.backfill_jobs
 
     # Idempotent: if the job is already running/done return its current state
@@ -284,6 +286,8 @@ async def trigger_backfill(
 @router.get("/backfill-jobs/{job_id_path:path}", response_model=BackfillJobResponse)
 async def get_backfill_job(job_id_path: str, request: Request) -> BackfillJobResponse:
     """Return current status for a backfill job."""
+    if not hasattr(request.app.state, "backfill_jobs"):
+        request.app.state.backfill_jobs = {}
     jobs: dict[str, Any] = request.app.state.backfill_jobs
     job = jobs.get(job_id_path)
     if job is None:

@@ -13,11 +13,12 @@ setup: ## Install with dev deps and copy .env
 	pip install -e ".[dev]"
 	cp -n .env.example .env || true
 
-dev: ## Start DB, runtime API, and web dashboard (Ctrl-C stops all)
-	docker compose up -d
-	@ALPHA_PID=""; \
+dev: ## Start DB, runtime engine, API server, and web dashboard (Ctrl-C stops all)
+	docker compose up -d db
+	@ALPHA_PID=""; API_PID=""; \
 	alpha run & ALPHA_PID=$$!; \
-	trap "kill $$ALPHA_PID 2>/dev/null; docker compose down" EXIT INT TERM; \
+	alpha api & API_PID=$$!; \
+	trap "kill $$ALPHA_PID $$API_PID 2>/dev/null; docker compose down" EXIT INT TERM; \
 	cd web && pnpm dev
 
 lint: ## Run ruff linter

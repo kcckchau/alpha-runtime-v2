@@ -49,11 +49,12 @@ class IBKRConnection:
         self._lock = asyncio.Lock()
 
     async def get(self) -> "IB":
-        """Return connected IB instance. Raises IBKRConnectionError on failure."""
+        """Return connected IB instance, retrying if TWS hasn't released the previous
+        client ID yet (common after a quick Ctrl-C / restart)."""
         async with self._lock:
             if self._ib is not None and self._ib.isConnected():
                 return self._ib
-            return await self._connect()
+            return await self._connect_with_retry()
 
     async def disconnect(self) -> None:
         if self._ib and self._ib.isConnected():
@@ -64,6 +65,31 @@ class IBKRConnection:
     @property
     def is_connected(self) -> bool:
         return self._ib is not None and self._ib.isConnected()
+
+    async def _connect_with_retry(self, max_attempts: int = 6, base_delay: float = 5.0) -> "IB":
+        """Retry connecting to TWS/Gateway with exponential backoff.
+
+        TWS holds the clientId slot for ~30-60s after a dirty disconnect.
+        With 6 attempts at 5/10/20/20/20/20s delays, we cover that window automatically.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await self._connect()
+            except IBKRConnectionError as exc:
+                last_exc = exc
+                if attempt == max_attempts:
+                    break
+                delay = min(base_delay * (2 ** (attempt - 1)), 20.0)
+                logger.warning(
+                    "IBKR connection attempt %d/%d failed — retrying in %.0fs (%s)",
+                    attempt,
+                    max_attempts,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
     async def _connect(self) -> "IB":
         from ib_insync import IB
