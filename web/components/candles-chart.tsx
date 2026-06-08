@@ -254,6 +254,31 @@ function emaPointFromState(
   return { value, nextState: { value, index: state.index + 1 } };
 }
 
+// ─── Session band helpers ─────────────────────────────────────────────────────
+
+type SessionBand = "premarket" | "regular" | "aftermarket";
+
+const SESSION_BAND_COLORS: Record<SessionBand, string> = {
+  premarket:   "rgba(250, 204, 21, 0.07)",  // amber tint
+  regular:     "rgba(34, 197, 94, 0.04)",   // faint green
+  aftermarket: "rgba(139, 92, 246, 0.08)",  // violet tint
+};
+
+// etEpoch is already "ET wall-clock as UTC" seconds, so UTC fields equal ET time.
+function classifySession(etEpoch: number, is24h: boolean): SessionBand | null {
+  const d = new Date(etEpoch * 1000);
+  const minutes = d.getUTCHours() * 60 + d.getUTCMinutes();
+  if (minutes >= 570 && minutes < 960) return "regular";   // 09:30–16:00 ET
+  if (minutes >= 960) {
+    // After 16:00 ET
+    if (is24h) return minutes < 1020 ? "aftermarket" : "premarket"; // 16–17 | 17+ (overnight)
+    return minutes < 1200 ? "aftermarket" : null;                    // 16–20 for equities
+  }
+  // Before 09:30 ET
+  if (is24h) return "premarket";
+  return minutes >= 240 ? "premarket" : null; // 04:00–09:30 for equities
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function CandlesChart({
@@ -264,6 +289,7 @@ export function CandlesChart({
   viewportKey,
   onMarkerClick,
   focusTime,
+  is24h = false,
 }: CandlesChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -289,6 +315,11 @@ export function CandlesChart({
 
   // Previous bars reference for detecting live updates
   const prevBarsRef = useRef<BarRow[]>([]);
+
+  // Session background band series
+  const bandPreRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const bandRegRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const bandAftRef = useRef<ISeriesApi<"Histogram"> | null>(null);
 
   // Chart init effect — runs once
   useEffect(() => {
@@ -318,6 +349,34 @@ export function CandlesChart({
         horzLine: { color: "rgba(255,255,255,0.15)" },
       },
     });
+
+    // Session background bands — added first so they render behind all other series
+    const SESSION_BAND_SCALE = "session-bands";
+    const bandPre = chart.addSeries(HistogramSeries, {
+      color: SESSION_BAND_COLORS.premarket,
+      priceScaleId: SESSION_BAND_SCALE,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      base: 0,
+    });
+    bandPre.priceScale().applyOptions({ visible: false, scaleMargins: { top: 0, bottom: 0 } });
+    const bandReg = chart.addSeries(HistogramSeries, {
+      color: SESSION_BAND_COLORS.regular,
+      priceScaleId: SESSION_BAND_SCALE,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      base: 0,
+    });
+    const bandAft = chart.addSeries(HistogramSeries, {
+      color: SESSION_BAND_COLORS.aftermarket,
+      priceScaleId: SESSION_BAND_SCALE,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      base: 0,
+    });
+    bandPreRef.current = bandPre;
+    bandRegRef.current = bandReg;
+    bandAftRef.current = bandAft;
 
     // VWAP rendered before candles so it appears behind them
     const vwap = chart.addSeries(LineSeries, {
@@ -356,6 +415,9 @@ export function CandlesChart({
       vwapRef.current = null;
       markerApiRef.current = null;
       emaSeriesRef.current.clear();
+      bandPreRef.current = null;
+      bandRegRef.current = null;
+      bandAftRef.current = null;
     };
   }, []);
 
@@ -421,8 +483,29 @@ export function CandlesChart({
         if (isNewBar) emaPreLastRef.current.set(period, emaLastRef.current.get(period)!);
         emaLastRef.current.set(period, newEmaState);
       }
+
+      // Session band — only append on new bar
+      if (isNewBar) {
+        const session = classifySession(t, is24h);
+        if (session === "premarket")   bandPreRef.current?.update({ time: t as Time, value: 1 });
+        else if (session === "regular")     bandRegRef.current?.update({ time: t as Time, value: 1 });
+        else if (session === "aftermarket") bandAftRef.current?.update({ time: t as Time, value: 1 });
+      }
     } else {
       // Full reset: rebuild all series data
+
+      // Session background bands
+      const bandData: Record<SessionBand, { time: Time; value: number }[]> = {
+        premarket: [], regular: [], aftermarket: [],
+      };
+      for (const { t } of buildSortedDeduped(bars, cache)) {
+        const session = classifySession(t, is24h);
+        if (session) bandData[session].push({ time: t as Time, value: 1 });
+      }
+      bandPreRef.current?.setData(bandData.premarket);
+      bandRegRef.current?.setData(bandData.regular);
+      bandAftRef.current?.setData(bandData.aftermarket);
+
       candle.setData(buildCandleData(bars, cache));
 
       const { data: vwapData, statePreLast, stateLast } = buildVwapData(bars, cache);
@@ -467,7 +550,7 @@ export function CandlesChart({
     }
 
     prevBarsRef.current = bars;
-  }, [bars, emas, viewportKey]);
+  }, [bars, emas, viewportKey, is24h]);
 
   // Overlay / marker effect — price lines and markers update independently of bar data
   useEffect(() => {

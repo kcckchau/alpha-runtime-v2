@@ -1817,6 +1817,9 @@ export function Dashboard() {
     return entry ? toETChartTime(entry.detected_at) : undefined;
   }, [selectedSetupId, activeSetupCtx]);
 
+  // 24-hour instruments (futures) — session boundaries differ from equities
+  const is24h = /^(MNQ|NQ|ES|MES|RTY|M2K|YM|MYM|CL|GC|SI|NKD|EMD)/.test(selectedSymbol);
+
   // EMA indicator configs — computed from bar data as line series in the chart
   const emas = useMemo((): EmaConfig[] => {
     if (selectedTimeframe === "1m" || selectedTimeframe === "5m") {
@@ -2193,6 +2196,7 @@ export function Dashboard() {
             viewportKey={replayMode ? `${selectedSymbol}:${selectedTimeframe}:replay:${replayEpoch}` : `${selectedSymbol}:${selectedTimeframe}`}
             onMarkerClick={setSelectedSetupId}
             focusTime={focusTime}
+            is24h={is24h}
           />
 
           {/* Quote bar */}
