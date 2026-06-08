@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from alpha.models.enums import DayType, ORBState, SessionPhase, TrendState, VWAPState
+from alpha.models.enums import DayType, DayTypeStatus, LiveBias, ORBState, SessionPhase, TrendState, VWAPState
 
 
 class MarketState(BaseModel):
@@ -37,10 +37,19 @@ class MarketState(BaseModel):
 
     # ── Overall quality score ─────────────────────────────────────────────────
     structure_score: float = 0.0          # 0.0–1.0; how clean is price structure?
-    confidence: float = 0.0              # 0.0–1.0; how certain is this classification?
+    confidence: float = 0.0              # 0.0–1.0; dynamic conviction vs locked day type
 
     # ── Day type ──────────────────────────────────────────────────────────────
     day_type: DayType = DayType.UNKNOWN
+    day_type_status: DayTypeStatus = DayTypeStatus.FORMING  # health of the locked day type
+
+    # ── Live bias (updates every bar, never locks) ────────────────────────────
+    live_bias: LiveBias = LiveBias.UNKNOWN
+
+    # ── Trade permission ──────────────────────────────────────────────────────
+    trade_long_allowed: bool = True
+    trade_short_allowed: bool = True
+    trade_permission_reason: str = ""
 
     # ── Context flags ─────────────────────────────────────────────────────────
     is_news_driven: bool = False

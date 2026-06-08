@@ -30,7 +30,8 @@ from alpha.core.registry import SymbolRegistry
 from alpha.engines.historical.sources.base import HistoricalDataSource
 from alpha.engines.storage.parquet import ParquetStore
 from alpha.engines.storage.session_context_store import SessionContextStore
-from alpha.models.enums import AssetClass, BarTimeframe
+from alpha.models.enums import AssetClass, BarTimeframe, EventType
+from alpha.models.events import AnyEvent
 from alpha.models.symbol import Symbol
 
 logger = logging.getLogger(__name__)
@@ -278,11 +279,12 @@ async def _replay_setup_detection(
 
     Returns the SessionSetupContext for date `d`, or None if no bars exist.
     """
-    from alpha.calendar.resolver import calendar_for_symbol
+        from alpha.calendar.resolver import calendar_for_symbol
     from alpha.engines.feature.engine import FeatureEngine
     from alpha.engines.market_state.engine import MarketStateEngine
     from alpha.engines.setup.engine import SetupEngine
     from alpha.engines.storage.engine import StorageEngine
+    from alpha.models.events import MarketStateEvent
 
     sym = _infer_symbol(symbol)
     registry = SymbolRegistry()
@@ -310,6 +312,16 @@ async def _replay_setup_detection(
     await setup_engine.start()
 
     storage = StorageEngine(settings, bus)
+
+    # Collect per-bar MarketState snapshots so the dashboard can show the live
+    # regime at any replay position (not just the end-of-day state).
+    bar_market_states: dict[str, Any] = {}
+
+    async def _collect_market_state(event: "AnyEvent") -> None:
+        if isinstance(event, MarketStateEvent):
+            bar_market_states[event.timestamp.isoformat()] = event.state_data
+
+    bus.subscribe(EventType.MARKET_STATE, _collect_market_state)
 
     # ── Warmup: prior trading days ──────────────────────────────────────────
     warmup_dates: list[date] = []
@@ -361,4 +373,16 @@ async def _replay_setup_detection(
     context = setup_engine.session_setup_context(symbol.upper())
     if context is not None and context.session_date != d.isoformat():
         context = setup_engine.prev_session_setup_context(symbol.upper())
+
+    # Attach per-bar MarketState snapshots. Only keep bars that belong to the
+    # target date to avoid leaking warmup-day states into the context.
+    if context is not None and bar_market_states:
+        date_prefix = d.isoformat()
+        target_states = {
+            ts: state
+            for ts, state in bar_market_states.items()
+            if ts.startswith(date_prefix)
+        }
+        context = context.model_copy(update={"bar_market_states": target_states})
+
     return context

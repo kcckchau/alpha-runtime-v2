@@ -99,6 +99,22 @@ class DayType(StrEnum):
     UNKNOWN = "unknown"         # ORB not yet established
 
 
+class DayTypeStatus(StrEnum):
+    FORMING = "forming"              # not enough evidence yet (< 30 bars or no ORB)
+    LOCKED_HEALTHY = "locked_healthy"  # locked and current price action confirms it
+    STRESSED = "stressed"            # locked but contradictory signals appearing
+    INVALIDATED = "invalidated"      # locked but completely contradicted by price action
+
+
+class LiveBias(StrEnum):
+    BULLISH = "bullish"                        # trending up + above VWAP
+    BEARISH = "bearish"                        # trending down + below VWAP
+    TRANSITIONING_BULLISH = "transitioning_bullish"  # trending up but below VWAP
+    TRANSITIONING_BEARISH = "transitioning_bearish"  # trending down but above VWAP
+    NEUTRAL = "neutral"                        # choppy
+    UNKNOWN = "unknown"                        # no EMA data yet
+
+
 class VWAPState(StrEnum):
     ABOVE = "above"
     BELOW = "below"

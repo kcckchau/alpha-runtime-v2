@@ -1,5 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
@@ -98,3 +99,7 @@ class SessionSetupContext(BaseModel):
     counts: dict[str, int] = Field(default_factory=dict)
     counts_by_type: dict[str, dict[str, int]] = Field(default_factory=dict)
     counts_by_level: dict[str, int] = Field(default_factory=dict)
+    # Per-bar MarketState snapshots keyed by ISO timestamp.
+    # Populated during backfill replay so the dashboard can show live regime
+    # evolution as the user scrubs through historical bars.
+    bar_market_states: dict[str, Any] = Field(default_factory=dict)

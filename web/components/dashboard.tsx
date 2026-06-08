@@ -69,28 +69,29 @@ type SymbolContext = {
 type MarketStateData = {
   symbol: string;
   timestamp: string;
-  // Day type — locked once per session after ORB + 15 bars
-  day_type: string;
   // Trend
   trend: string;
   trend_strength: number;
   trend_bars: number;
   // VWAP
   vwap_state: string;
-  vwap_tests: number;
-  vwap_holds: number;
   // ORB
   orb_state: string;
-  orb_breakout_clean: boolean;
-  orb_volume_confirmed: boolean;
   // Session
   session_phase: string;
   is_extended: boolean;
   // Quality
   structure_score: number;
   confidence: number;
-  // Flags
-  flags: string[];
+  // Day type — locked once per session after ORB + 30 bars + 3-bar confirmation
+  day_type: string;
+  day_type_status: string;   // forming | locked_healthy | stressed | invalidated
+  // Live bias — per-bar, never locks
+  live_bias: string;         // bullish | bearish | transitioning_bullish | transitioning_bearish | neutral | unknown
+  // Trade permission derived from day_type_status + live_bias
+  trade_long_allowed: boolean;
+  trade_short_allowed: boolean;
+  trade_permission_reason: string;
 };
 
 type SetupRow = {
@@ -147,6 +148,9 @@ type SetupSessionContext = {
   counts: Record<string, number>;
   counts_by_type: Record<string, Record<string, number>>;
   counts_by_level: Record<string, number>;
+  // Per-bar MarketState snapshots, keyed by ISO timestamp.
+  // Populated during backfill replay; absent on live session contexts.
+  bar_market_states?: Record<string, MarketStateData>;
 };
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -398,7 +402,47 @@ function dayTypePillColor(dayType: string | null | undefined): PillColor {
 
 function dayTypeLabel(dayType: string | null | undefined): string {
   if (!dayType || dayType === "unknown") return "UNKNOWN";
-  return dayType.replace("_", " ").toUpperCase();
+  return dayType.replaceAll("_", " ").toUpperCase();
+}
+
+function dayTypeStatusColor(status: string | null | undefined): string {
+  if (!status || status === "forming") return "rgba(255,255,255,0.4)";
+  if (status === "locked_healthy") return "#22c55e";
+  if (status === "stressed") return "#fbbf24";
+  if (status === "invalidated") return "#ef4444";
+  return "rgba(255,255,255,0.4)";
+}
+
+function dayTypeStatusLabel(status: string | null | undefined): string {
+  if (!status) return "—";
+  return status.replaceAll("_", " ").toUpperCase();
+}
+
+function liveBiasColor(bias: string | null | undefined): string {
+  if (!bias || bias === "unknown") return "rgba(255,255,255,0.4)";
+  if (bias === "bullish") return "#22c55e";
+  if (bias === "bearish") return "#ef4444";
+  if (bias === "transitioning_bullish") return "#86efac";  // light green
+  if (bias === "transitioning_bearish") return "#fca5a5";  // light red
+  if (bias === "neutral") return "#fbbf24";
+  return "rgba(255,255,255,0.4)";
+}
+
+function liveBiasLabel(bias: string | null | undefined): string {
+  if (!bias || bias === "unknown") return "—";
+  return bias.replaceAll("_", " ").toUpperCase();
+}
+
+function tradePermissionSummary(ms: MarketStateData | null): { label: string; color: string; detail: string } {
+  if (!ms) return { label: "—", color: "rgba(255,255,255,0.4)", detail: "" };
+  const { trade_long_allowed, trade_short_allowed, trade_permission_reason } = ms;
+  if (!trade_long_allowed && !trade_short_allowed)
+    return { label: "ALL BLOCKED", color: "#ef4444", detail: trade_permission_reason };
+  if (!trade_long_allowed)
+    return { label: "LONG BLOCKED", color: "#ef4444", detail: trade_permission_reason };
+  if (!trade_short_allowed)
+    return { label: "SHORT BLOCKED", color: "#fbbf24", detail: trade_permission_reason };
+  return { label: "BOTH ALLOWED", color: "#22c55e", detail: "" };
 }
 
 function regimeColor(regime: string | null | undefined): string {
@@ -1061,68 +1105,132 @@ function MarketStatePanel({
   isHistorical?: boolean;
 }) {
   const dayType = marketState?.day_type;
-  const isLocked = dayType && dayType !== "unknown";
+  const dayTypeStatus = marketState?.day_type_status;
+  const liveBias = marketState?.live_bias;
   const trend = marketState?.trend;
   const vwapState = marketState?.vwap_state;
   const orb = marketState?.orb_state;
   const structure = marketState?.structure_score;
   const confidence = marketState?.confidence;
   const trendBars = marketState?.trend_bars;
+  const perm = tradePermissionSummary(marketState ?? null);
+
+  const isLocked = dayType && dayType !== "unknown";
+  const hasData = marketState != null;
 
   return (
     <div style={S.panel}>
       <div style={S.panelHd}>
         <span style={S.panelLbl}>Market State</span>
-        {isHistorical && (
-          <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.3)", fontStyle: "italic" }}>live only</span>
+        {isHistorical && !hasData && (
+          <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.3)", fontStyle: "italic" }}>
+            scrub to see
+          </span>
         )}
       </div>
 
-      {/* Day type — prominent banner */}
+      {/* ── Layer 1: Day type + status ── */}
       <div
         style={{
-          margin: "6px 8px 4px",
+          margin: "6px 8px 0",
           padding: "8px 10px",
           borderRadius: 5,
-          background: isLocked
-            ? `${dayTypeColor(dayType)}14`
-            : "rgba(255,255,255,0.03)",
+          background: isLocked ? `${dayTypeColor(dayType)}14` : "rgba(255,255,255,0.03)",
           border: `0.5px solid ${isLocked ? `${dayTypeColor(dayType)}40` : "rgba(255,255,255,0.08)"}`,
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+          <div>
+            <div style={{ fontSize: 9, ...S.mono, color: "rgba(255,255,255,0.3)", letterSpacing: "0.1em", marginBottom: 3 }}>
+              DAY TYPE
+            </div>
+            <div style={{ ...S.mono, fontSize: 13, fontWeight: 600, color: dayTypeColor(dayType), letterSpacing: "0.04em" }}>
+              {dayTypeLabel(dayType)}
+            </div>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+            <Pill color={dayTypePillColor(dayType)}>
+              {isLocked ? "LOCKED" : "FORMING"}
+            </Pill>
+          </div>
+        </div>
+        {/* Status + confidence on same line */}
+        {isLocked && dayTypeStatus && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 5 }}>
+            <span style={{
+              ...S.mono, fontSize: 9, fontWeight: 500, letterSpacing: "0.05em",
+              color: dayTypeStatusColor(dayTypeStatus),
+            }}>
+              {dayTypeStatusLabel(dayTypeStatus)}
+            </span>
+            {confidence != null && (
+              <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.35)" }}>
+                conf {(confidence * 100).toFixed(0)}%
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ── Layer 2: Live bias ── */}
+      <div
+        style={{
+          margin: "4px 8px 0",
+          padding: "6px 10px",
+          borderRadius: 5,
+          background: "rgba(255,255,255,0.02)",
+          border: "0.5px solid rgba(255,255,255,0.06)",
           display: "flex",
-          alignItems: "center",
           justifyContent: "space-between",
+          alignItems: "center",
         }}
       >
         <div>
           <div style={{ fontSize: 9, ...S.mono, color: "rgba(255,255,255,0.3)", letterSpacing: "0.1em", marginBottom: 3 }}>
-            DAY TYPE
+            LIVE BIAS
           </div>
-          <div
-            style={{
-              ...S.mono,
-              fontSize: 13,
-              fontWeight: 600,
-              color: dayTypeColor(dayType),
-              letterSpacing: "0.04em",
-            }}
-          >
-            {dayTypeLabel(dayType)}
+          <div style={{ ...S.mono, fontSize: 11, fontWeight: 500, color: liveBiasColor(liveBias) }}>
+            {liveBiasLabel(liveBias)}
           </div>
         </div>
-        <Pill color={dayTypePillColor(dayType)}>
-          {isLocked ? "LOCKED" : "FORMING"}
-        </Pill>
+        <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.2)", fontStyle: "italic" }}>
+          UPDATING
+        </span>
       </div>
 
-      <div style={{ padding: "4px 12px 8px" }}>
+      {/* ── Layer 3: Trade permission ── */}
+      <div
+        style={{
+          margin: "4px 8px 6px",
+          padding: "6px 10px",
+          borderRadius: 5,
+          background: `${perm.color}0d`,
+          border: `0.5px solid ${perm.color}40`,
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+        }}
+      >
+        <div>
+          <div style={{ fontSize: 9, ...S.mono, color: "rgba(255,255,255,0.3)", letterSpacing: "0.1em", marginBottom: 3 }}>
+            PERMISSION
+          </div>
+          <div style={{ ...S.mono, fontSize: 11, fontWeight: 600, color: perm.color }}>
+            {perm.label}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Supporting rows ── */}
+      <div style={{ padding: "0 12px 8px" }}>
         <MsRow
           label="Trend"
-          value={trend ? `${trend.toUpperCase()}${trendBars ? ` · ${trendBars}b` : ""}` : "—"}
+          value={trend ? `${trend.replace(/_/g, " ").toUpperCase()}${trendBars ? ` · ${trendBars}b` : ""}` : "—"}
           valueColor={trendColor(trend)}
         />
         <MsRow
           label="VWAP"
-          value={(vwapState ?? "—").toUpperCase()}
+          value={(vwapState ?? "—").replace(/_/g, " ").toUpperCase()}
           valueColor={regimeColor(vwapState)}
         />
         <MsRow
@@ -1134,10 +1242,6 @@ function MarketStatePanel({
           label="Structure"
           value={structure != null ? structure.toFixed(2) : "—"}
           valueColor={structure != null && structure > 0.7 ? "#22c55e" : undefined}
-        />
-        <MsRow
-          label="Confidence"
-          value={confidence != null ? confidence.toFixed(2) : "—"}
           last
         />
       </div>
@@ -1566,6 +1670,32 @@ export function Dashboard() {
   }, [replayMode, replayBarTime, currentSetupContext]);
 
   const activeSetupCtx = replayMode ? replaySetupContext : currentSetupContext;
+
+  // Per-bar market state for historical / replay mode.
+  // In replay: find the nearest prior timestamp in bar_market_states.
+  // In static historical: show the last bar's state.
+  // In live: use currentMarketState from WS.
+  const displayMarketState = useMemo((): MarketStateData | null => {
+    const bms = currentSetupContext?.bar_market_states;
+    if (selectedDate === null) {
+      // Live mode — use WS/REST state
+      return currentMarketState;
+    }
+    if (!bms || Object.keys(bms).length === 0) return null;
+    const targetTime = replayMode && replayBarTime ? replayBarTime : null;
+    const timestamps = Object.keys(bms).sort();
+    if (!targetTime) {
+      // Static historical view — show last available bar state
+      return bms[timestamps[timestamps.length - 1]] ?? null;
+    }
+    // Replay scrubbing — find the nearest prior or exact timestamp
+    let nearest: MarketStateData | null = null;
+    for (const ts of timestamps) {
+      if (ts <= targetTime) nearest = bms[ts] as MarketStateData;
+      else break;
+    }
+    return nearest;
+  }, [selectedDate, replayMode, replayBarTime, currentMarketState, currentSetupContext]);
 
   // Flash animation when a new setup appears during replay
   useEffect(() => {
@@ -2100,7 +2230,7 @@ export function Dashboard() {
           />
           <SetupsPanel setups={setups} />
           <FeaturesPanel context={currentContext} isHistorical={!!selectedDate} />
-          <MarketStatePanel marketState={currentMarketState} isHistorical={!!selectedDate} />
+          <MarketStatePanel marketState={displayMarketState} isHistorical={!!selectedDate} />
           <RiskPanel risk={riskState} />
         </div>
       </div>
