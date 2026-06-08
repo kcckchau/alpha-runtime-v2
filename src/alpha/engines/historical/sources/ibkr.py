@@ -155,7 +155,13 @@ class IBKRHistoricalDataSource(HistoricalDataSource):
 
             # Fetch oldest-first so bars are yielded in chronological order
             for chunk_start, chunk_end in reversed(chunks):
-                days = max(1, (chunk_end - chunk_start).days)
+                # CME futures sessions span midnight UTC (18:00–17:00 ET).
+                # With durationStr="1 D", IBKR returns the single trading
+                # session active AT endDateTime — if that session started only
+                # 2 hours ago we get just 120 bars.  Using at least "2 D"
+                # guarantees the full calendar-day range is covered; the
+                # start/end filter below trims the extra bars.
+                days = max(2, (chunk_end - chunk_start).days)
                 duration = f"{days} D"
 
                 logger.debug(

@@ -84,7 +84,13 @@ class ParquetStore:
         path = _partition_path(self._root, data_type, symbol, d) / "data.parquet"
         if not path.exists():
             return None
-        return pq.read_table(path, columns=columns)
+        try:
+            return pq.read_table(path, columns=columns)
+        except Exception:
+            logger.warning(
+                "Corrupted Parquet file (treating as missing): %s", path
+            )
+            return None
 
     def read_range(
         self,

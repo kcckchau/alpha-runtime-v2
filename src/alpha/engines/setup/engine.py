@@ -50,6 +50,11 @@ from alpha.models.snapshot import BarSnapshot
 
 logger = logging.getLogger(__name__)
 
+# Minimum bars between closing a setup and reopening the same type on the same symbol.
+# On 1-minute bars this equals a 10-minute cooldown.  Prevents rapid-fire churn on
+# strong trend days where the same ORB/VWAP setup would otherwise reopen every bar.
+_COOLDOWN_BARS = 10
+
 _RTH_PHASES = frozenset({
     SessionPhase.OPENING_RANGE,
     SessionPhase.EARLY,
@@ -95,6 +100,11 @@ class SetupEngine(BaseEngine):
         self._symbol_calendars: dict[str, SessionCalendar] = {}
         # Bars-in-forming counter for invalidation timers
         self._forming_bars: dict[UUID, int] = {}
+        # Cooldown: symbol → {SetupType → bar-count-at-last-close}
+        # Prevents the same setup type from re-opening within _COOLDOWN_BARS of closing.
+        self._last_close_bar: dict[str, dict["SetupType", int]] = {}
+        self._bar_counts: dict[str, int] = {}  # rolling bar count per symbol per session
+        self._bar_count_session: dict[str, str] = {}
         self._setups_detected: int = 0
         self._setups_triggered: int = 0
 
@@ -152,7 +162,16 @@ class SetupEngine(BaseEngine):
             return
 
         symbol = event.symbol
+        session_key = self._session_keys.get(symbol, "")
         self._roll_session_if_needed(symbol, event.timestamp)
+
+        # Increment per-symbol bar counter; reset on new session.
+        if self._bar_count_session.get(symbol) != session_key:
+            self._bar_count_session[symbol] = session_key
+            self._bar_counts[symbol] = 0
+            self._last_close_bar.pop(symbol, None)
+        self._bar_counts[symbol] = self._bar_counts.get(symbol, 0) + 1
+
         snapshot = self._get_snapshot(symbol)
         market_state = self._get_market_state(symbol)
         if snapshot is None or market_state is None:
@@ -186,12 +205,22 @@ class SetupEngine(BaseEngine):
             (SetupType.ORB_BREAKDOWN, self._detect_orb_breakdown),
             (SetupType.SWEEP_RECLAIM, self._detect_sweep_reclaim),
         ]
+        current_bar = self._bar_counts.get(symbol, 0)
         for setup_type, detector in detectors:
             if self._has_active(symbol, setup_type):
                 self._log_scan_detail(
                     "Setup scan skipped: %s %s reason=already_active",
                     symbol,
                     setup_type,
+                )
+                continue
+            last_close = self._last_close_bar.get(symbol, {}).get(setup_type)
+            if last_close is not None and (current_bar - last_close) < _COOLDOWN_BARS:
+                self._log_scan_detail(
+                    "Setup scan skipped: %s %s reason=cooldown bars_remaining=%d",
+                    symbol,
+                    setup_type,
+                    _COOLDOWN_BARS - (current_bar - last_close),
                 )
                 continue
             if not self._session_allows_detection(symbol, snapshot):
@@ -327,7 +356,7 @@ class SetupEngine(BaseEngine):
                     # Entry above the reclaim bar's high; stop = reclaim bar's low
                     entry = setup.bar_snapshot.bar.high
                     stop = setup.bar_snapshot.bar.low
-                    mult = self._target_mult("buy", ms.day_type)
+                    mult = self._target_mult("buy", ms)
                     target = (
                         snap.intraday_high
                         if snap.intraday_high is not None and snap.intraday_high > entry
@@ -375,7 +404,7 @@ class SetupEngine(BaseEngine):
                     # Entry below the rejection bar's low; stop = rejection bar's high
                     entry = setup.bar_snapshot.bar.low
                     stop = setup.bar_snapshot.bar.high
-                    mult = self._target_mult("sell", ms.day_type)
+                    mult = self._target_mult("sell", ms)
                     target = (
                         snap.intraday_low
                         if snap.intraday_low is not None and snap.intraday_low < entry
@@ -431,7 +460,7 @@ class SetupEngine(BaseEngine):
                         (snap.orb_high - snap.orb_low)
                         if snap.orb_high and snap.orb_low else None
                     )
-                    mult = self._target_mult("sell", ms.day_type)
+                    mult = self._target_mult("sell", ms)
                     target = (
                         entry - orb_range * mult
                         if orb_range else entry - (stop - entry) * mult
@@ -618,13 +647,41 @@ class SetupEngine(BaseEngine):
             }:
                 to_remove.append(setup_id)
         for sid in to_remove:
-            self._active[symbol].pop(sid, None)
+            closed_setup = self._active[symbol].pop(sid, None)
             self._forming_bars.pop(sid, None)
+            # Record cooldown: same setup type cannot reopen for _COOLDOWN_BARS bars.
+            if closed_setup is not None:
+                self._last_close_bar.setdefault(symbol, {})[closed_setup.setup_type] = (
+                    self._bar_counts.get(symbol, 0)
+                )
 
     @staticmethod
-    def _target_mult(side: str, day_type: "DayType") -> Decimal:
-        """R multiplier for take-profit based on day type and trade direction."""
-        from alpha.models.enums import DayType
+    def _target_mult(side: str, ms: "MarketState") -> Decimal:
+        """R multiplier for take-profit.
+
+        Uses live_bias (recalculated every bar) as the primary signal so that
+        a TREND_DOWN day that has since reclaimed VWAP and flipped bullish still
+        gives longs the 4R target instead of the 2R "against trend" multiplier.
+        Falls back to locked day_type only when live_bias is neutral/unknown.
+        """
+        from alpha.models.enums import DayType, LiveBias
+        lb = ms.live_bias
+        bullish = lb in {LiveBias.BULLISH, LiveBias.TRANSITIONING_BULLISH}
+        bearish = lb in {LiveBias.BEARISH, LiveBias.TRANSITIONING_BEARISH}
+
+        if side == "buy":
+            if bullish:
+                return Decimal("4")
+            if bearish:
+                return Decimal("2")
+        if side == "sell":
+            if bearish:
+                return Decimal("4")
+            if bullish:
+                return Decimal("2")
+
+        # Neutral/unknown live_bias — fall back to locked day_type
+        day_type = ms.day_type
         with_trend = (day_type == DayType.TREND_UP and side == "buy") or \
                      (day_type == DayType.TREND_DOWN and side == "sell")
         against_trend = (day_type == DayType.TREND_UP and side == "sell") or \
@@ -682,7 +739,7 @@ class SetupEngine(BaseEngine):
                     entry = snap.vwap
                     # Stop: sweep low (FORMING bar's low) × 0.9995
                     stop = setup.bar_snapshot.bar.low * Decimal("0.9995")
-                    mult = self._target_mult("buy", ms.day_type)
+                    mult = self._target_mult("buy", ms)
                     target = entry + (entry - stop) * mult
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
@@ -721,7 +778,7 @@ class SetupEngine(BaseEngine):
                     # Use breakout bar's low as stop — tighter and more logical
                     # than vwap-based stop which can be 100+ pts wide on MNQ.
                     stop = snap.bar.low
-                    mult = self._target_mult("buy", ms.day_type)
+                    mult = self._target_mult("buy", ms)
                     target = entry + (entry - stop) * mult
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
@@ -769,7 +826,7 @@ class SetupEngine(BaseEngine):
                     # Stop: confirmation bar's low (unique per bar, tighter and more
                     # relevant than a fixed VWAP percentage across all detections).
                     stop = snap.bar.low
-                    mult = self._target_mult("buy", ms.day_type)
+                    mult = self._target_mult("buy", ms)
                     target = (
                         snap.intraday_high
                         if snap.intraday_high is not None and snap.intraday_high > entry
@@ -831,6 +888,10 @@ class SetupEngine(BaseEngine):
         self._active[symbol] = {}
         for setup_id in stale_ids:
             self._forming_bars.pop(setup_id, None)
+        # Reset per-session cooldown and bar counter on roll.
+        self._last_close_bar.pop(symbol, None)
+        self._bar_counts[symbol] = 0
+        self._bar_count_session[symbol] = session_key
 
         old_context = self._session_contexts.get(symbol)
         if old_context is not None:

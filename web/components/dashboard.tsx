@@ -1390,8 +1390,15 @@ export function Dashboard() {
           ? selectedSymbol
           : (statusData.symbols[0] ?? "MNQ");
 
-        // Date bounds: historical uses the selected date, live uses rolling lookback
-        const histStart = isHistorical ? selectedDate : historyStartDate(symbol);
+        // Date bounds: historical uses the selected date, live uses rolling lookback.
+        // For 24h futures (MNQ, NQ, ES, …) the CME session starts at 18:00 ET the
+        // *prior* calendar day, whose UTC bars sit in the previous day's partition.
+        // Pull histStart back one day so overnight bars are included in the chart.
+        const is24hSymbol = /^(MNQ|NQ|ES|MES|RTY|M2K|YM|MYM|CL|GC|SI|NKD|EMD)/.test(symbol);
+        const rawHistStart = isHistorical ? selectedDate : historyStartDate(symbol);
+        const histStart = (isHistorical && is24hSymbol)
+          ? (() => { const d = new Date(rawHistStart + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); })()
+          : rawHistStart;
         const histEnd   = isHistorical ? selectedDate : todayDate();
         const dateSuffix = isHistorical ? `&date=${selectedDate}` : "";
 
@@ -1968,7 +1975,11 @@ export function Dashboard() {
 
       {/* ── Historical data banner ── */}
       {selectedDate !== null && (() => {
-        const hasBarData = bars.length > 0;
+        // For 24h futures a full session is ~1300 bars; equities ~390.
+        // If we have bars but well below the expected minimum, treat the
+        // data as incomplete and offer a re-fetch via the Backfill button.
+        const minBars = is24h ? 1000 : 350;
+        const hasBarData = bars.length > 0 && bars.length >= minBars;
         const jobRunning = backfillJob && (
           backfillJob.status === "pending" ||
           backfillJob.status === "fetching_bars" ||
