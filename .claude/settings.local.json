@@ -11,7 +11,8 @@
       "Bash(docker compose:*)",
       "Bash(git add:*)",
       "Bash(git commit -m ':*)",
-      "Bash(docker start alpha_db:*)"
+      "Bash(docker start alpha_db:*)",
+      "Bash(grep -i \"session\\\\|premarket\\\\|aftermarket\\\\|24.*hour\" /Users/kennethchau/Projects/execution-ledger2/docs/*.md)"
     ]
   }
 }

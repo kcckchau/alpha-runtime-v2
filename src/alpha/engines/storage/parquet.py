@@ -55,8 +55,16 @@ class ParquetStore:
         path.mkdir(parents=True, exist_ok=True)
         file_path = path / "data.parquet"
         if file_path.exists():
-            existing = pq.ParquetFile(file_path).read()
-            table = pa.concat_tables([existing, table], promote_options="default")
+            try:
+                existing = pq.ParquetFile(file_path).read()
+                table = pa.concat_tables([existing, table], promote_options="default")
+            except Exception:
+                # File is corrupted or empty (e.g. interrupted write). Discard it
+                # and overwrite with the incoming table only.
+                logger.warning(
+                    "Corrupted Parquet file discarded and replaced: %s", file_path
+                )
+                file_path.unlink(missing_ok=True)
         pq.write_table(
             table,
             file_path,

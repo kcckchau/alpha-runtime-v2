@@ -279,7 +279,7 @@ async def _replay_setup_detection(
 
     Returns the SessionSetupContext for date `d`, or None if no bars exist.
     """
-        from alpha.calendar.resolver import calendar_for_symbol
+    from alpha.calendar.resolver import calendar_for_symbol
     from alpha.engines.feature.engine import FeatureEngine
     from alpha.engines.market_state.engine import MarketStateEngine
     from alpha.engines.setup.engine import SetupEngine

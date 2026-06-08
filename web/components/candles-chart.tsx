@@ -5,6 +5,7 @@ import {
   CandlestickData,
   CandlestickSeries,
   ColorType,
+  HistogramSeries,
   IChartApi,
   ISeriesApi,
   LineData,
@@ -47,6 +48,8 @@ type CandlesChartProps = {
   viewportKey?: string;
   onMarkerClick?: (setupId: string) => void;
   focusTime?: Time;
+  /** True for instruments that trade ~24h (futures: MNQ, NQ, ES, etc.) */
+  is24h?: boolean;
 };
 
 // ─── ET timezone helpers ──────────────────────────────────────────────────────
