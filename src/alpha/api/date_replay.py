@@ -128,6 +128,14 @@ async def run_date_backfill(
                 symbol, d, job["bars_fetched"],
             )
 
+        # ── Step 1b: best-effort fetch prior-day bars ─────────────────────────
+        # The chart pulls histStart = D-1 for 24h futures (MNQ, NQ, ES, …) so
+        # that overnight bars (18:00–23:59 ET) are visible.  Those bars live in
+        # the D-1 Parquet partition.  The warmup phase also needs several prior
+        # trading days to seed ATR/EMA/RVOL.  Fetch any missing prior days here
+        # so that both the chart and the feature-engine warmup have real data.
+        await _ensure_prior_bars(symbol, d, settings, parquet)
+
         # ── Step 2: replay through feature+setup pipeline ────────────────────
         job["status"] = JobStatus.DETECTING_SETUPS
         logger.info("[backfill] Running setup detection replay for %s %s", symbol, d)
@@ -152,6 +160,62 @@ async def run_date_backfill(
 
     finally:
         job["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+# ─── Prior-day bar seeder ─────────────────────────────────────────────────────
+
+async def _ensure_prior_bars(
+    symbol: str,
+    d: date,
+    settings: AlphaSettings,
+    parquet: ParquetStore,
+) -> None:
+    """
+    Best-effort: ensure bars exist in Parquet for the calendar day immediately
+    before `d` PLUS the `_WARMUP_DAYS` prior trading days.
+
+    - The prior calendar day (D-1) is required so the chart can display the
+      overnight session for 24h futures (18:00–23:59 ET bars sit in the D-1
+      partition because those timestamps are UTC of the previous day).
+    - The warmup trading days feed ATR, EMA, and RVOL so that setup detection
+      is properly seeded.
+
+    Failures are logged and swallowed — missing prior-day bars degrade quality
+    but must not abort the target-date backfill.
+    """
+    from datetime import timedelta
+
+    from alpha.calendar.resolver import calendar_for_symbol
+
+    sym = _infer_symbol(symbol)
+    calendar = calendar_for_symbol(sym)
+
+    # Collect calendar D-1 + the last _WARMUP_DAYS trading days before D.
+    prior_dates: list[date] = []
+
+    prev_cal = d - timedelta(days=1)
+    if prev_cal not in prior_dates:
+        prior_dates.append(prev_cal)
+
+    prev_trading = d
+    for _ in range(_WARMUP_DAYS):
+        prev_trading = calendar.prev_trading_day(prev_trading)
+        if prev_trading not in prior_dates:
+            prior_dates.append(prev_trading)
+
+    for prior in prior_dates:
+        if parquet.exists(f"bars/{BarTimeframe.M1}", symbol.upper(), prior):
+            logger.debug("[backfill] Prior-day bars already in Parquet: %s %s", symbol, prior)
+            continue
+        logger.info("[backfill] Fetching prior-day bars for %s %s (chart/warmup)", symbol, prior)
+        try:
+            count = await _fetch_bars_from_best_source(symbol, prior, settings, parquet)
+            logger.info("[backfill] Prior-day bars fetched: %s %s (%d bars)", symbol, prior, count)
+        except Exception as exc:
+            logger.warning(
+                "[backfill] Could not fetch prior-day bars for %s %s: %s — skipping",
+                symbol, prior, exc,
+            )
 
 
 # ─── Bar fetch: JSON first, IBKR fallback ────────────────────────────────────
