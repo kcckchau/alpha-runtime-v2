@@ -254,6 +254,9 @@ function emaPointFromState(
   return { value, nextState: { value, index: state.index + 1 } };
 }
 
+const VOL_UP   = "rgba(34,  197, 94,  0.45)";
+const VOL_DOWN = "rgba(239, 68,  68,  0.45)";
+
 // ─── Session band helpers ─────────────────────────────────────────────────────
 
 type SessionBand = "premarket" | "regular" | "aftermarket";
@@ -315,6 +318,9 @@ export function CandlesChart({
 
   // Previous bars reference for detecting live updates
   const prevBarsRef = useRef<BarRow[]>([]);
+
+  // Volume histogram
+  const volRef = useRef<ISeriesApi<"Histogram"> | null>(null);
 
   // Session background band series
   const bandPreRef = useRef<ISeriesApi<"Histogram"> | null>(null);
@@ -397,9 +403,18 @@ export function CandlesChart({
     });
     const markerApi = createSeriesMarkers(candle, [], { zOrder: "aboveSeries" });
 
+    const vol = chart.addSeries(HistogramSeries, {
+      priceScaleId: "volume",
+      priceLineVisible: false,
+      lastValueVisible: false,
+      base: 0,
+    });
+    vol.priceScale().applyOptions({ visible: false, scaleMargins: { top: 0.8, bottom: 0 } });
+
     chartRef.current = chart;
     candleRef.current = candle;
     vwapRef.current = vwap;
+    volRef.current = vol;
     markerApiRef.current = markerApi;
 
     chart.subscribeClick((param) => {
@@ -413,6 +428,7 @@ export function CandlesChart({
       chartRef.current = null;
       candleRef.current = null;
       vwapRef.current = null;
+      volRef.current = null;
       markerApiRef.current = null;
       emaSeriesRef.current.clear();
       bandPreRef.current = null;
@@ -457,6 +473,13 @@ export function CandlesChart({
         low: Number(lastBar.low),
         close: Number(lastBar.close),
       });
+
+      // Volume
+      const vol = Number(lastBar.volume ?? 0);
+      if (vol > 0) {
+        const volColor = Number(lastBar.close) >= Number(lastBar.open) ? VOL_UP : VOL_DOWN;
+        volRef.current?.update({ time: t as Time, value: vol, color: volColor });
+      }
 
       // VWAP
       const preLastVwap = isNewBar ? vwapLastRef.current : vwapPreLastRef.current;
@@ -508,6 +531,16 @@ export function CandlesChart({
 
       candle.setData(buildCandleData(bars, cache));
 
+      // Volume
+      const volData = buildSortedDeduped(bars, cache)
+        .filter(({ b }) => Number(b.volume ?? 0) > 0)
+        .map(({ t, b }) => ({
+          time: t as Time,
+          value: Number(b.volume),
+          color: Number(b.close) >= Number(b.open) ? VOL_UP : VOL_DOWN,
+        }));
+      volRef.current?.setData(volData);
+
       const { data: vwapData, statePreLast, stateLast } = buildVwapData(bars, cache);
       vwap.setData(vwapData);
       vwapPreLastRef.current = statePreLast;
@@ -545,6 +578,7 @@ export function CandlesChart({
 
       if (isViewportChange) {
         chart.timeScale().fitContent();
+        candle.priceScale().applyOptions({ autoScale: true });
         lastViewportKeyRef.current = viewportKey;
       }
     }
@@ -589,6 +623,21 @@ export function CandlesChart({
       to: ((focusTime as number) + half) as Time,
     });
   }, [focusTime]);
+
+  // 'R' key — reset view (fit content + re-enable price auto-scale), like TradingView
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.code !== "KeyR" || !e.altKey) return;
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      const chart = chartRef.current;
+      const candle = candleRef.current;
+      if (!chart || !candle) return;
+      chart.timeScale().fitContent();
+      candle.priceScale().applyOptions({ autoScale: true });
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, []);
 
   return <div ref={containerRef} style={{ height: 420, width: "100%" }} />;
 }
