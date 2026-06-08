@@ -392,6 +392,16 @@ async def list_contexts(symbol: str | None = None) -> dict[str, Any]:
     return {symbol: contexts.get(symbol)}
 
 
+@router.get("/market-states")
+async def list_market_states(symbol: str | None = None) -> dict[str, Any]:
+    """Return the latest MarketState for each symbol (day type, trend, VWAP/ORB regime, etc.)."""
+    snapshot = _snapshot_or_default()
+    states = snapshot.get("market_states", {})
+    if symbol is None:
+        return states
+    return {symbol: states.get(symbol)}
+
+
 @router.get("/orders")
 async def list_open_orders(symbol: str | None = None) -> list[dict]:  # type: ignore[type-arg]
     snapshot = _snapshot_or_default()

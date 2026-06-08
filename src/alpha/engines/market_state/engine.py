@@ -23,7 +23,7 @@ from alpha.config.settings import AlphaSettings
 from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
-from alpha.models.enums import EventType, HealthStatus, TrendState, VWAPState
+from alpha.models.enums import DayType, EventType, HealthStatus, ORBState, TrendState, VWAPState
 from alpha.models.events import AnyEvent, BarEvent, MarketStateEvent
 from alpha.models.market_state import MarketState
 from alpha.models.snapshot import BarSnapshot
@@ -58,6 +58,9 @@ class MarketStateEngine(BaseEngine):
         self._feature_engine: object | None = None   # FeatureEngine, avoid circular import
         self._latest_states: dict[str, MarketState] = {}
         self._classifications_total: int = 0
+        # Day type is locked once ORB is established; reset each session
+        self._day_types: dict[str, DayType] = {}
+        self._day_type_session: dict[str, str] = {}
 
     @property
     def name(self) -> str:
@@ -110,6 +113,7 @@ class MarketStateEngine(BaseEngine):
         trend = self._classify_trend(snap)
         vwap_state = self._classify_vwap(snap)
         structure_score = self._score_structure(snap, trend)
+        day_type = self._classify_day_type(symbol, snap, trend)
 
         return MarketState(
             symbol=symbol,
@@ -122,7 +126,36 @@ class MarketStateEngine(BaseEngine):
             is_extended=snap.is_extended,
             structure_score=structure_score,
             confidence=self._confidence(snap),
+            day_type=day_type,
         )
+
+    def _classify_day_type(self, symbol: str, snap: BarSnapshot, trend: TrendState) -> DayType:
+        # Reset on new session
+        session_key = snap.timestamp.strftime("%Y-%m-%d")
+        if self._day_type_session.get(symbol) != session_key:
+            self._day_type_session[symbol] = session_key
+            self._day_types.pop(symbol, None)
+
+        # Return locked value if already determined
+        if symbol in self._day_types:
+            return self._day_types[symbol]
+
+        # Need ORB established and enough bars to classify
+        if snap.orb_state == ORBState.NOT_SET or snap.bars_since_open < 15:
+            return DayType.UNKNOWN
+
+        if snap.orb_state == ORBState.BREAKOUT_UP and trend == TrendState.TRENDING_UP:
+            day_type = DayType.TREND_UP
+        elif snap.orb_state == ORBState.BREAKOUT_DOWN and trend == TrendState.TRENDING_DOWN:
+            day_type = DayType.TREND_DOWN
+        elif snap.orb_state in {ORBState.INSIDE, ORBState.FAILED_BREAKOUT_UP, ORBState.FAILED_BREAKOUT_DOWN}:
+            day_type = DayType.RANGE
+        else:
+            day_type = DayType.BALANCED
+
+        self._day_types[symbol] = day_type
+        logger.info("Day type locked: %s → %s (orb=%s trend=%s)", symbol, day_type, snap.orb_state, trend)
+        return day_type
 
     @staticmethod
     def _classify_trend(snap: BarSnapshot) -> TrendState:

@@ -91,6 +91,14 @@ class TrendState(StrEnum):
     UNKNOWN = "unknown"
 
 
+class DayType(StrEnum):
+    TREND_UP = "trend_up"       # ORB breakout up + trending up — run longs, fade shorts
+    TREND_DOWN = "trend_down"   # ORB breakdown + trending down — run shorts, fade longs
+    RANGE = "range"             # Inside ORB or failed breakout — take profits quickly
+    BALANCED = "balanced"       # ORB broke but trend not aligned — neutral targets
+    UNKNOWN = "unknown"         # ORB not yet established
+
+
 class VWAPState(StrEnum):
     ABOVE = "above"
     BELOW = "below"

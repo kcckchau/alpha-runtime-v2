@@ -310,7 +310,7 @@ class SetupEngine(BaseEngine):
         return None
 
     def _advance_vwap_reclaim(
-        self, setup: Setup, snap: BarSnapshot
+        self, setup: Setup, snap: BarSnapshot, ms: MarketState
     ) -> tuple[Setup, str]:
         if setup.state == SetupState.FORMING:
             self._forming_bars[setup.setup_id] = (
@@ -327,10 +327,11 @@ class SetupEngine(BaseEngine):
                     # Entry above the reclaim bar's high; stop = reclaim bar's low
                     entry = setup.bar_snapshot.bar.high
                     stop = setup.bar_snapshot.bar.low
+                    mult = self._target_mult("buy", ms.day_type)
                     target = (
                         snap.intraday_high
                         if snap.intraday_high is not None and snap.intraday_high > entry
-                        else entry + (entry - stop) * Decimal("3")
+                        else entry + (entry - stop) * mult
                     )
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
@@ -357,7 +358,7 @@ class SetupEngine(BaseEngine):
         return setup, ""
 
     def _advance_vwap_rejection(
-        self, setup: Setup, snap: BarSnapshot
+        self, setup: Setup, snap: BarSnapshot, ms: MarketState
     ) -> tuple[Setup, str]:
         if setup.state == SetupState.FORMING:
             self._forming_bars[setup.setup_id] = (
@@ -374,10 +375,11 @@ class SetupEngine(BaseEngine):
                     # Entry below the rejection bar's low; stop = rejection bar's high
                     entry = setup.bar_snapshot.bar.low
                     stop = setup.bar_snapshot.bar.high
+                    mult = self._target_mult("sell", ms.day_type)
                     target = (
                         snap.intraday_low
                         if snap.intraday_low is not None and snap.intraday_low < entry
-                        else entry - (stop - entry) * Decimal("3")
+                        else entry - (stop - entry) * mult
                     )
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
@@ -404,7 +406,7 @@ class SetupEngine(BaseEngine):
         return setup, ""
 
     def _advance_orb_breakdown(
-        self, setup: Setup, snap: BarSnapshot
+        self, setup: Setup, snap: BarSnapshot, ms: MarketState
     ) -> tuple[Setup, str]:
         if setup.state == SetupState.FORMING:
             self._forming_bars[setup.setup_id] = (
@@ -419,16 +421,20 @@ class SetupEngine(BaseEngine):
             if snap.orb_low is not None and snap.bar.close < snap.orb_low:
                 rvol_ok = snap.relative_volume is None or snap.relative_volume >= 1.0
                 if rvol_ok:
-                    entry = snap.orb_low
-                    # Stop: just above ORB low (failed breakdown = reclaim)
+                    # Entry: forming bar's close — where price was when the breakdown
+                    # was first detected (an actionable fill price, not the stale ORB level).
+                    entry = setup.bar_snapshot.bar.close
+                    # Stop: just above ORB low — the structural level; if price reclaims
+                    # it the breakdown has failed.
                     stop = snap.orb_low * Decimal("1.001")
                     orb_range = (
                         (snap.orb_high - snap.orb_low)
                         if snap.orb_high and snap.orb_low else None
                     )
+                    mult = self._target_mult("sell", ms.day_type)
                     target = (
-                        entry - orb_range
-                        if orb_range else entry - (stop - entry) * Decimal("2")
+                        entry - orb_range * mult
+                        if orb_range else entry - (stop - entry) * mult
                     )
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
@@ -615,6 +621,22 @@ class SetupEngine(BaseEngine):
             self._active[symbol].pop(sid, None)
             self._forming_bars.pop(sid, None)
 
+    @staticmethod
+    def _target_mult(side: str, day_type: "DayType") -> Decimal:
+        """R multiplier for take-profit based on day type and trade direction."""
+        from alpha.models.enums import DayType
+        with_trend = (day_type == DayType.TREND_UP and side == "buy") or \
+                     (day_type == DayType.TREND_DOWN and side == "sell")
+        against_trend = (day_type == DayType.TREND_UP and side == "sell") or \
+                        (day_type == DayType.TREND_DOWN and side == "buy")
+        if with_trend:
+            return Decimal("4")
+        if against_trend:
+            return Decimal("2")
+        if day_type == DayType.RANGE:
+            return Decimal("1.5")
+        return Decimal("3")  # BALANCED / UNKNOWN
+
     def _advance_state(
         self,
         setup: Setup,
@@ -622,23 +644,23 @@ class SetupEngine(BaseEngine):
         market_state: MarketState,
     ) -> tuple[Setup, str]:
         if setup.setup_type == SetupType.FAKE_BREAKDOWN:
-            return self._advance_fake_breakdown(setup, snapshot)
+            return self._advance_fake_breakdown(setup, snapshot, market_state)
         if setup.setup_type == SetupType.HOD_BREAKOUT:
-            return self._advance_hod_breakout(setup, snapshot)
+            return self._advance_hod_breakout(setup, snapshot, market_state)
         if setup.setup_type == SetupType.TREND_PULLBACK:
-            return self._advance_trend_pullback(setup, snapshot)
+            return self._advance_trend_pullback(setup, snapshot, market_state)
         if setup.setup_type == SetupType.VWAP_RECLAIM:
-            return self._advance_vwap_reclaim(setup, snapshot)
+            return self._advance_vwap_reclaim(setup, snapshot, market_state)
         if setup.setup_type == SetupType.VWAP_REJECTION:
-            return self._advance_vwap_rejection(setup, snapshot)
+            return self._advance_vwap_rejection(setup, snapshot, market_state)
         if setup.setup_type == SetupType.ORB_BREAKDOWN:
-            return self._advance_orb_breakdown(setup, snapshot)
+            return self._advance_orb_breakdown(setup, snapshot, market_state)
         return setup, ""
 
     # ── Per-type advance methods ───────────────────────────────────────────────
 
     def _advance_fake_breakdown(
-        self, setup: Setup, snap: BarSnapshot
+        self, setup: Setup, snap: BarSnapshot, ms: MarketState
     ) -> tuple[Setup, str]:
         if setup.state == SetupState.FORMING:
             bars = self._forming_bars.get(setup.setup_id, 0) + 1
@@ -660,7 +682,8 @@ class SetupEngine(BaseEngine):
                     entry = snap.vwap
                     # Stop: sweep low (FORMING bar's low) × 0.9995
                     stop = setup.bar_snapshot.bar.low * Decimal("0.9995")
-                    target = entry + (entry - stop) * Decimal("2.5")
+                    mult = self._target_mult("buy", ms.day_type)
+                    target = entry + (entry - stop) * mult
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
                             "entry_trigger": entry,
@@ -684,7 +707,7 @@ class SetupEngine(BaseEngine):
         return setup, ""
 
     def _advance_hod_breakout(
-        self, setup: Setup, snap: BarSnapshot
+        self, setup: Setup, snap: BarSnapshot, ms: MarketState
     ) -> tuple[Setup, str]:
         if setup.state == SetupState.FORMING:
             self._forming_bars[setup.setup_id] = (
@@ -698,7 +721,8 @@ class SetupEngine(BaseEngine):
                     # Use breakout bar's low as stop — tighter and more logical
                     # than vwap-based stop which can be 100+ pts wide on MNQ.
                     stop = snap.bar.low
-                    target = entry + (entry - stop) * Decimal("2")
+                    mult = self._target_mult("buy", ms.day_type)
+                    target = entry + (entry - stop) * mult
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
                             "entry_trigger": entry,
@@ -722,7 +746,7 @@ class SetupEngine(BaseEngine):
         return setup, ""
 
     def _advance_trend_pullback(
-        self, setup: Setup, snap: BarSnapshot
+        self, setup: Setup, snap: BarSnapshot, ms: MarketState
     ) -> tuple[Setup, str]:
         if setup.state == SetupState.FORMING:
             self._forming_bars[setup.setup_id] = (
@@ -742,11 +766,14 @@ class SetupEngine(BaseEngine):
                 no_lower_low = not snap.is_lower_low
                 if rvol_ok and no_lower_low:
                     entry = snap.vwap
-                    stop = snap.vwap * Decimal("0.997")
+                    # Stop: confirmation bar's low (unique per bar, tighter and more
+                    # relevant than a fixed VWAP percentage across all detections).
+                    stop = snap.bar.low
+                    mult = self._target_mult("buy", ms.day_type)
                     target = (
                         snap.intraday_high
-                        if snap.intraday_high is not None
-                        else entry + (entry - stop) * Decimal("3")
+                        if snap.intraday_high is not None and snap.intraday_high > entry
+                        else entry + (entry - stop) * mult
                     )
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={

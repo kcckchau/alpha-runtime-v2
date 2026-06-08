@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from alpha.models.enums import ORBState, SessionPhase, TrendState, VWAPState
+from alpha.models.enums import DayType, ORBState, SessionPhase, TrendState, VWAPState
 
 
 class MarketState(BaseModel):
@@ -38,6 +38,9 @@ class MarketState(BaseModel):
     # ── Overall quality score ─────────────────────────────────────────────────
     structure_score: float = 0.0          # 0.0–1.0; how clean is price structure?
     confidence: float = 0.0              # 0.0–1.0; how certain is this classification?
+
+    # ── Day type ──────────────────────────────────────────────────────────────
+    day_type: DayType = DayType.UNKNOWN
 
     # ── Context flags ─────────────────────────────────────────────────────────
     is_news_driven: bool = False

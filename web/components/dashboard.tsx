@@ -56,7 +56,7 @@ type SymbolContext = {
   vwap_deviation_pct?: number | null;
   rs_vs_spy?: number | null;
   vwap?: number | null;
-  // Market state
+  // Legacy market state fields (not populated in current backend — use MarketStateData instead)
   trend?: string | null;
   trend_strength?: number | null;
   vwap_regime?: string | null;
@@ -64,6 +64,33 @@ type SymbolContext = {
   structure_score?: number | null;
   confidence?: number | null;
   session_phase?: string | null;
+};
+
+type MarketStateData = {
+  symbol: string;
+  timestamp: string;
+  // Day type — locked once per session after ORB + 15 bars
+  day_type: string;
+  // Trend
+  trend: string;
+  trend_strength: number;
+  trend_bars: number;
+  // VWAP
+  vwap_state: string;
+  vwap_tests: number;
+  vwap_holds: number;
+  // ORB
+  orb_state: string;
+  orb_breakout_clean: boolean;
+  orb_volume_confirmed: boolean;
+  // Session
+  session_phase: string;
+  is_extended: boolean;
+  // Quality
+  structure_score: number;
+  confidence: number;
+  // Flags
+  flags: string[];
 };
 
 type SetupRow = {
@@ -316,6 +343,7 @@ type RuntimeWsMessage = {
   quote: QuoteRow | null;
   bar: BarHistoryRow | null;
   context: SymbolContext | null;
+  market_state: MarketStateData | null;
   setup_context: SetupSessionContext | null;
   prev_setup_context: SetupSessionContext | null;
   setups: SetupRow[];
@@ -348,6 +376,29 @@ function trendColor(trend: string | null | undefined): string {
   if (trend.includes("up")) return "#22c55e";
   if (trend.includes("down")) return "#ef4444";
   return "#fbbf24";
+}
+
+function dayTypeColor(dayType: string | null | undefined): string {
+  if (!dayType || dayType === "unknown") return "rgba(255,255,255,0.4)";
+  if (dayType === "trend_up") return "#22c55e";
+  if (dayType === "trend_down") return "#ef4444";
+  if (dayType === "range") return "#fbbf24";
+  if (dayType === "balanced") return "#60a5fa";
+  return "rgba(255,255,255,0.4)";
+}
+
+function dayTypePillColor(dayType: string | null | undefined): PillColor {
+  if (!dayType || dayType === "unknown") return "gray";
+  if (dayType === "trend_up") return "green";
+  if (dayType === "trend_down") return "red";
+  if (dayType === "range") return "amber";
+  if (dayType === "balanced") return "blue";
+  return "gray";
+}
+
+function dayTypeLabel(dayType: string | null | undefined): string {
+  if (!dayType || dayType === "unknown") return "UNKNOWN";
+  return dayType.replace("_", " ").toUpperCase();
 }
 
 function regimeColor(regime: string | null | undefined): string {
@@ -1002,12 +1053,21 @@ function FeaturesPanel({ context, isHistorical }: { context: SymbolContext | nul
   );
 }
 
-function MarketStatePanel({ context, isHistorical }: { context: SymbolContext | null; isHistorical?: boolean }) {
-  const trend = context?.trend;
-  const regime = context?.vwap_regime;
-  const orb = context?.orb_state;
-  const structure = context?.structure_score;
-  const confidence = context?.confidence;
+function MarketStatePanel({
+  marketState,
+  isHistorical,
+}: {
+  marketState: MarketStateData | null;
+  isHistorical?: boolean;
+}) {
+  const dayType = marketState?.day_type;
+  const isLocked = dayType && dayType !== "unknown";
+  const trend = marketState?.trend;
+  const vwapState = marketState?.vwap_state;
+  const orb = marketState?.orb_state;
+  const structure = marketState?.structure_score;
+  const confidence = marketState?.confidence;
+  const trendBars = marketState?.trend_bars;
 
   return (
     <div style={S.panel}>
@@ -1017,13 +1077,58 @@ function MarketStatePanel({ context, isHistorical }: { context: SymbolContext | 
           <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.3)", fontStyle: "italic" }}>live only</span>
         )}
       </div>
+
+      {/* Day type — prominent banner */}
+      <div
+        style={{
+          margin: "6px 8px 4px",
+          padding: "8px 10px",
+          borderRadius: 5,
+          background: isLocked
+            ? `${dayTypeColor(dayType)}14`
+            : "rgba(255,255,255,0.03)",
+          border: `0.5px solid ${isLocked ? `${dayTypeColor(dayType)}40` : "rgba(255,255,255,0.08)"}`,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+        }}
+      >
+        <div>
+          <div style={{ fontSize: 9, ...S.mono, color: "rgba(255,255,255,0.3)", letterSpacing: "0.1em", marginBottom: 3 }}>
+            DAY TYPE
+          </div>
+          <div
+            style={{
+              ...S.mono,
+              fontSize: 13,
+              fontWeight: 600,
+              color: dayTypeColor(dayType),
+              letterSpacing: "0.04em",
+            }}
+          >
+            {dayTypeLabel(dayType)}
+          </div>
+        </div>
+        <Pill color={dayTypePillColor(dayType)}>
+          {isLocked ? "LOCKED" : "FORMING"}
+        </Pill>
+      </div>
+
       <div style={{ padding: "4px 12px 8px" }}>
-        <MsRow label="Trend" value={(trend ?? "—").toUpperCase()} valueColor={trendColor(trend)} />
-        <MsRow label="VWAP regime" value={(regime ?? "—").toUpperCase()} valueColor={regimeColor(regime)} />
         <MsRow
-          label="ORB state"
-          value={(orb ?? "—").toUpperCase()}
-          valueColor={orb?.includes("breakout") ? "#22c55e" : undefined}
+          label="Trend"
+          value={trend ? `${trend.toUpperCase()}${trendBars ? ` · ${trendBars}b` : ""}` : "—"}
+          valueColor={trendColor(trend)}
+        />
+        <MsRow
+          label="VWAP"
+          value={(vwapState ?? "—").toUpperCase()}
+          valueColor={regimeColor(vwapState)}
+        />
+        <MsRow
+          label="ORB"
+          value={(orb ?? "—").replace(/_/g, " ").toUpperCase()}
+          valueColor={orb?.includes("breakout") ? "#22c55e" : orb?.includes("breakdown") ? "#ef4444" : undefined}
         />
         <MsRow
           label="Structure"
@@ -1125,6 +1230,7 @@ export function Dashboard() {
   // null = live mode; string = historical date "YYYY-MM-DD"
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
   const [contexts, setContexts] = useState<Record<string, SymbolContext | null>>({});
+  const [marketStates, setMarketStates] = useState<Record<string, MarketStateData | null>>({});
   const [quotes, setQuotes] = useState<Record<string, QuoteRow | null>>({});
   const [bars, setBars] = useState<BarHistoryRow[]>([]);
   const [setups, setSetups] = useState<SetupRow[]>([]);
@@ -1214,6 +1320,10 @@ export function Dashboard() {
           fetchJson<Record<string, SetupSessionContext | null>>(
             `/runtime/prev-setup-contexts?symbol=${symbol}${dateSuffix}`
           ),
+          // [7] market states (live only — locked per session)
+          isHistorical
+            ? Promise.resolve({})
+            : fetchJson<Record<string, MarketStateData | null>>(`/runtime/market-states?symbol=${symbol}`).catch(() => ({})),
         ];
 
         const [
@@ -1224,6 +1334,7 @@ export function Dashboard() {
           setupData,
           setupContextData,
           prevSetupContextData,
+          marketStateData,
         ] = await Promise.all(requests) as [
           Record<string, SymbolContext | null>,
           Record<string, QuoteRow | null>,
@@ -1232,6 +1343,7 @@ export function Dashboard() {
           SetupRow[],
           Record<string, SetupSessionContext | null>,
           Record<string, SetupSessionContext | null>,
+          Record<string, MarketStateData | null>,
         ];
 
         const riskData = isHistorical
@@ -1245,6 +1357,7 @@ export function Dashboard() {
 
         if (!isHistorical) {
           setContexts((prev) => ({ ...prev, ...contextData }));
+          setMarketStates((prev) => ({ ...prev, ...marketStateData }));
           setQuotes((prev) => ({ ...prev, ...quoteData }));
         }
 
@@ -1302,6 +1415,9 @@ export function Dashboard() {
 
         if (payload.context) {
           setContexts((prev) => ({ ...prev, [selectedSymbol]: payload.context }));
+        }
+        if (payload.market_state) {
+          setMarketStates((prev) => ({ ...prev, [selectedSymbol]: payload.market_state }));
         }
         if (payload.quote) {
           setQuotes((prev) => ({ ...prev, [selectedSymbol]: payload.quote }));
@@ -1430,6 +1546,7 @@ export function Dashboard() {
   }, [replayPlaying, replayMode, replaySpeed, bars.length]);
 
   const currentContext = contexts[selectedSymbol] ?? null;
+  const currentMarketState = marketStates[selectedSymbol] ?? null;
   const currentQuote = quotes[selectedSymbol] ?? null;
   const _rawSetupContext = setupContexts[selectedSymbol] ?? null;
   const _prevSetupContext = prevSetupContexts[selectedSymbol] ?? null;
@@ -1531,10 +1648,19 @@ export function Dashboard() {
       }
     }
 
-    // Historical setup price lines intentionally omitted — too noisy with many setups.
+    // Show E/SL/TP for the selected historical setup
+    if (selectedSetupId) {
+      const sel = activeSetupCtx?.setups.find((s) => s.setup_id === selectedSetupId);
+      if (sel) {
+        const sideColor = sel.side === "buy" ? "#22c55e" : "#ef4444";
+        if (sel.entry_trigger)   overlays.push({ label: "E",  price: Number(sel.entry_trigger),   color: sideColor,  style: LineStyle.Solid });
+        if (sel.stop_reference)  overlays.push({ label: "SL", price: Number(sel.stop_reference),  color: "#ef4444",  style: LineStyle.Dashed });
+        if (sel.target_reference) overlays.push({ label: "TP", price: Number(sel.target_reference), color: "#22c55e", style: LineStyle.Dashed });
+      }
+    }
 
     return overlays;
-  }, [currentContext, setups, currentSetupContext]);
+  }, [currentContext, setups, currentSetupContext, selectedSetupId, activeSetupCtx]);
 
   const historyMarkers = useMemo((): SeriesMarker<Time>[] => {
     return (activeSetupCtx?.setups ?? [])
@@ -1974,7 +2100,7 @@ export function Dashboard() {
           />
           <SetupsPanel setups={setups} />
           <FeaturesPanel context={currentContext} isHistorical={!!selectedDate} />
-          <MarketStatePanel context={currentContext} isHistorical={!!selectedDate} />
+          <MarketStatePanel marketState={currentMarketState} isHistorical={!!selectedDate} />
           <RiskPanel risk={riskState} />
         </div>
       </div>
