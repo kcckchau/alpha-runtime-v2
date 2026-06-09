@@ -58,10 +58,14 @@ class IBKRBrokerAdapter(BrokerAdapter):
         conn: IBKRConnection,
         settings: IBKRSettings,
         registry: SymbolRegistry,
+        account_map: dict[str, str] | None = None,
     ) -> None:
         self._conn = conn
         self._settings = settings
         self._registry = registry
+        # logical_id → IBKR account string (keys normalized to lowercase)
+        raw_map = account_map or dict(settings.account_map)
+        self._account_map: dict[str, str] = {k.lower(): v for k, v in raw_map.items()}
         self._order_handlers: list[OrderUpdateHandlerT] = []
         self._exec_handlers: list[ExecutionHandlerT] = []
         # Maps our order_id → ib_insync Trade object
@@ -97,11 +101,20 @@ class IBKRBrokerAdapter(BrokerAdapter):
 
     # ── Order management ──────────────────────────────────────────────────────
 
+    def _resolve_ibkr_account(self, account_id: str) -> str | None:
+        """Translate logical account_id to IBKR account string, or None for default."""
+        return self._account_map.get(account_id)
+
     async def submit_order(self, intent: OrderIntent) -> Order:
         ib = await self._conn.get()
         sym = self._registry.get(intent.symbol)
         contract = make_contract(sym)
         ib_order = self._build_ib_order(intent)
+
+        # Route to the specific IBKR account if mapped
+        ibkr_account = self._resolve_ibkr_account(intent.account_id)
+        if ibkr_account:
+            ib_order.account = ibkr_account  # type: ignore[union-attr]
 
         trade = ib.placeOrder(contract, ib_order)
         order_id = uuid4()
@@ -122,6 +135,7 @@ class IBKRBrokerAdapter(BrokerAdapter):
             time_in_force=intent.time_in_force,
             status=OrderStatus.PENDING,
             submitted_at=datetime.now(_UTC),
+            account_id=intent.account_id,
         )
         logger.info(
             "Submitted IBKR order: %s %s %d @ %s",
@@ -153,21 +167,39 @@ class IBKRBrokerAdapter(BrokerAdapter):
 
     # ── Account ───────────────────────────────────────────────────────────────
 
-    async def get_account_equity(self) -> float:
+    async def get_account_equity(self, account_id: str = "default") -> float:
         ib = await self._conn.get()
-        vals = ib.accountValues()
+        ibkr_account = self._resolve_ibkr_account(account_id)
+        vals = ib.accountValues(ibkr_account) if ibkr_account else ib.accountValues()
         for v in vals:
             if v.tag == "NetLiquidation" and v.currency == "USD":
                 return float(v.value)
         return 0.0
 
-    async def get_positions(self) -> dict[str, int]:
+    async def get_positions(self, account_id: str = "default") -> dict[str, int]:
         ib = await self._conn.get()
+        ibkr_account = self._resolve_ibkr_account(account_id)
+        positions = ib.positions(ibkr_account) if ibkr_account else ib.positions()
         return {
             p.contract.symbol: int(p.position)
-            for p in ib.positions()
+            for p in positions
             if p.position != 0
         }
+
+    async def get_daily_pnl(self, account_id: str = "default") -> tuple[float, float]:
+        ib = await self._conn.get()
+        ibkr_account = self._resolve_ibkr_account(account_id)
+        vals = ib.accountValues(ibkr_account) if ibkr_account else ib.accountValues()
+        realized = 0.0
+        unrealized = 0.0
+        for v in vals:
+            if v.currency != "USD":
+                continue
+            if v.tag == "DailyPnL":
+                realized = float(v.value)
+            elif v.tag == "UnrealizedPnL":
+                unrealized = float(v.value)
+        return realized, unrealized
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 

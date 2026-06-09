@@ -73,12 +73,20 @@ class BrokerAdapter(ABC):
     # ── Account ───────────────────────────────────────────────────────────────
 
     @abstractmethod
-    async def get_account_equity(self) -> float:
-        """Return current account equity in USD."""
+    async def get_account_equity(self, account_id: str = "default") -> float:
+        """Return current equity in USD for the given logical account."""
 
     @abstractmethod
-    async def get_positions(self) -> dict[str, int]:
-        """Return {symbol: shares} for all open positions."""
+    async def get_positions(self, account_id: str = "default") -> dict[str, int]:
+        """Return {symbol: shares} for all open positions in the given logical account."""
+
+    @abstractmethod
+    async def get_daily_pnl(self, account_id: str = "default") -> tuple[float, float]:
+        """Return (realized_pnl, unrealized_pnl) for today from the broker.
+
+        Values are sourced directly from the broker's own P&L accounting, so
+        they include positions opened manually or in prior engine sessions.
+        """
 
     # ── Streaming callbacks ───────────────────────────────────────────────────
 

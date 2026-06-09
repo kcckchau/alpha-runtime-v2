@@ -278,9 +278,11 @@ class BootstrapEngine(BaseEngine):
                 IBKRLiveFeedAdapter(conn, self._settings.ibkr, self._registry.active())
             )
 
-        self._order.register_adapter(
-            IBKRBrokerAdapter(conn, self._settings.ibkr, self._registry)
-        )
+        ibkr_adapter = IBKRBrokerAdapter(conn, self._settings.ibkr, self._registry)
+        self._order.register_adapter(ibkr_adapter)
+        # Give the risk engine direct access to the broker adapter for P&L polling
+        if self._risk is not None:
+            self._risk.set_broker_adapter(ibkr_adapter)
         logger.info("IBKR adapters registered (paper=%s)", self._settings.ibkr.is_paper)
 
     async def _run_catchup(self) -> None:
@@ -677,10 +679,35 @@ class BootstrapEngine(BaseEngine):
         return [order.model_dump(mode="json") for order in self._order.get_open_orders()]
 
     def _serialize_risk(self) -> dict[str, Any]:
-        if self._risk is None or self._risk.daily_state is None:  # type: ignore[union-attr]
+        if self._risk is None:
             return {}
-        state = self._risk.daily_state  # type: ignore[union-attr]
-        return state.model_dump(mode="json")
+        result: dict[str, Any] = {}
+        for account_id, ctx in self._risk._accounts.items():  # type: ignore[union-attr]
+            s = ctx.state
+            # All monetary values cast to float so the frontend receives numbers, not strings.
+            # Pydantic serialises Decimal as string in JSON mode; we normalise here instead.
+            result[account_id] = {
+                "account_id": s.account_id,
+                "account_type": str(s.account_type),
+                "date": s.date,
+                "realized_pnl": float(s.realized_pnl),
+                "unrealized_pnl": float(s.unrealized_pnl),
+                "session_high_pnl": float(s.session_high_pnl),
+                "max_drawdown": float(s.max_drawdown),
+                "daily_loss_limit": float(s.daily_loss_limit),
+                "trades_taken": s.trades_taken,
+                "open_positions": s.open_positions,
+                "risk_consumed_pct": s.risk_consumed_pct,
+                "is_halted": s.is_halted,
+                "halt_reason": str(s.halt_reason) if s.halt_reason else None,
+                "halt_time": s.halt_time.isoformat() if s.halt_time else None,
+                # Config fields the UI needs for threshold bars
+                "account_size": float(ctx.config.account_size),
+                "profit_protect_activation": float(ctx.config.profit_protect_activation),
+                "profit_protect_giveback_pct": ctx.config.profit_protect_giveback_pct,
+                "kill_switch_flatten": ctx.config.kill_switch_flatten,
+            }
+        return result
 
     def _serialize_setup_contexts(self) -> dict[str, Any]:
         if self._setup is None:

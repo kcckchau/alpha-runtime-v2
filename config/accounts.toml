@@ -1,0 +1,24 @@
+# Per-account risk + kill-switch config
+# account_type: "day" | "swing"
+
+[[accounts]]
+account_id = "day_trade"
+account_type = "day"
+account_size = "25000.00"
+max_daily_loss_pct = 0.02
+max_position_risk_pct = 0.01
+max_open_positions = 5
+profit_protect_activation = "200.00"
+profit_protect_giveback_pct = 0.40
+kill_switch_flatten = true
+
+[[accounts]]
+account_id = "swing_trade"
+account_type = "swing"
+account_size = "50000.00"
+max_daily_loss_pct = 0.03
+max_position_risk_pct = 0.01
+max_open_positions = 3
+profit_protect_activation = "500.00"
+profit_protect_giveback_pct = 0.60
+kill_switch_flatten = false

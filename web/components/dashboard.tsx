@@ -110,13 +110,28 @@ type SetupRow = {
   conditions_missing: string[];
 };
 
-type RiskState = {
-  realized_pnl?: number | null;
-  unrealized_pnl?: number | null;
-  risk_consumed_pct?: number | null;
-  max_drawdown?: number | null;
-  is_halted?: boolean | null;
+type AccountRiskState = {
+  account_id: string;
+  account_type: string;           // "day" | "swing"
+  account_size: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  session_high_pnl: number;
+  daily_loss_limit: number;
+  risk_consumed_pct: number;
+  max_drawdown: number;
+  trades_taken: number;
+  open_positions: number;
+  is_halted: boolean;
+  halt_reason: string | null;
+  halt_time: string | null;
+  profit_protect_activation: number;
+  profit_protect_giveback_pct: number;
+  kill_switch_flatten: boolean;
 };
+
+// Keyed by account_id
+type RiskData = Record<string, AccountRiskState>;
 
 type SetupHistoryEntry = {
   setup_id: string;
@@ -1249,58 +1264,243 @@ function MarketStatePanel({
   );
 }
 
-function RiskPanel({ risk }: { risk: RiskState | null }) {
-  const isHalted = risk?.is_halted ?? false;
-  const pnl = risk?.realized_pnl;
-  const unreal = risk?.unrealized_pnl;
-  const riskUsed = risk?.risk_consumed_pct;
-  const drawdown = risk?.max_drawdown;
+function RiskPanel({ risk }: { risk: RiskData | null }) {
+  // Derive a single summary across all accounts for the sidebar
+  // Guard against old flat-format snapshots which produce primitive values
+  const accounts = Object.values(risk ?? {}).filter(isAccountRiskState);
+  const anyHalted = accounts.some((a) => a.is_halted);
+  const totalPnl = accounts.length > 0
+    ? accounts.reduce((sum, a) => sum + a.realized_pnl, 0)
+    : null;
+  const totalUnreal = accounts.length > 0
+    ? accounts.reduce((sum, a) => sum + a.unrealized_pnl, 0)
+    : null;
+  const worstRiskUsed = accounts.length > 0
+    ? Math.max(...accounts.map((a) => a.risk_consumed_pct))
+    : null;
+  const haltedAccounts = accounts.filter((a) => a.is_halted).map((a) => a.account_id.toUpperCase());
 
   return (
     <div style={S.panel}>
       <div style={S.panelHd}>
         <span style={S.panelLbl}>Risk</span>
+        {accounts.length > 1 && (
+          <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.3)" }}>
+            {accounts.length} accounts
+          </span>
+        )}
       </div>
       <div style={{ padding: "4px 12px 8px" }}>
         <MsRow
-          label="Real P&L"
-          value={pnl != null ? formatPnl(pnl) : "—"}
-          valueColor={pnl != null ? (pnl >= 0 ? "#22c55e" : "#ef4444") : undefined}
+          label="Total P&L"
+          value={totalPnl != null ? formatPnl(totalPnl) : "—"}
+          valueColor={totalPnl != null ? (totalPnl >= 0 ? "#22c55e" : "#ef4444") : undefined}
         />
         <MsRow
           label="Unreal"
-          value={unreal != null ? formatPnl(unreal) : "—"}
-          valueColor={unreal != null ? (unreal >= 0 ? "#22c55e" : "#fbbf24") : undefined}
+          value={totalUnreal != null ? formatPnl(totalUnreal) : "—"}
+          valueColor={totalUnreal != null ? (totalUnreal >= 0 ? "#22c55e" : "#fbbf24") : undefined}
         />
         <MsRow
           label="Risk used"
-          value={riskUsed != null ? `${(riskUsed * 100).toFixed(0)}%` : "—"}
-          valueColor={riskUsed != null && riskUsed > 0.7 ? "#ef4444" : "#fbbf24"}
-        />
-        <MsRow
-          label="Drawdown"
-          value={drawdown != null ? formatPnl(drawdown) : "—"}
-          valueColor="#ef4444"
+          value={worstRiskUsed != null ? `${(worstRiskUsed * 100).toFixed(0)}%` : "—"}
+          valueColor={worstRiskUsed != null && worstRiskUsed > 0.7 ? "#ef4444" : "#fbbf24"}
           last
         />
         <div
           style={{
             marginTop: 8, display: "flex", alignItems: "center", gap: 5, padding: "5px 8px",
-            background: isHalted ? "rgba(239,68,68,0.07)" : "rgba(34,197,94,0.07)",
-            border: `0.5px solid ${isHalted ? "rgba(239,68,68,0.25)" : "rgba(34,197,94,0.25)"}`,
+            background: anyHalted ? "rgba(239,68,68,0.07)" : "rgba(34,197,94,0.07)",
+            border: `0.5px solid ${anyHalted ? "rgba(239,68,68,0.25)" : "rgba(34,197,94,0.25)"}`,
             borderRadius: 5,
           }}
         >
-          <span
-            style={{
-              ...S.mono, fontSize: 10, fontWeight: 500, letterSpacing: "0.05em",
-              color: isHalted ? "#ef4444" : "#22c55e",
-            }}
-          >
-            {isHalted ? "RISK HALTED" : "TRADING ACTIVE"}
+          <span style={{ ...S.mono, fontSize: 10, fontWeight: 500, letterSpacing: "0.05em", color: anyHalted ? "#ef4444" : "#22c55e" }}>
+            {anyHalted ? `HALTED · ${haltedAccounts.join(", ")}` : "TRADING ACTIVE"}
           </span>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ─── Account P&L bar (below chart) ───────────────────────────────────────────
+
+function haltReasonLabel(reason: string | null): string {
+  if (!reason) return "—";
+  if (reason === "daily_loss_limit") return "LOSS LIMIT";
+  if (reason === "profit_protection") return "PROFIT PROTECT";
+  if (reason === "manual") return "MANUAL";
+  return reason.toUpperCase();
+}
+
+function isAccountRiskState(v: unknown): v is AccountRiskState {
+  return typeof v === "object" && v !== null && "account_id" in v && "is_halted" in v;
+}
+
+function AccountPnlBar({ risk }: { risk: RiskData | null }) {
+  // Guard against old flat-format snapshots (pre-migration) which produce primitive values
+  const accounts = Object.values(risk ?? {}).filter(isAccountRiskState);
+  if (accounts.length === 0) return null;
+
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: `repeat(${accounts.length}, 1fr)`,
+        borderTop: "0.5px solid rgba(255,255,255,0.06)",
+      }}
+    >
+      {accounts.map((acct, idx) => {
+        const isHalted = acct.is_halted;
+        const pnl = acct.realized_pnl;
+        const high = acct.session_high_pnl;
+        const limit = acct.daily_loss_limit;
+        const pctUsed = acct.risk_consumed_pct;          // 0–1 fraction of limit consumed
+        const activation = acct.profit_protect_activation;
+        const givebackPct = acct.profit_protect_giveback_pct;
+        const openPos = acct.open_positions;
+        const trades = acct.trades_taken;
+
+        const pnlColor = isHalted ? "#ef4444" : pnl > 0 ? "#22c55e" : pnl < 0 ? "#ef4444" : "rgba(255,255,255,0.5)";
+        const typeLabel = (acct.account_type ?? "unknown").toUpperCase();
+
+        // Profit protection progress: how far we are toward triggering
+        // protection activates when session_high >= activation
+        // inside that region, giveback allowed = high * givebackPct
+        // current giveback = high - pnl
+        const protectionActive = high >= activation && high > 0;
+        const maxGiveback = high * givebackPct;
+        const currentGiveback = Math.max(0, high - pnl);
+        const givebackFraction = protectionActive && maxGiveback > 0
+          ? Math.min(1, currentGiveback / maxGiveback)
+          : 0;
+        const givebackColor = givebackFraction > 0.8 ? "#ef4444" : givebackFraction > 0.5 ? "#fbbf24" : "#22c55e";
+
+        // Daily loss bar — fills red as you approach the limit
+        const lossBarFraction = Math.min(1, pctUsed);
+        const lossBarColor = lossBarFraction > 0.7 ? "#ef4444" : lossBarFraction > 0.4 ? "#fbbf24" : "#22c55e";
+
+        return (
+          <div
+            key={acct.account_id}
+            style={{
+              padding: "10px 14px",
+              borderRight: idx < accounts.length - 1 ? "0.5px solid rgba(255,255,255,0.06)" : "none",
+              background: isHalted ? "rgba(239,68,68,0.04)" : "transparent",
+            }}
+          >
+            {/* Header row: account label + halt badge */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span
+                  style={{
+                    ...S.mono, fontSize: 9, fontWeight: 600, letterSpacing: "0.1em",
+                    padding: "2px 6px", borderRadius: 3,
+                    background: acct.account_type === "day" ? "rgba(96,165,250,0.12)" : "rgba(251,191,36,0.12)",
+                    color: acct.account_type === "day" ? "#60a5fa" : "#fbbf24",
+                    border: `0.5px solid ${acct.account_type === "day" ? "rgba(96,165,250,0.3)" : "rgba(251,191,36,0.3)"}`,
+                  }}
+                >
+                  {typeLabel}
+                </span>
+                <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.35)" }}>
+                  {acct.account_id}
+                </span>
+              </div>
+              <div
+                style={{
+                  display: "flex", alignItems: "center", gap: 4,
+                  padding: "2px 7px", borderRadius: 100,
+                  background: isHalted ? "rgba(239,68,68,0.12)" : "rgba(34,197,94,0.08)",
+                  border: `0.5px solid ${isHalted ? "rgba(239,68,68,0.35)" : "rgba(34,197,94,0.25)"}`,
+                }}
+              >
+                <span style={{ width: 5, height: 5, borderRadius: "50%", background: isHalted ? "#ef4444" : "#22c55e", display: "inline-block" }} />
+                <span style={{ ...S.mono, fontSize: 9, fontWeight: 600, letterSpacing: "0.06em", color: isHalted ? "#ef4444" : "#22c55e" }}>
+                  {isHalted ? haltReasonLabel(acct.halt_reason) : "ACTIVE"}
+                </span>
+              </div>
+            </div>
+
+            {/* P&L + session high row */}
+            <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 6 }}>
+              <span style={{ ...S.mono, fontSize: 22, fontWeight: 600, color: pnlColor, letterSpacing: "-0.01em" }}>
+                {formatPnl(pnl)}
+              </span>
+              {high > 0 && (
+                <span style={{ ...S.mono, fontSize: 11, color: "rgba(255,255,255,0.3)" }}>
+                  HIGH <span style={{ color: "#22c55e" }}>{formatPnl(high)}</span>
+                </span>
+              )}
+            </div>
+
+            {/* Stats row */}
+            <div style={{ display: "flex", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
+              <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.35)" }}>
+                LIMIT <span style={{ color: "#ef4444" }}>−{formatPnl(limit)}</span>
+              </span>
+              <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.35)" }}>
+                POS <span style={{ color: "rgba(255,255,255,0.7)" }}>{openPos}</span>
+              </span>
+              <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.35)" }}>
+                TRADES <span style={{ color: "rgba(255,255,255,0.7)" }}>{trades}</span>
+              </span>
+            </div>
+
+            {/* Daily loss bar */}
+            <div style={{ marginBottom: protectionActive ? 6 : 0 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.3)", letterSpacing: "0.08em" }}>
+                  DAILY LOSS
+                </span>
+                <span style={{ ...S.mono, fontSize: 9, color: lossBarFraction > 0.5 ? lossBarColor : "rgba(255,255,255,0.3)" }}>
+                  {(lossBarFraction * 100).toFixed(0)}%
+                </span>
+              </div>
+              <div style={{ height: 4, background: "rgba(255,255,255,0.06)", borderRadius: 2, overflow: "hidden" }}>
+                <div
+                  style={{
+                    height: "100%",
+                    width: `${lossBarFraction * 100}%`,
+                    background: lossBarColor,
+                    borderRadius: 2,
+                    transition: "width 0.4s ease",
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Profit protection bar — only shown once high-water mark passes activation */}
+            {protectionActive && (
+              <div>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3, marginTop: 6 }}>
+                  <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.3)", letterSpacing: "0.08em" }}>
+                    PROFIT PROTECT
+                  </span>
+                  <span style={{ ...S.mono, fontSize: 9, color: givebackFraction > 0.5 ? givebackColor : "rgba(255,255,255,0.3)" }}>
+                    {(givebackFraction * 100).toFixed(0)}% giveback
+                  </span>
+                </div>
+                <div style={{ height: 4, background: "rgba(255,255,255,0.06)", borderRadius: 2, overflow: "hidden" }}>
+                  <div
+                    style={{
+                      height: "100%",
+                      width: `${givebackFraction * 100}%`,
+                      background: givebackColor,
+                      borderRadius: 2,
+                      transition: "width 0.4s ease",
+                    }}
+                  />
+                </div>
+                <div style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.2)", marginTop: 3 }}>
+                  max giveback {formatPnl(maxGiveback)} of {formatPnl(high)}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -1340,7 +1540,7 @@ export function Dashboard() {
   const [setups, setSetups] = useState<SetupRow[]>([]);
   const [setupContexts, setSetupContexts] = useState<Record<string, SetupSessionContext | null>>({});
   const [prevSetupContexts, setPrevSetupContexts] = useState<Record<string, SetupSessionContext | null>>({});
-  const [riskState, setRiskState] = useState<RiskState | null>(null);
+  const [riskState, setRiskState] = useState<RiskData | null>(null);
   const [clock, setClock] = useState("--:--:-- ET");
   const [error, setError] = useState<string | null>(null);
   // Backfill state
@@ -1459,7 +1659,7 @@ export function Dashboard() {
 
         const riskData = isHistorical
           ? null
-          : await fetchJson<RiskState>(`/runtime/risk?symbol=${symbol}`).catch(() => null);
+          : await fetchJson<RiskData>(`/runtime/risk?symbol=${symbol}`).catch(() => null);
 
         if (cancelled) return;
 
@@ -2232,6 +2432,9 @@ export function Dashboard() {
               </span>
             </div>
           )}
+
+          {/* Per-account P&L — sits inside the chart panel, always visible */}
+          <AccountPnlBar risk={riskState} />
         </div>
 
         {/* Sidebar */}

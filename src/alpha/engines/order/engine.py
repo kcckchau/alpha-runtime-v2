@@ -24,7 +24,7 @@ from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.engines.order.adapters.base import BrokerAdapter
-from alpha.models.enums import EventType, HealthStatus, OrderStatus, OrderType, TimeInForce
+from alpha.models.enums import EventType, HealthStatus, OrderSide, OrderStatus, OrderType, TimeInForce
 from alpha.models.events import AnyEvent, OrderUpdateEvent
 from alpha.models.order import Execution, Order, OrderIntent
 from alpha.models.risk import TradePlan
@@ -139,6 +139,43 @@ class OrderEngine(BaseEngine):
     def get_open_orders(self) -> list[Order]:
         return [o for o in self._orders.values() if not o.is_terminal]
 
+    async def submit_close_order(
+        self,
+        account_id: str,
+        symbol: str,
+        side: OrderSide,
+        quantity: int,
+    ) -> Order | None:
+        """Submit a market order to close a position (used by kill switch flatten)."""
+        intent = OrderIntent(
+            intent_id=uuid4(),
+            plan_id=uuid4(),       # synthetic plan_id — no TradePlan for forced close
+            symbol=symbol,
+            side=side,
+            order_type=OrderType.MARKET,
+            quantity=quantity,
+            time_in_force=TimeInForce.DAY,
+            created_at=datetime.now(timezone.utc),
+            account_id=account_id,
+            notes="kill_switch_flatten",
+        )
+        try:
+            order = await self.primary_adapter.submit_order(intent)
+            self._orders[order.order_id] = order
+            self._orders_submitted += 1
+            await self._emit_update(order)
+            logger.info(
+                "Close order submitted: %s %s qty=%d account=%s [flatten]",
+                side, symbol, quantity, account_id,
+            )
+            return order
+        except Exception:
+            logger.exception(
+                "Close order submission failed: %s %s qty=%d account=%s",
+                side, symbol, quantity, account_id,
+            )
+            return None
+
     # ── Callbacks from adapter ────────────────────────────────────────────────
 
     async def _on_order_update(self, updated: Order) -> None:
@@ -169,6 +206,7 @@ class OrderEngine(BaseEngine):
             stop_price=plan.stop_price,
             time_in_force=TimeInForce.DAY,
             created_at=datetime.now(timezone.utc),
+            account_id=plan.account_id,
         )
 
     async def _emit_update(self, order: Order) -> None:
@@ -182,6 +220,8 @@ class OrderEngine(BaseEngine):
             filled_quantity=order.filled_quantity,
             avg_fill_price=order.avg_fill_price,
             reject_reason=order.reject_reason,
+            account_id=order.account_id,
+            side=order.side,
         )
         await self._event_bus.publish(event)
 

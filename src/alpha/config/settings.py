@@ -10,14 +10,18 @@ An .env file is loaded automatically when present.
 
 from __future__ import annotations
 
+import json
+import tomllib
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from typing import Any, Self
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from alpha.models.enums import DataSourceId, RuntimeMode
+from alpha.models.risk import AccountConfig
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -113,6 +117,9 @@ class IBKRSettings(BaseSettings):
     what_to_show: str = "TRADES"
     pacing_delay: float = 10.0  # seconds between historical requests (avoid pacing violations)
     is_paper: bool = True       # flip to False when routing real orders
+    # Maps logical account_id → IBKR account string (e.g. {"day_trade": "U1234567"}).
+    # If empty, orders are routed to the default IBKR account.
+    account_map: dict[str, str] = Field(default_factory=dict)
 
 
 class AlpacaSettings(BaseSettings):
@@ -128,11 +135,51 @@ class PolygonSettings(BaseSettings):
 
 
 class RiskSettings(BaseSettings):
+    # Legacy scalar fields — used when no accounts file / RISK__ACCOUNTS is set
     account_size: Decimal = Decimal("25000.00")
-    max_daily_loss_pct: float = 0.02     # 2%
-    max_position_risk_pct: float = 0.01  # 1% per trade
+    max_daily_loss_pct: float = 0.02
+    max_position_risk_pct: float = 0.01
     max_open_positions: int = 5
     default_stop_atr_multiple: float = 1.5
+
+    # Logical account that receives new trade plans (must match an account_id in accounts)
+    default_account_id: str = "day_trade"
+
+    # Readable per-account config (preferred over RISK__ACCOUNTS JSON in .env)
+    accounts_file: Path = Path("config/accounts.toml")
+
+    # Optional JSON override — only used when accounts file is missing / empty
+    accounts: list[AccountConfig] = Field(default_factory=list)
+
+    @field_validator("accounts", mode="before")
+    @classmethod
+    def coerce_accounts(cls, v: Any) -> Any:
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            v = json.loads(v)
+        if not isinstance(v, list):
+            return v
+        return [
+            AccountConfig.model_validate(item) if isinstance(item, dict) else item
+            for item in v
+        ]
+
+    @model_validator(mode="after")
+    def load_accounts_from_file(self) -> Self:
+        if self.accounts:
+            return self
+        path = self.accounts_file
+        if not path.is_absolute():
+            path = _REPO_ROOT / path
+        if not path.is_file():
+            return self
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        raw = data.get("accounts", [])
+        if not raw:
+            return self
+        self.accounts = [AccountConfig.model_validate(item) for item in raw]
+        return self
 
 
 class ReplaySettings(BaseSettings):

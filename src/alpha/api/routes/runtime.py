@@ -165,11 +165,15 @@ async def list_active_setups(symbol: str | None = None) -> list[dict]:  # type: 
 
 @router.get("/risk")
 async def get_risk_state(symbol: str | None = None) -> dict[str, Any]:
-    """Return the current daily risk state (P&L, drawdown, halt status)."""
+    """Return per-account daily risk state (P&L, kill switch, thresholds).
+
+    Returns a dict keyed by account_id, each value containing both live state
+    (realized_pnl, session_high_pnl, is_halted, …) and static config
+    (daily_loss_limit, profit_protect_activation, profit_protect_giveback_pct).
+    Symbol param is reserved for future per-symbol risk filtering.
+    """
     snapshot = _snapshot_or_default()
-    risk = snapshot.get("risk") or {}
-    # symbol param reserved for per-symbol risk in future; currently one global state
-    return risk
+    return snapshot.get("risk") or {}
 
 
 @router.get("/setup-contexts")

@@ -25,6 +25,7 @@ class OrderIntent(BaseModel):
     stop_price: Decimal | None = None
     time_in_force: TimeInForce = TimeInForce.DAY
     created_at: datetime
+    account_id: str = "default"
     notes: str = ""
 
 
@@ -38,6 +39,7 @@ class Order(BaseModel):
     side: OrderSide
     order_type: OrderType
     quantity: int
+    account_id: str = "default"
     filled_quantity: int = 0
     avg_fill_price: Decimal | None = None
     limit_price: Decimal | None = None
@@ -78,3 +80,4 @@ class Execution(BaseModel):
     price: Decimal
     commission: Decimal = Decimal("0")
     timestamp: datetime
+    account_id: str = "default"

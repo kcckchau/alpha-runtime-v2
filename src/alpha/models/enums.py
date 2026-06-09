@@ -203,3 +203,14 @@ class HealthStatus(StrEnum):
     HEALTHY = "healthy"
     DEGRADED = "degraded"
     UNHEALTHY = "unhealthy"
+
+
+class AccountType(StrEnum):
+    DAY = "day"
+    SWING = "swing"
+
+
+class KillSwitchReason(StrEnum):
+    DAILY_LOSS_LIMIT = "daily_loss_limit"
+    PROFIT_PROTECTION = "profit_protection"
+    MANUAL = "manual"

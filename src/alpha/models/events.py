@@ -18,6 +18,7 @@ from alpha.models.enums import (
     BarTimeframe,
     DataSourceId,
     EventType,
+    OrderSide,
     OrderStatus,
     ORBState,
     SetupState,
@@ -128,6 +129,8 @@ class OrderUpdateEvent(BaseEvent):
     filled_quantity: int = 0
     avg_fill_price: Decimal | None = None
     reject_reason: str | None = None
+    account_id: str = "default"
+    side: OrderSide | None = None
 
 
 class SystemEvent(BaseEvent):

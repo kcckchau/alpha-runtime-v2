@@ -3,15 +3,17 @@ Engine 8 — Risk Engine
 
 Responsibilities:
   - Subscribe to SetupEvent (TRIGGERED state)
-  - Validate setup against daily risk limits before generating a plan
+  - Route each setup to the correct account based on setup type
+  - Validate setup against per-account daily risk limits before generating a plan
   - Compute position size based on entry/stop distance and account risk %
   - Calculate stop, target, and risk/reward ratio
-  - Emit a TradePlan if the risk check passes
-  - Track daily P&L and halt trading if daily loss limit is hit
+  - Track per-account P&L via OrderUpdateEvent fills
+  - Trigger kill switch when either:
+      1. Daily loss floor is breached (hard floor)
+      2. Giveback from session high-water mark exceeds profit-protect threshold
 
-Input:  SetupEvent (TRIGGERED)
-Output: TradePlan → forwarded to OrderEngine (not via EventBus — direct call
-        or optional signal event)
+Input:  SetupEvent (TRIGGERED), OrderUpdateEvent (FILLED)
+Output: TradePlan → forwarded to OrderEngine (direct call)
 
 The Risk Engine is the last gate before an order is generated.
 If it rejects a setup, no order is ever created.
@@ -19,7 +21,9 @@ If it rejects a setup, no order is ever created.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import uuid4
@@ -27,9 +31,17 @@ from uuid import uuid4
 from alpha.config.settings import AlphaSettings
 from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
-from alpha.models.enums import EventType, HealthStatus, OrderSide, SetupState
-from alpha.models.events import AnyEvent, SetupEvent
-from alpha.models.risk import DailyRiskState, TradePlan
+from alpha.models.enums import (
+    AccountType,
+    EventType,
+    HealthStatus,
+    KillSwitchReason,
+    OrderSide,
+    OrderStatus,
+    SetupState,
+)
+from alpha.models.events import AnyEvent, OrderUpdateEvent, SetupEvent
+from alpha.models.risk import AccountConfig, DailyRiskState, TradePlan
 from alpha.models.setup import Setup
 
 logger = logging.getLogger(__name__)
@@ -39,10 +51,34 @@ class RiskViolation(Exception):
     pass
 
 
+# ── Per-symbol position tracking for P&L computation ─────────────────────────
+
+@dataclass
+class _PositionEntry:
+    """Tracks the cost basis of an open position."""
+    qty: int
+    avg_price: Decimal
+    side: OrderSide  # ENTRY side: BUY = long, SELL = short
+
+
+@dataclass
+class _AccountRiskContext:
+    """Bundles account config + live state + position book."""
+    config: AccountConfig
+    state: DailyRiskState
+    positions: dict[str, _PositionEntry] = field(default_factory=dict)
+
+
+# ── Engine ────────────────────────────────────────────────────────────────────
+
 class RiskEngine(BaseEngine):
     """
-    Validates setups against risk rules and produces sized TradePlans.
+    Validates setups against per-account risk rules and produces sized TradePlans.
+    Tracks fills to maintain live P&L and triggers kill switch when limits are hit.
     """
+
+    # How often to sync P&L from the broker (seconds)
+    _BROKER_SYNC_INTERVAL = 30
 
     def __init__(self, settings: AlphaSettings, event_bus: EventBus) -> None:
         super().__init__()
@@ -50,9 +86,12 @@ class RiskEngine(BaseEngine):
         self._event_bus = event_bus
         self._setup_engine: object | None = None
         self._order_engine: object | None = None
-        self._daily_state: DailyRiskState | None = None
+        self._broker_adapter: object | None = None
+        # account_id → context
+        self._accounts: dict[str, _AccountRiskContext] = {}
         self._plans_generated: int = 0
         self._plans_rejected: int = 0
+        self._sync_task: asyncio.Task | None = None
 
     @property
     def name(self) -> str:
@@ -64,39 +103,71 @@ class RiskEngine(BaseEngine):
     def set_order_engine(self, engine: object) -> None:
         self._order_engine = engine
 
+    def set_broker_adapter(self, adapter: object) -> None:
+        """Wire the broker adapter so P&L can be polled directly."""
+        self._broker_adapter = adapter
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def _on_initialize(self) -> None:
-        self._reset_daily_state()
+        self._build_account_contexts()
 
     async def _on_start(self) -> None:
         self._event_bus.subscribe(EventType.SETUP, self._handle_setup)
         self._event_bus.subscribe(EventType.ORDER_UPDATE, self._handle_order_update)
+        # Seed P&L immediately from broker, then poll periodically
+        await self._sync_broker_pnl()
+        self._sync_task = asyncio.create_task(self._broker_sync_loop())
 
     async def _on_stop(self) -> None:
-        pass
+        if self._sync_task:
+            self._sync_task.cancel()
 
     async def _health_check(self) -> EngineHealth:
-        halted = self._daily_state.is_halted if self._daily_state else False
+        halted_accounts = [
+            aid for aid, ctx in self._accounts.items() if ctx.state.is_halted
+        ]
+        status = HealthStatus.DEGRADED if halted_accounts else HealthStatus.HEALTHY
         return EngineHealth(
-            HealthStatus.DEGRADED if halted else HealthStatus.HEALTHY,
+            status,
             self.name,
             {
                 "plans_generated": self._plans_generated,
                 "plans_rejected": self._plans_rejected,
-                "daily_halted": halted,
+                "halted_accounts": halted_accounts,
+                "account_states": {
+                    aid: {
+                        "type": ctx.config.account_type,
+                        "realized_pnl": float(ctx.state.realized_pnl),
+                        "session_high_pnl": float(ctx.state.session_high_pnl),
+                        "daily_loss_limit": float(ctx.state.daily_loss_limit),
+                        "is_halted": ctx.state.is_halted,
+                        "halt_reason": ctx.state.halt_reason,
+                    }
+                    for aid, ctx in self._accounts.items()
+                },
             },
         )
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    @property
-    def daily_state(self) -> DailyRiskState | None:
-        return self._daily_state
+    def daily_state(self, account_id: str = "default") -> DailyRiskState | None:
+        ctx = self._accounts.get(account_id)
+        return ctx.state if ctx else None
+
+    def all_daily_states(self) -> dict[str, DailyRiskState]:
+        return {aid: ctx.state for aid, ctx in self._accounts.items()}
 
     @property
     def is_halted(self) -> bool:
-        return self._daily_state.is_halted if self._daily_state else False
+        """True if ALL configured accounts are halted."""
+        return bool(self._accounts) and all(
+            ctx.state.is_halted for ctx in self._accounts.values()
+        )
+
+    def is_account_halted(self, account_id: str) -> bool:
+        ctx = self._accounts.get(account_id)
+        return ctx.state.is_halted if ctx else False
 
     # ── Handlers ──────────────────────────────────────────────────────────────
 
@@ -105,20 +176,36 @@ class RiskEngine(BaseEngine):
             return
         if event.setup_state != SetupState.TRIGGERED:
             return
-        if self.is_halted:
-            logger.warning("Risk halt active — rejecting setup %s", event.setup_id)
-            return
 
         setup = self._get_setup(event.symbol, event.setup_id)
         if setup is None:
             return
 
+        account_id = self._settings.risk.default_account_id
+        ctx = self._accounts.get(account_id)
+        if ctx is None:
+            logger.warning(
+                "No account configured for id=%s — rejecting %s",
+                account_id, event.setup_id,
+            )
+            self._plans_rejected += 1
+            return
+
+        if ctx.state.is_halted:
+            logger.warning(
+                "Kill switch active on %s (%s) — rejecting setup %s",
+                ctx.config.account_id, ctx.state.halt_reason, event.setup_id,
+            )
+            self._plans_rejected += 1
+            return
+
         try:
-            plan = self._evaluate(setup)
+            plan = self._evaluate(setup, ctx)
             self._plans_generated += 1
             logger.info(
-                "TradePlan generated: %s %s size=%d R:R=%.2f",
-                plan.symbol, plan.side, plan.position_size, plan.risk_reward_ratio,
+                "TradePlan generated: %s %s size=%d R:R=%.2f account=%s",
+                plan.symbol, plan.side, plan.position_size,
+                plan.risk_reward_ratio, plan.account_id,
             )
             await self._forward_plan(plan)
         except RiskViolation as exc:
@@ -126,14 +213,227 @@ class RiskEngine(BaseEngine):
             logger.info("Setup rejected by risk: %s — %s", event.setup_id, exc)
 
     async def _handle_order_update(self, event: AnyEvent) -> None:
-        # TODO: update realized P&L on fills
-        pass
+        if not isinstance(event, OrderUpdateEvent):
+            return
+        if event.order_status != OrderStatus.FILLED:
+            return
+        if event.avg_fill_price is None or event.side is None:
+            return
+
+        ctx = self._accounts.get(event.account_id)
+        if ctx is None:
+            return
+
+        realized_delta = self._apply_fill(
+            ctx,
+            symbol=event.symbol,
+            side=event.side,
+            qty=event.filled_quantity,
+            fill_price=event.avg_fill_price,
+        )
+
+        if realized_delta != Decimal("0"):
+            ctx.state.realized_pnl += realized_delta
+            ctx.state.trades_taken += 1
+            ctx.state.risk_consumed_pct = float(
+                abs(ctx.state.realized_pnl) / ctx.state.daily_loss_limit
+            ) if ctx.state.daily_loss_limit else 0.0
+            logger.debug(
+                "P&L update [%s]: realized_delta=%s total_realized=%s",
+                event.account_id, realized_delta, ctx.state.realized_pnl,
+            )
+
+        # Update high-water mark
+        current_pnl = ctx.state.current_pnl
+        if current_pnl > ctx.state.session_high_pnl:
+            ctx.state.session_high_pnl = current_pnl
+
+        # Check kill switch triggers
+        reason = self._check_kill_switch(ctx)
+        if reason is not None and not ctx.state.is_halted:
+            await self._trigger_halt(ctx, reason)
+
+    # ── Broker P&L sync ───────────────────────────────────────────────────────
+
+    async def _broker_sync_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._BROKER_SYNC_INTERVAL)
+            await self._sync_broker_pnl()
+
+    async def _sync_broker_pnl(self) -> None:
+        """
+        Pull realized + unrealized P&L directly from the broker for each account.
+        This ensures positions opened manually or before the engine started are
+        reflected correctly, without depending on fill events flowing through us.
+        """
+        from alpha.engines.order.adapters.base import BrokerAdapter
+        adapter = self._broker_adapter
+        if not isinstance(adapter, BrokerAdapter):
+            return
+        if not adapter.is_connected:
+            return
+
+        for account_id, ctx in self._accounts.items():
+            try:
+                realized, unrealized = await adapter.get_daily_pnl(account_id)
+                ctx.state.realized_pnl = Decimal(str(round(realized, 2)))
+                ctx.state.unrealized_pnl = Decimal(str(round(unrealized, 2)))
+                ctx.state.risk_consumed_pct = float(
+                    abs(ctx.state.realized_pnl) / ctx.state.daily_loss_limit
+                ) if ctx.state.daily_loss_limit else 0.0
+
+                # Keep high-water mark updated
+                current_pnl = ctx.state.current_pnl
+                if current_pnl > ctx.state.session_high_pnl:
+                    ctx.state.session_high_pnl = current_pnl
+
+                logger.debug(
+                    "Broker P&L sync [%s]: realized=%s unrealized=%s",
+                    account_id, ctx.state.realized_pnl, ctx.state.unrealized_pnl,
+                )
+
+                # Check kill switch after each sync
+                reason = self._check_kill_switch(ctx)
+                if reason is not None and not ctx.state.is_halted:
+                    await self._trigger_halt(ctx, reason)
+
+            except Exception:
+                logger.warning(
+                    "Broker P&L sync failed for account %s", account_id, exc_info=True
+                )
+
+    # ── Position book + P&L ───────────────────────────────────────────────────
+
+    def _apply_fill(
+        self,
+        ctx: _AccountRiskContext,
+        symbol: str,
+        side: OrderSide,
+        qty: int,
+        fill_price: Decimal,
+    ) -> Decimal:
+        """
+        Update the position book and return the realized P&L delta for this fill.
+        Returns Decimal("0") for pure entry fills.
+        """
+        pos = ctx.positions.get(symbol)
+
+        if pos is None:
+            # Opening a new position
+            ctx.positions[symbol] = _PositionEntry(qty=qty, avg_price=fill_price, side=side)
+            ctx.state.open_positions += 1
+            return Decimal("0")
+
+        # Determine if this fill is closing/reducing an existing position
+        is_closing = (pos.side == OrderSide.BUY and side == OrderSide.SELL) or \
+                     (pos.side == OrderSide.SELL and side == OrderSide.BUY)
+
+        if is_closing:
+            close_qty = min(qty, pos.qty)
+            if pos.side == OrderSide.BUY:
+                realized = (fill_price - pos.avg_price) * close_qty
+            else:
+                realized = (pos.avg_price - fill_price) * close_qty
+
+            remaining = pos.qty - close_qty
+            if remaining <= 0:
+                del ctx.positions[symbol]
+                ctx.state.open_positions = max(0, ctx.state.open_positions - 1)
+            else:
+                ctx.positions[symbol] = _PositionEntry(
+                    qty=remaining, avg_price=pos.avg_price, side=pos.side
+                )
+            return realized
+
+        # Adding to existing position — update average price
+        total_cost = pos.avg_price * pos.qty + fill_price * qty
+        new_qty = pos.qty + qty
+        ctx.positions[symbol] = _PositionEntry(
+            qty=new_qty,
+            avg_price=total_cost / new_qty,
+            side=pos.side,
+        )
+        return Decimal("0")
+
+    # ── Kill switch ───────────────────────────────────────────────────────────
+
+    def _check_kill_switch(self, ctx: _AccountRiskContext) -> KillSwitchReason | None:
+        """
+        Returns a KillSwitchReason if either trigger is met, else None.
+
+        Trigger 1 — Hard loss floor:
+          current_pnl <= -(daily_loss_limit)
+
+        Trigger 2 — Profit protection (trailing stop on daily P&L):
+          Only activates once session_high_pnl >= profit_protect_activation.
+          Halts when giveback from peak >= peak * profit_protect_giveback_pct.
+        """
+        current_pnl = ctx.state.current_pnl
+
+        # Trigger 1: hard floor
+        if current_pnl <= -ctx.state.daily_loss_limit:
+            return KillSwitchReason.DAILY_LOSS_LIMIT
+
+        # Trigger 2: profit protection
+        cfg = ctx.config
+        if ctx.state.session_high_pnl >= cfg.profit_protect_activation:
+            giveback = ctx.state.session_high_pnl - current_pnl
+            max_giveback = ctx.state.session_high_pnl * Decimal(
+                str(cfg.profit_protect_giveback_pct)
+            )
+            if giveback >= max_giveback:
+                return KillSwitchReason.PROFIT_PROTECTION
+
+        return None
+
+    async def _trigger_halt(
+        self, ctx: _AccountRiskContext, reason: KillSwitchReason
+    ) -> None:
+        ctx.state.is_halted = True
+        ctx.state.halt_reason = reason
+        ctx.state.halt_time = datetime.now(timezone.utc)
+        logger.warning(
+            "KILL SWITCH TRIGGERED — account=%s reason=%s "
+            "realized_pnl=%s session_high=%s daily_limit=%s",
+            ctx.config.account_id, reason,
+            ctx.state.realized_pnl,
+            ctx.state.session_high_pnl,
+            ctx.state.daily_loss_limit,
+        )
+        if ctx.config.kill_switch_flatten:
+            await self._flatten_account(ctx)
+
+    async def _flatten_account(self, ctx: _AccountRiskContext) -> None:
+        """Cancel open orders and close all positions for this account."""
+        from alpha.engines.order.engine import OrderEngine
+        if not isinstance(self._order_engine, OrderEngine):
+            return
+
+        # Cancel all open orders for this account
+        for order in self._order_engine.get_open_orders():
+            if order.account_id == ctx.config.account_id and order.broker_order_id:
+                cancelled = await self._order_engine.cancel_order(order.order_id)
+                if cancelled:
+                    logger.info("Cancelled order %s during flatten", order.order_id)
+
+        # Close all tracked positions with market orders
+        for symbol, pos in list(ctx.positions.items()):
+            close_side = OrderSide.SELL if pos.side == OrderSide.BUY else OrderSide.BUY
+            await self._order_engine.submit_close_order(
+                account_id=ctx.config.account_id,
+                symbol=symbol,
+                side=close_side,
+                quantity=pos.qty,
+            )
+            logger.info(
+                "Flatten: submitted close order %s %s qty=%d account=%s",
+                close_side, symbol, pos.qty, ctx.config.account_id,
+            )
 
     # ── Plan generation ───────────────────────────────────────────────────────
 
-    def _evaluate(self, setup: Setup) -> TradePlan:
-        snap = setup.bar_snapshot
-        cfg = self._settings.risk
+    def _evaluate(self, setup: Setup, ctx: _AccountRiskContext) -> TradePlan:
+        cfg = ctx.config
 
         entry = setup.entry_trigger
         stop = setup.stop_reference
@@ -152,7 +452,7 @@ class RiskEngine(BaseEngine):
         if size < 1:
             raise RiskViolation("Position size rounds to 0")
 
-        self._check_daily_limits(dollar_risk)
+        self._check_daily_limits(ctx, dollar_risk)
 
         reward = abs(target - entry) * size
         risk = risk_per_share * size
@@ -166,6 +466,7 @@ class RiskEngine(BaseEngine):
             setup_id=setup.setup_id,
             symbol=setup.symbol,
             side=side,
+            account_id=cfg.account_id,
             entry_price=entry,
             stop_price=stop,
             target_price=target,
@@ -178,18 +479,15 @@ class RiskEngine(BaseEngine):
             created_at=datetime.now(timezone.utc),
         )
 
-    def _check_daily_limits(self, new_risk: Decimal) -> None:
-        if self._daily_state is None:
-            return
-        remaining = self._daily_state.remaining_risk
+    def _check_daily_limits(self, ctx: _AccountRiskContext, new_risk: Decimal) -> None:
+        remaining = ctx.state.remaining_risk
         if new_risk > remaining:
             raise RiskViolation(
                 f"Would exceed daily loss limit: need {new_risk}, have {remaining}"
             )
-        max_positions = self._settings.risk.max_open_positions
-        if self._daily_state.open_positions >= max_positions:
+        if ctx.state.open_positions >= ctx.config.max_open_positions:
             raise RiskViolation(
-                f"Max open positions ({max_positions}) reached"
+                f"Max open positions ({ctx.config.max_open_positions}) reached"
             )
 
     @staticmethod
@@ -201,13 +499,53 @@ class RiskEngine(BaseEngine):
         }
         return OrderSide.BUY if setup.setup_type in bullish else OrderSide.SELL
 
-    def _reset_daily_state(self) -> None:
-        today = datetime.now(timezone.utc).date().isoformat()
+    # ── Account management ────────────────────────────────────────────────────
+
+    def _build_account_contexts(self) -> None:
+        from alpha.models.risk import AccountConfig as AC
+
         cfg = self._settings.risk
-        self._daily_state = DailyRiskState(
-            date=today,
-            daily_loss_limit=cfg.account_size * Decimal(str(cfg.max_daily_loss_pct)),
-        )
+        today = datetime.now(timezone.utc).date().isoformat()
+
+        raw_accounts: list[AccountConfig] = [
+            a if isinstance(a, AC) else AC(**a)
+            for a in cfg.accounts
+        ]
+
+        if not raw_accounts:
+            # Backward compat: build one account from scalar fields
+            raw_accounts = [
+                AC(
+                    account_id=cfg.default_account_id,
+                    account_type=AccountType.DAY,
+                    account_size=cfg.account_size,
+                    max_daily_loss_pct=cfg.max_daily_loss_pct,
+                    max_position_risk_pct=cfg.max_position_risk_pct,
+                    max_open_positions=cfg.max_open_positions,
+                )
+            ]
+
+        for account_cfg in raw_accounts:
+            state = DailyRiskState(
+                date=today,
+                account_id=account_cfg.account_id,
+                account_type=account_cfg.account_type,
+                daily_loss_limit=account_cfg.account_size * Decimal(
+                    str(account_cfg.max_daily_loss_pct)
+                ),
+            )
+            self._accounts[account_cfg.account_id] = _AccountRiskContext(
+                config=account_cfg,
+                state=state,
+            )
+            logger.info(
+                "Account configured: id=%s type=%s size=%s loss_limit=%s "
+                "profit_protect_activation=%s giveback_pct=%.0f%%",
+                account_cfg.account_id, account_cfg.account_type,
+                account_cfg.account_size, state.daily_loss_limit,
+                account_cfg.profit_protect_activation,
+                account_cfg.profit_protect_giveback_pct * 100,
+            )
 
     def _get_setup(self, symbol: str, setup_id: object) -> Setup | None:
         from alpha.engines.setup.engine import SetupEngine

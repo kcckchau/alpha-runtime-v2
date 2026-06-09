@@ -12,7 +12,20 @@
       "Bash(git add:*)",
       "Bash(git commit -m ':*)",
       "Bash(docker start alpha_db:*)",
-      "Bash(grep -i \"session\\\\|premarket\\\\|aftermarket\\\\|24.*hour\" /Users/kennethchau/Projects/execution-ledger2/docs/*.md)"
+      "Bash(grep -i \"session\\\\|premarket\\\\|aftermarket\\\\|24.*hour\" /Users/kennethchau/Projects/execution-ledger2/docs/*.md)",
+      "Bash(xargs -I {} basename {})",
+      "WebSearch",
+      "WebFetch(domain:polygon.io)",
+      "WebFetch(domain:massive.com)",
+      "WebFetch(domain:databento.com)",
+      "WebFetch(domain:www.interactivebrokers.com)",
+      "WebFetch(domain:tradingtoolshub.com)",
+      "WebFetch(domain:www.ibkrguides.com)",
+      "WebFetch(domain:www.ksred.com)",
+      "WebFetch(domain:roadmap.databento.com)",
+      "WebFetch(domain:www.quantlabsnet.com)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:brightdata.com)"
     ]
   }
 }
