@@ -88,6 +88,16 @@ class BrokerAdapter(ABC):
         they include positions opened manually or in prior engine sessions.
         """
 
+    @abstractmethod
+    async def get_account_summary(self, account_id: str = "default") -> dict[str, float]:
+        """Return a snapshot of key account metrics.
+
+        Guaranteed keys (all in USD):
+          net_liquidation     – total equity (cash + open positions market value)
+          cash_balance        – settled cash not tied up in open positions
+          gross_position_value – absolute market value of all open positions
+        """
+
     # ── Streaming callbacks ───────────────────────────────────────────────────
 
     @abstractmethod

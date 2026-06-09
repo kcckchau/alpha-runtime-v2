@@ -115,8 +115,11 @@ class RiskEngine(BaseEngine):
     async def _on_start(self) -> None:
         self._event_bus.subscribe(EventType.SETUP, self._handle_setup)
         self._event_bus.subscribe(EventType.ORDER_UPDATE, self._handle_order_update)
-        # Seed P&L immediately from broker, then poll periodically
-        await self._sync_broker_pnl()
+        # Best-effort seed on startup; don't let a connection delay block the engine.
+        try:
+            await self._sync_broker_pnl()
+        except Exception:
+            logger.warning("Initial broker P&L seed failed — will retry in sync loop", exc_info=True)
         self._sync_task = asyncio.create_task(self._broker_sync_loop())
 
     async def _on_stop(self) -> None:
@@ -127,7 +130,17 @@ class RiskEngine(BaseEngine):
         halted_accounts = [
             aid for aid, ctx in self._accounts.items() if ctx.state.is_halted
         ]
-        status = HealthStatus.DEGRADED if halted_accounts else HealthStatus.HEALTHY
+        sync_task_dead = (
+            self._sync_task is not None and self._sync_task.done()
+        )
+        if sync_task_dead:
+            exc = self._sync_task.exception() if not self._sync_task.cancelled() else None
+            logger.error("Broker sync task has died: %s", exc)
+        status = (
+            HealthStatus.DEGRADED
+            if (halted_accounts or sync_task_dead)
+            else HealthStatus.HEALTHY
+        )
         return EngineHealth(
             status,
             self.name,
@@ -135,6 +148,7 @@ class RiskEngine(BaseEngine):
                 "plans_generated": self._plans_generated,
                 "plans_rejected": self._plans_rejected,
                 "halted_accounts": halted_accounts,
+                "broker_sync_alive": not sync_task_dead,
                 "account_states": {
                     aid: {
                         "type": ctx.config.account_type,
@@ -256,9 +270,59 @@ class RiskEngine(BaseEngine):
     # ── Broker P&L sync ───────────────────────────────────────────────────────
 
     async def _broker_sync_loop(self) -> None:
+        consecutive_errors = 0
         while True:
             await asyncio.sleep(self._BROKER_SYNC_INTERVAL)
-            await self._sync_broker_pnl()
+            try:
+                self._check_day_rollover()
+                await self._sync_broker_pnl()
+                consecutive_errors = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                consecutive_errors += 1
+                logger.exception(
+                    "Broker sync loop error (consecutive=%d) — will retry in %ds",
+                    consecutive_errors, self._BROKER_SYNC_INTERVAL,
+                )
+                # Back off progressively but cap at 5 minutes so we recover quickly
+                # once the connection is restored.
+                backoff = min(300, self._BROKER_SYNC_INTERVAL * consecutive_errors)
+                await asyncio.sleep(backoff)
+
+    def _check_day_rollover(self) -> None:
+        """Reset each account's daily state when the calendar date changes.
+
+        The engine may run continuously across midnight; without this reset the
+        daily loss limit, trade count, and kill-switch state would carry over
+        into the next trading session.
+        """
+        today = datetime.now(timezone.utc).date().isoformat()
+        for account_id, ctx in self._accounts.items():
+            if ctx.state.date == today:
+                continue
+            logger.info(
+                "Day rollover detected for account %s (%s → %s) — resetting daily state",
+                account_id, ctx.state.date, today,
+            )
+            ctx.state.date = today
+            ctx.state.realized_pnl = Decimal("0")
+            ctx.state.unrealized_pnl = Decimal("0")
+            ctx.state.session_high_pnl = Decimal("0")
+            ctx.state.max_drawdown = Decimal("0")
+            ctx.state.trades_taken = 0
+            ctx.state.open_positions = 0
+            ctx.state.risk_consumed_pct = 0.0
+            ctx.state.is_halted = False
+            ctx.state.halt_reason = None
+            ctx.state.halt_time = None
+            # Recompute limit in case account_size changed between sessions
+            ctx.state.daily_loss_limit = ctx.config.account_size * Decimal(
+                str(ctx.config.max_daily_loss_pct)
+            )
+            # Positions are stale from yesterday; clear the internal book.
+            # The next broker sync will repopulate P&L from fresh broker data.
+            ctx.positions.clear()
 
     async def _sync_broker_pnl(self) -> None:
         """
@@ -287,9 +351,22 @@ class RiskEngine(BaseEngine):
                 if current_pnl > ctx.state.session_high_pnl:
                     ctx.state.session_high_pnl = current_pnl
 
+                # Pull account equity / cash / leverage
+                summary = await adapter.get_account_summary(account_id)
+                ctx.state.net_liquidation = summary.get("net_liquidation", 0.0)
+                ctx.state.cash_balance = summary.get("cash_balance", 0.0)
+                ctx.state.gross_position_value = summary.get("gross_position_value", 0.0)
+                ctx.state.leverage_ratio = (
+                    ctx.state.gross_position_value / ctx.state.net_liquidation
+                    if ctx.state.net_liquidation > 0 else 0.0
+                )
+
                 logger.debug(
-                    "Broker P&L sync [%s]: realized=%s unrealized=%s",
-                    account_id, ctx.state.realized_pnl, ctx.state.unrealized_pnl,
+                    "Broker sync [%s]: realized=%s unrealized=%s nlv=%s cash=%s gpv=%s lev=%.2fx",
+                    account_id,
+                    ctx.state.realized_pnl, ctx.state.unrealized_pnl,
+                    ctx.state.net_liquidation, ctx.state.cash_balance,
+                    ctx.state.gross_position_value, ctx.state.leverage_ratio,
                 )
 
                 # Check kill switch after each sync

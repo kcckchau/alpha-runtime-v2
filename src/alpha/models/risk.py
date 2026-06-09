@@ -95,6 +95,12 @@ class DailyRiskState(BaseModel):
     open_positions: int = 0
     risk_consumed_pct: float = 0.0    # % of daily loss limit consumed
 
+    # Account snapshot (populated by broker sync; 0.0 until first sync)
+    net_liquidation: float = 0.0        # total equity in USD
+    cash_balance: float = 0.0           # settled cash not in open positions
+    gross_position_value: float = 0.0   # abs market value of all open positions
+    leverage_ratio: float = 0.0         # gross_position_value / net_liquidation
+
     # Kill switch state
     is_halted: bool = False
     halt_reason: KillSwitchReason | None = None

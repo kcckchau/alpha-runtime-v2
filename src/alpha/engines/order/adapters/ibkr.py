@@ -186,6 +186,31 @@ class IBKRBrokerAdapter(BrokerAdapter):
             if p.position != 0
         }
 
+    async def get_account_summary(self, account_id: str = "default") -> dict[str, float]:
+        ib = await self._conn.get()
+        ibkr_account = self._resolve_ibkr_account(account_id)
+        vals = ib.accountValues(ibkr_account) if ibkr_account else ib.accountValues()
+        result: dict[str, float] = {
+            "net_liquidation": 0.0,
+            "cash_balance": 0.0,
+            "gross_position_value": 0.0,
+        }
+        _tag_map = {
+            "NetLiquidation": "net_liquidation",
+            "TotalCashValue": "cash_balance",
+            "GrossPositionValue": "gross_position_value",
+        }
+        for v in vals:
+            if v.currency != "USD":
+                continue
+            key = _tag_map.get(v.tag)
+            if key:
+                try:
+                    result[key] = float(v.value)
+                except (ValueError, TypeError):
+                    pass
+        return result
+
     async def get_daily_pnl(self, account_id: str = "default") -> tuple[float, float]:
         ib = await self._conn.get()
         ibkr_account = self._resolve_ibkr_account(account_id)

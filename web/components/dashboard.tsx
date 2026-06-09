@@ -122,6 +122,11 @@ type AccountRiskState = {
   max_drawdown: number;
   trades_taken: number;
   open_positions: number;
+  // Account metrics (populated after first broker sync)
+  net_liquidation: number;
+  cash_balance: number;
+  gross_position_value: number;
+  leverage_ratio: number;
   is_halted: boolean;
   halt_reason: string | null;
   halt_time: string | null;
@@ -1362,6 +1367,16 @@ function AccountPnlBar({ risk }: { risk: RiskData | null }) {
         const openPos = acct.open_positions;
         const trades = acct.trades_taken;
 
+        const nlv = acct.net_liquidation ?? 0;
+        const cash = acct.cash_balance ?? 0;
+        const gpv = acct.gross_position_value ?? 0;
+        const lev = acct.leverage_ratio ?? 0;
+
+        // Leverage risk colouring: >4x = red, >2x = amber, else green
+        const levColor = lev > 4 ? "#ef4444" : lev > 2 ? "#fbbf24" : lev > 0.5 ? "#22c55e" : "rgba(255,255,255,0.35)";
+        const levLabel = lev >= 10 ? lev.toFixed(1) + "x" : lev > 0 ? lev.toFixed(2) + "x" : "—";
+        const levRisk = lev > 4 ? "HIGH" : lev > 2 ? "MED" : lev > 0.5 ? "LOW" : null;
+
         const pnlColor = isHalted ? "#ef4444" : pnl > 0 ? "#22c55e" : pnl < 0 ? "#ef4444" : "rgba(255,255,255,0.5)";
         const typeLabel = (acct.account_type ?? "unknown").toUpperCase();
 
@@ -1436,7 +1451,7 @@ function AccountPnlBar({ risk }: { risk: RiskData | null }) {
             </div>
 
             {/* Stats row */}
-            <div style={{ display: "flex", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
+            <div style={{ display: "flex", gap: 12, marginBottom: 6, flexWrap: "wrap" }}>
               <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.35)" }}>
                 LIMIT <span style={{ color: "#ef4444" }}>−{formatPnl(limit)}</span>
               </span>
@@ -1447,6 +1462,42 @@ function AccountPnlBar({ risk }: { risk: RiskData | null }) {
                 TRADES <span style={{ color: "rgba(255,255,255,0.7)" }}>{trades}</span>
               </span>
             </div>
+
+            {/* Account metrics row — NLV / Cash / Leverage */}
+            {nlv > 0 && (
+              <div
+                style={{
+                  display: "flex", gap: 0, marginBottom: 8,
+                  background: "rgba(255,255,255,0.03)",
+                  border: "0.5px solid rgba(255,255,255,0.07)",
+                  borderRadius: 4, overflow: "hidden",
+                }}
+              >
+                {/* Net Liquidation */}
+                <div style={{ flex: 1, padding: "5px 8px", borderRight: "0.5px solid rgba(255,255,255,0.07)" }}>
+                  <div style={{ ...S.mono, fontSize: 8, color: "rgba(255,255,255,0.3)", letterSpacing: "0.08em", marginBottom: 2 }}>NLV</div>
+                  <div style={{ ...S.mono, fontSize: 11, fontWeight: 600, color: "rgba(255,255,255,0.8)" }}>
+                    {nlv >= 1000 ? `$${(nlv / 1000).toFixed(1)}k` : `$${nlv.toFixed(0)}`}
+                  </div>
+                </div>
+                {/* Cash */}
+                <div style={{ flex: 1, padding: "5px 8px", borderRight: "0.5px solid rgba(255,255,255,0.07)" }}>
+                  <div style={{ ...S.mono, fontSize: 8, color: "rgba(255,255,255,0.3)", letterSpacing: "0.08em", marginBottom: 2 }}>CASH</div>
+                  <div style={{ ...S.mono, fontSize: 11, fontWeight: 600, color: cash < 0 ? "#ef4444" : "rgba(255,255,255,0.8)" }}>
+                    {cash >= 1000 ? `$${(cash / 1000).toFixed(1)}k` : cash < -1000 ? `−$${(Math.abs(cash) / 1000).toFixed(1)}k` : `$${cash.toFixed(0)}`}
+                  </div>
+                </div>
+                {/* Leverage */}
+                <div style={{ flex: 1, padding: "5px 8px" }}>
+                  <div style={{ ...S.mono, fontSize: 8, color: "rgba(255,255,255,0.3)", letterSpacing: "0.08em", marginBottom: 2 }}>
+                    LEVERAGE{levRisk && <span style={{ marginLeft: 4, color: levColor }}>{levRisk}</span>}
+                  </div>
+                  <div style={{ ...S.mono, fontSize: 11, fontWeight: 600, color: levColor }}>
+                    {levLabel}
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Daily loss bar */}
             <div style={{ marginBottom: protectionActive ? 6 : 0 }}>
