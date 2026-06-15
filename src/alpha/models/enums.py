@@ -134,10 +134,12 @@ class ORBState(StrEnum):
 class SetupType(StrEnum):
     VWAP_RECLAIM = "vwap_reclaim"
     VWAP_REJECTION = "vwap_rejection"
+    VWAP_UNDERCUT_RECLAIM = "vwap_undercut_reclaim"   # shallow VWAP dip, quick reclaim (Grade A)
     ORB_BREAKOUT = "orb_breakout"
     ORB_BREAKDOWN = "orb_breakdown"
-    SWEEP_RECLAIM = "sweep_reclaim"
-    FAKE_BREAKDOWN = "fake_breakdown"
+    SWEEP_RECLAIM = "sweep_reclaim"                   # OR low / structural level sweep + reclaim (Grade A)
+    FAKE_BREAKDOWN = "fake_breakdown"                 # structural sweep + VWAP reclaim, strict (SSS)
+    DEEP_EXHAUSTION_RECLAIM = "deep_exhaustion_reclaim"  # capitulation candle + no new low (Grade A-)
     HOD_BREAKOUT = "hod_breakout"
     TREND_PULLBACK = "trend_pullback"
     RELATIVE_STRENGTH_BREAKOUT = "relative_strength_breakout"
