@@ -30,7 +30,8 @@ class Setup(BaseModel):
 
     # ── Scoring (populated by Scoring Engine) ─────────────────────────────────
     score: float | None = None               # 0.0–100.0
-    grade: SetupGrade | None = None
+    grade: SetupGrade | None = None          # final grade from ScoringEngine
+    structural_grade: SetupGrade | None = None  # hint set at detection (e.g. SSS candidate); ScoringEngine may confirm or downgrade
 
     # ── Conditions ───────────────────────────────────────────────────────────
     conditions_met: list[str] = Field(default_factory=list)
@@ -83,6 +84,7 @@ class SetupHistoryEntry(BaseModel):
     target_reference: Decimal | None = None
     grade: SetupGrade | None = None
     score: float | None = None
+    structural_grade: SetupGrade | None = None
     session_phase: SessionPhase
     invalidation_reason: str | None = None
 

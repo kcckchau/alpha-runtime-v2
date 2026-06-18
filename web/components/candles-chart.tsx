@@ -50,6 +50,13 @@ type CandlesChartProps = {
   focusTime?: Time;
   /** True for instruments that trade ~24h (futures: MNQ, NQ, ES, etc.) */
   is24h?: boolean;
+  /**
+   * ISO date string ("YYYY-MM-DD") of the prior calendar day whose bars are
+   * shown as overnight context.  Bars with timestamps on this date receive a
+   * distinct slate background instead of the normal session colour, making it
+   * visually clear they belong to the previous session.
+   */
+  prevDayDate?: string;
 };
 
 // ─── ET timezone helpers ──────────────────────────────────────────────────────
@@ -267,6 +274,11 @@ const SESSION_BAND_COLORS: Record<SessionBand, string> = {
   aftermarket: "rgba(139, 92, 246, 0.08)",  // violet tint
 };
 
+// Bars from the prior calendar day (loaded as overnight context for 24h futures)
+// get a distinct slate tint so they are immediately distinguishable from the
+// target session.
+const PREV_DAY_COLOR = "rgba(100, 116, 139, 0.14)"; // slate-500
+
 // etEpoch is already "ET wall-clock as UTC" seconds, so UTC fields equal ET time.
 function classifySession(etEpoch: number, is24h: boolean): SessionBand | null {
   const d = new Date(etEpoch * 1000);
@@ -293,6 +305,7 @@ export function CandlesChart({
   onMarkerClick,
   focusTime,
   is24h = false,
+  prevDayDate,
 }: CandlesChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -323,9 +336,10 @@ export function CandlesChart({
   const volRef = useRef<ISeriesApi<"Histogram"> | null>(null);
 
   // Session background band series
-  const bandPreRef = useRef<ISeriesApi<"Histogram"> | null>(null);
-  const bandRegRef = useRef<ISeriesApi<"Histogram"> | null>(null);
-  const bandAftRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const bandPreRef    = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const bandRegRef    = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const bandAftRef    = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const bandPrevDayRef = useRef<ISeriesApi<"Histogram"> | null>(null);
 
   // Chart init effect — runs once
   useEffect(() => {
@@ -358,6 +372,14 @@ export function CandlesChart({
 
     // Session background bands — added first so they render behind all other series
     const SESSION_BAND_SCALE = "session-bands";
+    const bandPrevDay = chart.addSeries(HistogramSeries, {
+      color: PREV_DAY_COLOR,
+      priceScaleId: SESSION_BAND_SCALE,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      base: 0,
+    });
+    bandPrevDay.priceScale().applyOptions({ visible: false, scaleMargins: { top: 0, bottom: 0 } });
     const bandPre = chart.addSeries(HistogramSeries, {
       color: SESSION_BAND_COLORS.premarket,
       priceScaleId: SESSION_BAND_SCALE,
@@ -380,6 +402,7 @@ export function CandlesChart({
       lastValueVisible: false,
       base: 0,
     });
+    bandPrevDayRef.current = bandPrevDay;
     bandPreRef.current = bandPre;
     bandRegRef.current = bandReg;
     bandAftRef.current = bandAft;
@@ -431,6 +454,7 @@ export function CandlesChart({
       volRef.current = null;
       markerApiRef.current = null;
       emaSeriesRef.current.clear();
+      bandPrevDayRef.current = null;
       bandPreRef.current = null;
       bandRegRef.current = null;
       bandAftRef.current = null;
@@ -509,22 +533,35 @@ export function CandlesChart({
 
       // Session band — only append on new bar
       if (isNewBar) {
-        const session = classifySession(t, is24h);
-        if (session === "premarket")   bandPreRef.current?.update({ time: t as Time, value: 1 });
-        else if (session === "regular")     bandRegRef.current?.update({ time: t as Time, value: 1 });
-        else if (session === "aftermarket") bandAftRef.current?.update({ time: t as Time, value: 1 });
+        if (prevDayDate && lastBar.timestamp.startsWith(prevDayDate)) {
+          bandPrevDayRef.current?.update({ time: t as Time, value: 1 });
+        } else {
+          const session = classifySession(t, is24h);
+          if (session === "premarket")        bandPreRef.current?.update({ time: t as Time, value: 1 });
+          else if (session === "regular")     bandRegRef.current?.update({ time: t as Time, value: 1 });
+          else if (session === "aftermarket") bandAftRef.current?.update({ time: t as Time, value: 1 });
+        }
       }
     } else {
       // Full reset: rebuild all series data
 
-      // Session background bands
+      // Session background bands.
+      // Bars whose ISO timestamp belongs to prevDayDate get the slate "prev-day"
+      // tint instead of their normal session colour — makes prior-day context bars
+      // immediately distinguishable from the target session.
       const bandData: Record<SessionBand, { time: Time; value: number }[]> = {
         premarket: [], regular: [], aftermarket: [],
       };
-      for (const { t } of buildSortedDeduped(bars, cache)) {
-        const session = classifySession(t, is24h);
-        if (session) bandData[session].push({ time: t as Time, value: 1 });
+      const bandPrevDayData: { time: Time; value: number }[] = [];
+      for (const { t, b } of buildSortedDeduped(bars, cache)) {
+        if (prevDayDate && b.timestamp.startsWith(prevDayDate)) {
+          bandPrevDayData.push({ time: t as Time, value: 1 });
+        } else {
+          const session = classifySession(t, is24h);
+          if (session) bandData[session].push({ time: t as Time, value: 1 });
+        }
       }
+      bandPrevDayRef.current?.setData(bandPrevDayData);
       bandPreRef.current?.setData(bandData.premarket);
       bandRegRef.current?.setData(bandData.regular);
       bandAftRef.current?.setData(bandData.aftermarket);
@@ -584,7 +621,7 @@ export function CandlesChart({
     }
 
     prevBarsRef.current = bars;
-  }, [bars, emas, viewportKey, is24h]);
+  }, [bars, emas, viewportKey, is24h, prevDayDate]);
 
   // Overlay / marker effect — price lines and markers update independently of bar data
   useEffect(() => {

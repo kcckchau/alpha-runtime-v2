@@ -1884,15 +1884,24 @@ export function Dashboard() {
     }
   }, [selectedDate]);
 
-  // Reset position when entering replay or data reloads
+  // Reset position when entering replay or data reloads.
+  // For historical dates, skip prior-day overnight bars (loaded for chart context)
+  // and start replay at the first bar on the selected calendar date, so they are
+  // already visible as static background rather than being replayed from scratch.
   useEffect(() => {
     if (replayMode) {
-      setReplayIndex(0);
+      let startIdx = 0;
+      if (selectedDate && bars.length > 0) {
+        const targetPrefix = selectedDate; // "YYYY-MM-DD"
+        const idx = bars.findIndex((b) => b.timestamp >= targetPrefix + "T00:00:00");
+        if (idx > 0) startIdx = idx;
+      }
+      setReplayIndex(startIdx);
       setReplayPlaying(false);
       flashRef.current.clear();
       setReplayEpoch((e) => e + 1);
     }
-  }, [replayMode]);
+  }, [replayMode, selectedDate, bars]);
 
   // Replay timer
   useEffect(() => {
@@ -2077,6 +2086,12 @@ export function Dashboard() {
 
   // 24-hour instruments (futures) — session boundaries differ from equities
   const is24h = /^(MNQ|NQ|ES|MES|RTY|M2K|YM|MYM|CL|GC|SI|NKD|EMD)/.test(selectedSymbol);
+
+  // For historical 24h futures, bars from the prior calendar day are loaded as
+  // overnight context. Pass that date so the chart can tint them distinctly.
+  const prevDayDate = (selectedDate && is24h)
+    ? (() => { const d = new Date(selectedDate + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); })()
+    : undefined;
 
   // EMA indicator configs — computed from bar data as line series in the chart
   const emas = useMemo((): EmaConfig[] => {
@@ -2459,6 +2474,7 @@ export function Dashboard() {
             onMarkerClick={setSelectedSetupId}
             focusTime={focusTime}
             is24h={is24h}
+            prevDayDate={prevDayDate}
           />
 
           {/* Quote bar */}

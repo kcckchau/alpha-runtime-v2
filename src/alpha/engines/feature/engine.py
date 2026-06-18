@@ -77,8 +77,13 @@ class SymbolFeatureState:
         self.is_new_lod: bool = False
         self.is_higher_high: bool = False
         self.is_lower_low: bool = False
+        self.is_lower_high: bool = False
         self.prev_bar_high: Decimal | None = None
         self.prev_bar_low: Decimal | None = None
+        self.prev_ema_9: Decimal | None = None
+        self.prev_ema_20: Decimal | None = None
+        self.prev_vwap: Decimal | None = None
+        self.bars_since_last_lower_low: int = 999  # 999 = no lower low yet this session
         self.session_key: str | None = None
 
     def reset_session(self) -> None:
@@ -103,8 +108,13 @@ class SymbolFeatureState:
         self.is_new_lod = False
         self.is_higher_high = False
         self.is_lower_low = False
+        self.is_lower_high = False
         self.prev_bar_high = None
         self.prev_bar_low = None
+        self.prev_ema_9 = None
+        self.prev_ema_20 = None
+        self.prev_vwap = None
+        self.bars_since_last_lower_low = 999
         self.session_key = None
 
     @property
@@ -241,6 +251,7 @@ class FeatureEngine(BaseEngine):
         active_session = is_rth or (is_futures and phase != SessionPhase.CLOSED)
 
         if active_session:
+            state.prev_vwap = state.vwap if state.cumulative_volume > 0 else None
             state.cumulative_volume += bar.volume
             typical = (bar.high + bar.low + bar.close) / 3
             state.cumulative_vwap_num += typical * bar.volume
@@ -315,8 +326,15 @@ class FeatureEngine(BaseEngine):
             state.is_lower_low = (
                 state.prev_bar_low is not None and bar.low < state.prev_bar_low
             )
+            state.is_lower_high = (
+                state.prev_bar_high is not None and bar.high < state.prev_bar_high
+            )
             state.prev_bar_high = bar.high
             state.prev_bar_low = bar.low
+            if state.is_lower_low:
+                state.bars_since_last_lower_low = 0
+            elif state.bars_since_last_lower_low < 999:
+                state.bars_since_last_lower_low += 1
         else:
             state.vwap_cross_up = False
             state.vwap_cross_down = False
@@ -325,10 +343,15 @@ class FeatureEngine(BaseEngine):
             state.is_new_lod = False
             state.is_higher_high = False
             state.is_lower_low = False
+            state.is_lower_high = False
 
+        prev_ema_9 = state.ema_9
+        prev_ema_20 = state.ema_20
         state.ema_9 = self._ema(bar.close, state.ema_9, 9)
         state.ema_20 = self._ema(bar.close, state.ema_20, 20)
         state.ema_50 = self._ema(bar.close, state.ema_50, 50)
+        state.prev_ema_9 = prev_ema_9
+        state.prev_ema_20 = prev_ema_20
 
         if state.prev_close is not None:
             tr = max(
@@ -366,6 +389,26 @@ class FeatureEngine(BaseEngine):
             if state.latest_bid and state.latest_ask else None
         )
         spread_pct = float(spread / mid * 100) if spread and mid else None
+
+        ema_9_slope: float | None = (
+            float((state.ema_9 - state.prev_ema_9) / state.prev_ema_9 * 100)
+            if state.ema_9 is not None and state.prev_ema_9 is not None and state.prev_ema_9 > _ZERO
+            else None
+        )
+        ema_20_slope: float | None = (
+            float((state.ema_20 - state.prev_ema_20) / state.prev_ema_20 * 100)
+            if state.ema_20 is not None and state.prev_ema_20 is not None and state.prev_ema_20 > _ZERO
+            else None
+        )
+        vwap_slope: float | None = (
+            float((state.vwap - state.prev_vwap) / state.prev_vwap * 100)
+            if state.prev_vwap is not None and state.prev_vwap > _ZERO
+            else None
+        )
+        ema_9_slope_direction = self._slope_direction(ema_9_slope, 0.005)
+        ema_20_slope_direction = self._slope_direction(ema_20_slope, 0.005)
+        vwap_slope_direction = self._slope_direction(vwap_slope, 0.002)
+        recent_lower_low = state.bars_since_last_lower_low <= 10
 
         bar_range = bar.high - bar.low
         bar_close_pos: float | None = (
@@ -410,6 +453,12 @@ class FeatureEngine(BaseEngine):
             ema_9=state.ema_9,
             ema_20=state.ema_20,
             ema_50=state.ema_50,
+            ema_9_slope=ema_9_slope,
+            ema_9_slope_direction=ema_9_slope_direction,
+            ema_20_slope=ema_20_slope,
+            ema_20_slope_direction=ema_20_slope_direction,
+            vwap_slope=vwap_slope,
+            vwap_slope_direction=vwap_slope_direction,
             atr_14=atr,
             bid_price=state.latest_bid,
             ask_price=state.latest_ask,
@@ -432,6 +481,8 @@ class FeatureEngine(BaseEngine):
             is_new_lod=state.is_new_lod,
             is_higher_high=state.is_higher_high,
             is_lower_low=state.is_lower_low,
+            is_lower_high=state.is_lower_high,
+            recent_lower_low=recent_lower_low,
             or_mid=or_mid,
             swept_below_vwap=swept_below,
             swept_orl=swept_orl,
@@ -445,6 +496,20 @@ class FeatureEngine(BaseEngine):
             return price
         k = Decimal(2) / Decimal(period + 1)
         return price * k + prev * (1 - k)
+
+    @staticmethod
+    def _slope_direction(slope: float | None, flat_threshold: float) -> str | None:
+        """Classify a % rate-of-change slope as "up", "flat", or "down".
+        flat_threshold is the %-ROC boundary; values within ±threshold = "flat".
+        EMA slopes use 0.005% (≈1pt on MNQ at 19000); VWAP uses 0.002%.
+        """
+        if slope is None:
+            return None
+        if slope > flat_threshold:
+            return "up"
+        if slope < -flat_threshold:
+            return "down"
+        return "flat"
 
     @staticmethod
     def _orb_state(state: SymbolFeatureState, bar: BarEvent) -> ORBState:

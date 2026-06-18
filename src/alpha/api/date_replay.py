@@ -336,10 +336,11 @@ async def _replay_setup_detection(
     """
     Replay bars through a fresh FeatureEngine → MarketStateEngine → SetupEngine pipeline.
 
-    Warm-up phase: replay the 2 prior trading days so that ATR(14), RVOL,
-    EMA, and session-phase indicators are properly seeded before the target
-    date starts.  The SetupEngine rolls its session on the first bar of the
-    target date, so warmup-day setups are discarded automatically.
+    Warm-up phase: replay the prior _WARMUP_DAYS trading days so that
+    ATR(14), RVOL, EMA, and session-phase indicators are properly seeded
+    before the target date starts.  The SetupEngine rolls its session on the
+    first bar of the target date, so warmup-day setups are discarded
+    automatically.
 
     Returns the SessionSetupContext for date `d`, or None if no bars exist.
     """

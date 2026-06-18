@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from decimal import Decimal
+from typing import ClassVar
 from uuid import UUID
 
 from alpha.calendar.base import SessionCalendar
@@ -63,15 +64,15 @@ _RTH_PHASES = frozenset({
     SessionPhase.CLOSING,
 })
 
-# SSS = highest-conviction grade; assigned at detection time.
-# FAKE_BREAKDOWN is the only new structural-sweep setup at SSS — it requires
-# both an OR-low sweep and a full VWAP reclaim before confirmation.
+# SSS grade is assigned at detection time only for setups whose structural
+# definition alone justifies the highest grade.  All other types receive
+# grade=None at detection and earn their grade from the ScoringEngine rubric.
+#
+# FAKE_BREAKDOWN is the sole SSS-at-detection type because it requires both
+# an OR-low structural sweep AND a confirmed VWAP reclaim — two independent
+# confluence signals that no other setup demands simultaneously.
 _SSS_TYPES = frozenset({
     SetupType.FAKE_BREAKDOWN,
-    SetupType.HOD_BREAKOUT,
-    SetupType.TREND_PULLBACK,
-    SetupType.VWAP_RECLAIM,
-    SetupType.VWAP_REJECTION,
 })
 
 
@@ -165,8 +166,10 @@ class SetupEngine(BaseEngine):
             return
 
         symbol = event.symbol
-        session_key = self._session_keys.get(symbol, "")
+        # Roll session BEFORE reading session_key so the bar counter compares
+        # against the current (possibly just-rolled) session, not the prior one.
         self._roll_session_if_needed(symbol, event.timestamp)
+        session_key = self._session_keys.get(symbol, "")
 
         # Increment per-symbol bar counter; reset on new session.
         if self._bar_count_session.get(symbol) != session_key:
@@ -210,6 +213,8 @@ class SetupEngine(BaseEngine):
             # VWAP cross family
             (SetupType.VWAP_RECLAIM, self._detect_vwap_reclaim),
             (SetupType.VWAP_REJECTION, self._detect_vwap_rejection),
+            (SetupType.VWAP_FAILED_RECLAIM_SHORT, self._detect_vwap_failed_reclaim_short),
+            (SetupType.TREND_PULLBACK_SHORT, self._detect_trend_pullback_short),
             # ORB family
             (SetupType.ORB_BREAKOUT, self._detect_orb_breakout),
             (SetupType.ORB_BREAKDOWN, self._detect_orb_breakdown),
@@ -323,9 +328,17 @@ class SetupEngine(BaseEngine):
 
     def _reason_fake_breakdown(self, snap: BarSnapshot, ms: MarketState) -> str | None:
         """
-        FORMING: swept OR low shallow (≤0.3%), closed back above with conviction.
+        FORMING: price must have been below VWAP (bars_below_vwap >= 1) before
+        sweeping the OR low — a bar that dips below OR low from above VWAP is a
+        different pattern (aggressive breakdown attempt) and should not count.
+
+        Then: swept OR low shallow (≤0.3%), closed back above OR low with conviction.
         CONFIRMED requires a full VWAP reclaim — this is the SSS gate.
         """
+        # Price must have lost VWAP before the OR low sweep; otherwise this is
+        # just an aggressive flush from above, not a fake breakdown.
+        if snap.bars_below_vwap < 1:
+            return "price_never_lost_vwap_before_sweep"
         if not snap.swept_orl:
             return "or_low_not_swept"
         if snap.orb_low is None or snap.bar.close <= snap.orb_low:
@@ -429,6 +442,84 @@ class SetupEngine(BaseEngine):
             return "pullback_too_far_from_vwap"
         return None
 
+    # ── VWAP_FAILED_RECLAIM_SHORT ─────────────────────────────────────────────
+
+    def _detect_vwap_failed_reclaim_short(self, snap: BarSnapshot, ms: MarketState) -> bool:
+        return self._reason_vwap_failed_reclaim_short(snap, ms) is None
+
+    def _reason_vwap_failed_reclaim_short(self, snap: BarSnapshot, ms: MarketState) -> str | None:
+        """
+        FORMING: price has been below VWAP for 3+ bars, wicked up to test VWAP
+        (high >= VWAP * 0.9995) but closed back below it with a weak close.
+        This is "buyers tried to reclaim VWAP, sellers defended it."
+
+        Unlike VWAP_REJECTION (which fires on the initial cross-down), this setup
+        requires the price to already be below VWAP and fail a reclaim attempt.
+        """
+        if snap.bars_below_vwap < 3:
+            return "bars_below_vwap_lt_3"
+        # High must have touched or wicked into VWAP zone
+        if snap.bar.high < snap.vwap * Decimal("0.9995"):
+            return "bar_high_did_not_reach_vwap"
+        # Close back below VWAP — failed reclaim
+        if snap.is_above_vwap:
+            return "close_above_vwap"
+        # Weak close = rejection conviction (close in lower half of bar)
+        if snap.bar_close_position_pct is not None and snap.bar_close_position_pct > 0.5:
+            return "close_in_upper_half"
+        # EMA9 must be ≤ EMA20 — bearish alignment (sellers have structural control)
+        if snap.ema_9 is not None and snap.ema_20 is not None and snap.ema_9 > snap.ema_20:
+            return "ema9_above_ema20_not_bearish"
+        # VWAP must not be rising — a rising VWAP means cumulative buying, short risk high
+        if snap.vwap_slope_direction == "up":
+            return "vwap_slope_rising"
+        # Guard: if EMA9 is actively rising AND price closed above it, V-reclaim is likely
+        if snap.ema_9_slope_direction == "up" and snap.ema_9 is not None and snap.bar.close >= snap.ema_9:
+            return "ema9_curling_up_close_above_ema9"
+        return None
+
+    # ── TREND_PULLBACK_SHORT ──────────────────────────────────────────────────
+
+    def _detect_trend_pullback_short(self, snap: BarSnapshot, ms: MarketState) -> bool:
+        return self._reason_trend_pullback_short(snap, ms) is None
+
+    def _reason_trend_pullback_short(self, snap: BarSnapshot, ms: MarketState) -> str | None:
+        """
+        FORMING: confirmed bearish regime (5+ bars below VWAP, EMA9 < EMA20),
+        price is in a pullback toward EMA9 (not making new lows, high approaches EMA9)
+        but closes below EMA9 — sellers defending the dynamic resistance.
+
+        Entry is triggered when a subsequent bar breaks below the forming bar's low,
+        confirming the lower high and resuming the downtrend.
+        """
+        if snap.bars_below_vwap < 5:
+            return "bars_below_vwap_lt_5"
+        if snap.ema_9 is None or snap.ema_20 is None:
+            return "ema_not_available"
+        # Bearish EMA alignment required
+        if snap.ema_9 >= snap.ema_20:
+            return "ema9_not_below_ema20"
+        # EMA9 must not be rising — flat or down only
+        if snap.ema_9_slope_direction == "up":
+            return "ema9_slope_rising"
+        # EMA20 must not be rising — trend must have real momentum, not just short-term dip
+        if snap.ema_20_slope_direction == "up":
+            return "ema20_slope_rising"
+        # A lower low must have been made recently — confirms this is a real downtrend,
+        # not VWAP-area chop. Without this, any 5-bar below-VWAP drift + EMA9 touch qualifies.
+        if not snap.recent_lower_low:
+            return "no_recent_lower_low"
+        # Not making new lows right now — price is in a pullback, not continuation
+        if snap.is_new_lod:
+            return "making_new_lod_not_a_pullback"
+        # High must have approached EMA9 (within 0.3%) — the bounce touched EMA9
+        if snap.bar.high < snap.ema_9 * Decimal("0.997"):
+            return "bar_high_too_far_from_ema9"
+        # Close must remain below EMA9 — EMA9 acted as resistance
+        if snap.bar.close >= snap.ema_9:
+            return "close_above_ema9_reclaim"
+        return None
+
     def _advance_vwap_reclaim(
         self, setup: Setup, snap: BarSnapshot, ms: MarketState
     ) -> tuple[Setup, str]:
@@ -525,6 +616,124 @@ class SetupEngine(BaseEngine):
 
         return setup, ""
 
+    def _advance_vwap_failed_reclaim_short(
+        self, setup: Setup, snap: BarSnapshot, ms: MarketState
+    ) -> tuple[Setup, str]:
+        """
+        FORMING → CONFIRMED: hold below VWAP on next bar, no higher high.
+        Entry = forming bar's low (break confirms rejection).
+        Stop  = forming bar's high (VWAP test high).
+        Timeout at 6 bars; invalidated if VWAP is reclaimed.
+        """
+        if setup.state == SetupState.FORMING:
+            bars = self._forming_bars.get(setup.setup_id, 0) + 1
+            self._forming_bars[setup.setup_id] = bars
+
+            if snap.vwap_cross_up:
+                return setup.transition(SetupState.INVALIDATED, "vwap_reclaimed_after_rejection", bar_time=snap.timestamp), ""
+            if bars > 6:
+                return setup.transition(SetupState.INVALIDATED, "forming_timeout_gt_6_bars", bar_time=snap.timestamp), ""
+
+            if not snap.is_above_vwap:
+                rvol_ok = snap.relative_volume is None or snap.relative_volume >= 0.8
+                # Require actual downside continuation: bar must NOT exceed forming bar's high
+                # AND must have already traded below forming bar's low (sellers following through,
+                # not just drifting sideways below VWAP).
+                no_higher_high = snap.bar.high <= setup.bar_snapshot.bar.high
+                broke_forming_low = snap.bar.low < setup.bar_snapshot.bar.low
+                if rvol_ok and no_higher_high and broke_forming_low:
+                    entry = setup.bar_snapshot.bar.low
+                    stop = setup.bar_snapshot.bar.high
+                    rw_reason = self._risk_width_rejection(entry, stop, snap)
+                    if rw_reason:
+                        return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
+                    mult = self._target_mult("sell", ms)
+                    target = (
+                        snap.intraday_low
+                        if snap.intraday_low is not None and snap.intraday_low < entry
+                        else entry - (stop - entry) * mult
+                    )
+                    confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
+                        update={"entry_trigger": entry, "stop_reference": stop, "target_reference": target}
+                    )
+                    logger.info(
+                        "Setup confirmed: %s %s entry=%.2f stop=%.2f target=%.2f",
+                        setup.symbol, setup.setup_type,
+                        float(entry), float(stop), float(target),
+                    )
+                    return confirmed, "confirmed"
+
+        elif setup.state == SetupState.CONFIRMED:
+            if snap.vwap_cross_up:
+                return setup.transition(SetupState.INVALIDATED, "vwap_reclaimed_while_confirmed", bar_time=snap.timestamp), ""
+            if setup.entry_trigger and snap.bar.low <= setup.entry_trigger:
+                return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"
+            if setup.stop_reference and snap.bar.high >= setup.stop_reference:
+                return setup.transition(SetupState.FAILED, bar_time=snap.timestamp), "stop hit"
+
+        return setup, ""
+
+    def _advance_trend_pullback_short(
+        self, setup: Setup, snap: BarSnapshot, ms: MarketState
+    ) -> tuple[Setup, str]:
+        """
+        FORMING → CONFIRMED: on a subsequent bar, lower high forms (this bar's high
+        is below the forming bar's high) and price is still below VWAP and EMA9.
+        Entry = forming bar's low (break of pullback bar's low).
+        Stop  = forming bar's high (max of the bounce).
+        Timeout at 8 bars; invalidated on VWAP reclaim or close above EMA20.
+        """
+        if setup.state == SetupState.FORMING:
+            bars = self._forming_bars.get(setup.setup_id, 0) + 1
+            self._forming_bars[setup.setup_id] = bars
+
+            if snap.vwap_cross_up:
+                return setup.transition(SetupState.INVALIDATED, "vwap_cross_up", bar_time=snap.timestamp), ""
+            if snap.ema_20 is not None and snap.bar.close >= snap.ema_20:
+                return setup.transition(SetupState.INVALIDATED, "close_above_ema20", bar_time=snap.timestamp), ""
+            if bars > 8:
+                return setup.transition(SetupState.INVALIDATED, "forming_timeout_gt_8_bars", bar_time=snap.timestamp), ""
+
+            # Confirm: lower high + price broke below pullback bar's low (downtrend resumed)
+            # + still below EMA9, EMA20, and VWAP.  All four must hold — no partial signals.
+            lower_high = snap.bar.high < setup.bar_snapshot.bar.high
+            broke_forming_low = snap.bar.low < setup.bar_snapshot.bar.low
+            below_ema9 = snap.ema_9 is None or snap.bar.close < snap.ema_9
+            below_ema20 = snap.ema_20 is None or snap.bar.close < snap.ema_20
+            if lower_high and broke_forming_low and not snap.is_above_vwap and below_ema9 and below_ema20:
+                rvol_ok = snap.relative_volume is None or snap.relative_volume >= 0.8
+                if rvol_ok:
+                    entry = setup.bar_snapshot.bar.low
+                    stop = setup.bar_snapshot.bar.high
+                    rw_reason = self._risk_width_rejection(entry, stop, snap)
+                    if rw_reason:
+                        return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
+                    mult = self._target_mult("sell", ms)
+                    target = (
+                        snap.intraday_low
+                        if snap.intraday_low is not None and snap.intraday_low < entry
+                        else entry - (stop - entry) * mult
+                    )
+                    confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
+                        update={"entry_trigger": entry, "stop_reference": stop, "target_reference": target}
+                    )
+                    logger.info(
+                        "Setup confirmed: %s %s entry=%.2f stop=%.2f target=%.2f",
+                        setup.symbol, setup.setup_type,
+                        float(entry), float(stop), float(target),
+                    )
+                    return confirmed, "confirmed"
+
+        elif setup.state == SetupState.CONFIRMED:
+            if snap.vwap_cross_up:
+                return setup.transition(SetupState.INVALIDATED, "vwap_cross_up_while_confirmed", bar_time=snap.timestamp), ""
+            if setup.entry_trigger and snap.bar.low <= setup.entry_trigger:
+                return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"
+            if setup.stop_reference and snap.bar.high >= setup.stop_reference:
+                return setup.transition(SetupState.FAILED, bar_time=snap.timestamp), "stop hit"
+
+        return setup, ""
+
     def _advance_orb_breakdown(
         self, setup: Setup, snap: BarSnapshot, ms: MarketState
     ) -> tuple[Setup, str]:
@@ -532,11 +741,13 @@ class SetupEngine(BaseEngine):
             self._forming_bars[setup.setup_id] = (
                 self._forming_bars.get(setup.setup_id, 0) + 1
             )
-            # Invalidation: reclaimed ORB low or VWAP
+            # Invalidation: OR low reclaimed (first cross back up, or close above level)
+            if snap.orb_cross_up:
+                return setup.transition(SetupState.INVALIDATED, "orb_low_reclaimed_cross_up", bar_time=snap.timestamp), ""
             if snap.orb_low is not None and snap.bar.close > snap.orb_low:
-                return setup.transition(SetupState.INVALIDATED, "ORB low reclaimed", bar_time=snap.timestamp), ""
+                return setup.transition(SetupState.INVALIDATED, "orb_low_reclaimed_close_above", bar_time=snap.timestamp), ""
             if snap.is_above_vwap:
-                return setup.transition(SetupState.INVALIDATED, "reclaimed VWAP", bar_time=snap.timestamp), ""
+                return setup.transition(SetupState.INVALIDATED, "reclaimed_vwap_while_forming", bar_time=snap.timestamp), ""
             # Confirm: hold below ORB low on next bar + rvol ≥ 1.0
             if snap.orb_low is not None and snap.bar.close < snap.orb_low:
                 rvol_ok = snap.relative_volume is None or snap.relative_volume >= 1.0
@@ -547,6 +758,9 @@ class SetupEngine(BaseEngine):
                     # Stop: just above ORB low — the structural level; if price reclaims
                     # it the breakdown has failed.
                     stop = snap.orb_low * Decimal("1.001")
+                    rw_reason = self._risk_width_rejection(entry, stop, snap)
+                    if rw_reason:
+                        return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
                     orb_range = (
                         (snap.orb_high - snap.orb_low)
                         if snap.orb_high and snap.orb_low else None
@@ -571,9 +785,11 @@ class SetupEngine(BaseEngine):
                     return confirmed, "confirmed"
 
         elif setup.state == SetupState.CONFIRMED:
-            # Invalidation: price reclaims ORB low
+            # Invalidation: price reclaims ORB low (close above or first orb_cross_up)
+            if snap.orb_cross_up:
+                return setup.transition(SetupState.INVALIDATED, "orb_low_reclaimed_cross_up", bar_time=snap.timestamp), ""
             if snap.orb_low is not None and snap.bar.close > snap.orb_low:
-                return setup.transition(SetupState.INVALIDATED, "ORB low reclaimed while confirmed", bar_time=snap.timestamp), ""
+                return setup.transition(SetupState.INVALIDATED, "orb_low_reclaimed_close_above", bar_time=snap.timestamp), ""
             if setup.entry_trigger and snap.bar.low <= setup.entry_trigger:
                 return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"
             if setup.stop_reference and snap.bar.high >= setup.stop_reference:
@@ -609,8 +825,15 @@ class SetupEngine(BaseEngine):
 
     def _detect_vwap_rejection(self, snap: BarSnapshot, ms: MarketState) -> bool:
         """
+        Detects the INITIAL clean cross below VWAP — effectively a VWAP breakdown short.
         FORMING: price crossed below VWAP from at least 2 bars above, closing
         with conviction (>0.05% below VWAP, lower half of bar).
+
+        NOTE: fires on the first cross-down regardless of EMA alignment or slope.
+        No slope or alignment filters — risk of catching fake breakdowns.
+        For the higher-quality failed-reclaim pattern see VWAP_FAILED_RECLAIM_SHORT.
+
+        ── 1m prototype ── detection runs entirely on the 1m bar stream.
         """
         if not snap.vwap_cross_down:
             return False
@@ -635,23 +858,33 @@ class SetupEngine(BaseEngine):
 
     def _detect_orb_breakdown(self, snap: BarSnapshot, ms: MarketState) -> bool:
         """
-        FORMING: price breaks below ORB low, below VWAP, setting a new LOD.
+        FORMING: detects only the INITIAL cross below OR low (orb_cross_down flag),
+        price below VWAP, and close below OR low.
+
+        orb_cross_down is True only on the exact bar that first closes below orb_low
+        (populated by the Feature Engine; see BarSnapshot.orb_cross_down).  Using
+        is_new_lod as the primary trigger would fire on every subsequent new low,
+        not just the initial break.
         """
-        if snap.orb_state != ORBState.BREAKOUT_DOWN or snap.orb_low is None:
+        if snap.orb_low is None:
+            return False
+        if not snap.orb_cross_down:
             return False
         if snap.is_above_vwap:
             return False
-        if not snap.is_new_lod:
+        if snap.bar.close >= snap.orb_low:
             return False
         return True
 
     def _reason_orb_breakdown(self, snap: BarSnapshot, ms: MarketState) -> str | None:
-        if snap.orb_state != ORBState.BREAKOUT_DOWN or snap.orb_low is None:
-            return "orb_not_in_breakdown"
+        if snap.orb_low is None:
+            return "no_orb_low_set"
+        if not snap.orb_cross_down:
+            return "not_initial_orb_cross_down"
         if snap.is_above_vwap:
             return "above_vwap"
-        if not snap.is_new_lod:
-            return "not_new_lod"
+        if snap.bar.close >= snap.orb_low:
+            return "close_not_below_orb_low"
         return None
 
     # ── Stub detectors (not yet implemented) ─────────────────────────────────
@@ -681,6 +914,10 @@ class SetupEngine(BaseEngine):
             return self._reason_vwap_reclaim(snapshot, market_state)
         if setup_type == SetupType.VWAP_REJECTION:
             return self._reason_vwap_rejection(snapshot, market_state)
+        if setup_type == SetupType.VWAP_FAILED_RECLAIM_SHORT:
+            return self._reason_vwap_failed_reclaim_short(snapshot, market_state)
+        if setup_type == SetupType.TREND_PULLBACK_SHORT:
+            return self._reason_trend_pullback_short(snapshot, market_state)
         if setup_type == SetupType.ORB_BREAKDOWN:
             return self._reason_orb_breakdown(snapshot, market_state)
         if setup_type == SetupType.ORB_BREAKOUT:
@@ -698,7 +935,9 @@ class SetupEngine(BaseEngine):
         trigger: BarEvent,
     ) -> None:
         bar_time = trigger.timestamp
-        grade = SetupGrade.SSS if setup_type in _SSS_TYPES else None
+        # structural_grade is a detection-time hint for ScoringEngine.
+        # grade is intentionally left None here — ScoringEngine produces the final grade.
+        structural_grade = SetupGrade.SSS if setup_type in _SSS_TYPES else None
         setup = Setup(
             symbol=symbol,
             setup_type=setup_type,
@@ -707,7 +946,7 @@ class SetupEngine(BaseEngine):
             updated_at=bar_time,
             market_state=market_state,
             bar_snapshot=snapshot,
-            grade=grade,
+            structural_grade=structural_grade,
         )
         self._active.setdefault(symbol, {})[setup.setup_id] = setup
         self._setups_detected += 1
@@ -786,6 +1025,41 @@ class SetupEngine(BaseEngine):
             return Decimal("1.5")
         return Decimal("3")  # BALANCED / UNKNOWN
 
+    # ── Risk-width guard ──────────────────────────────────────────────────────
+
+    # Maximum risk as a multiple of ATR-14.  A confirmed entry whose
+    # risk (|entry - stop|) exceeds this is rejected at confirm time —
+    # typically caused by a huge reclaim candle producing a terrible R:R.
+    _MAX_RISK_ATR_MULT: ClassVar[Decimal] = Decimal("1.5")
+    # Fallback threshold (% of entry price) used when ATR is not yet available.
+    _MAX_RISK_PCT: ClassVar[Decimal] = Decimal("0.005")  # 0.5 %
+
+    @staticmethod
+    def _risk_width_rejection(
+        entry: Decimal, stop: Decimal, snap: BarSnapshot
+    ) -> str | None:
+        """Return a rejection reason if the risk width is too wide; None if acceptable.
+
+        Applied at confirm time to prevent large-candle setups from producing
+        entries with poor R:R.  atr_14 is the primary benchmark; when it is
+        unavailable a hard percentage-of-price fallback applies.
+        """
+        risk = abs(entry - stop)
+        if snap.atr_14 is not None:
+            if risk > snap.atr_14 * SetupEngine._MAX_RISK_ATR_MULT:
+                return (
+                    f"risk_too_wide_gt_{SetupEngine._MAX_RISK_ATR_MULT}x_atr "
+                    f"risk={float(risk):.2f} atr={float(snap.atr_14):.2f}"
+                )
+        else:
+            risk_pct = risk / entry
+            if risk_pct > SetupEngine._MAX_RISK_PCT:
+                return (
+                    f"risk_too_wide_gt_0_5pct "
+                    f"risk_pct={float(risk_pct * 100):.2f}%"
+                )
+        return None
+
     def _advance_state(
         self,
         setup: Setup,
@@ -808,6 +1082,10 @@ class SetupEngine(BaseEngine):
             return self._advance_vwap_reclaim(setup, snapshot, market_state)
         if setup.setup_type == SetupType.VWAP_REJECTION:
             return self._advance_vwap_rejection(setup, snapshot, market_state)
+        if setup.setup_type == SetupType.VWAP_FAILED_RECLAIM_SHORT:
+            return self._advance_vwap_failed_reclaim_short(setup, snapshot, market_state)
+        if setup.setup_type == SetupType.TREND_PULLBACK_SHORT:
+            return self._advance_trend_pullback_short(setup, snapshot, market_state)
         if setup.setup_type == SetupType.ORB_BREAKDOWN:
             return self._advance_orb_breakdown(setup, snapshot, market_state)
         return setup, ""
@@ -841,6 +1119,9 @@ class SetupEngine(BaseEngine):
                 if rvol_ok and close_pos_ok and no_lower_low:
                     entry = snap.vwap
                     stop = setup.bar_snapshot.bar.low * Decimal("0.9995")
+                    rw_reason = self._risk_width_rejection(entry, stop, snap)
+                    if rw_reason:
+                        return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
                     mult = self._target_mult("buy", ms)
                     target = entry + (entry - stop) * mult
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
@@ -883,6 +1164,9 @@ class SetupEngine(BaseEngine):
                 if no_lower_low and recovering and rvol_ok:
                     entry = snap.bar.high
                     stop = setup.bar_snapshot.bar.low * Decimal("0.9995")
+                    rw_reason = self._risk_width_rejection(entry, stop, snap)
+                    if rw_reason:
+                        return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
                     mult = self._target_mult("buy", ms)
                     target = entry + (entry - stop) * mult
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
@@ -911,14 +1195,19 @@ class SetupEngine(BaseEngine):
             bars = self._forming_bars.get(setup.setup_id, 0) + 1
             self._forming_bars[setup.setup_id] = bars
 
-            # Invalidation: broke below the sweep bar's low
-            if snap.bar.low < setup.bar_snapshot.bar.low:
-                return setup.transition(SetupState.INVALIDATED, "broke below sweep low", bar_time=snap.timestamp), ""
+            # Invalidation: close breaks below sweep bar low (structural failure),
+            # OR wick extends more than 0.05% below sweep bar low (not a tiny noise wick).
+            # A single tick wick into the sweep candle's range does NOT invalidate.
+            sweep_low = setup.bar_snapshot.bar.low
+            if snap.bar.close < sweep_low:
+                return setup.transition(SetupState.INVALIDATED, "close_broke_below_sweep_low", bar_time=snap.timestamp), ""
+            if snap.bar.low < sweep_low * Decimal("0.9995"):
+                return setup.transition(SetupState.INVALIDATED, "wick_broke_sweep_low_by_gt_0_05pct", bar_time=snap.timestamp), ""
             # Invalidation: spending too long below VWAP without reclaiming
             if snap.bars_below_vwap > 8:
-                return setup.transition(SetupState.INVALIDATED, "below VWAP >8 bars without reclaim", bar_time=snap.timestamp), ""
+                return setup.transition(SetupState.INVALIDATED, "below_vwap_gt_8_bars_no_reclaim", bar_time=snap.timestamp), ""
             if bars > 12:
-                return setup.transition(SetupState.INVALIDATED, "forming timeout >12 bars", bar_time=snap.timestamp), ""
+                return setup.transition(SetupState.INVALIDATED, "forming_timeout_gt_12_bars", bar_time=snap.timestamp), ""
 
             # Confirm: full VWAP reclaim with all gates
             if snap.vwap_cross_up and snap.is_above_vwap:
@@ -928,8 +1217,13 @@ class SetupEngine(BaseEngine):
                 ema_ok = snap.ema_9 is None or snap.bar.close >= snap.ema_9
                 no_lower_low = not snap.is_lower_low
                 if rvol_ok and close_pos_ok and or_mid_ok and ema_ok and no_lower_low:
-                    entry = snap.vwap
+                    # Use bar close as entry — realistic fill price on the reclaim candle.
+                    # snap.vwap would be an idealized price that rarely fills in practice.
+                    entry = snap.bar.close
                     stop = setup.bar_snapshot.bar.low * Decimal("0.9995")
+                    rw_reason = self._risk_width_rejection(entry, stop, snap)
+                    if rw_reason:
+                        return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
                     mult = self._target_mult("buy", ms)
                     target = entry + (entry - stop) * mult
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
@@ -1183,6 +1477,7 @@ class SetupEngine(BaseEngine):
             target_reference=setup.target_reference,
             grade=setup.grade,
             score=setup.score,
+            structural_grade=setup.structural_grade,
             session_phase=setup.bar_snapshot.session_phase,
             invalidation_reason=setup.invalidation_reason,
         )
@@ -1248,6 +1543,7 @@ class SetupEngine(BaseEngine):
         if setup_type in {
             SetupType.VWAP_RECLAIM, SetupType.VWAP_REJECTION,
             SetupType.VWAP_UNDERCUT_RECLAIM, SetupType.TREND_PULLBACK,
+            SetupType.VWAP_FAILED_RECLAIM_SHORT, SetupType.TREND_PULLBACK_SHORT,
         }:
             return "vwap"
         if setup_type in {SetupType.ORB_BREAKOUT, SetupType.ORB_BREAKDOWN}:

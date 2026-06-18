@@ -39,6 +39,12 @@ class BarSnapshot(BaseModel):
     ema_9: Decimal | None = None
     ema_20: Decimal | None = None
     ema_50: Decimal | None = None
+    ema_9_slope: float | None = None          # % rate-of-change of EMA9 vs prior bar (positive = rising)
+    ema_9_slope_direction: str | None = None  # "up" / "flat" / "down"  (flat = |slope| ≤ 0.005%)
+    ema_20_slope: float | None = None         # % rate-of-change of EMA20 vs prior bar
+    ema_20_slope_direction: str | None = None  # "up" / "flat" / "down"
+    vwap_slope: float | None = None           # % rate-of-change of VWAP vs prior bar
+    vwap_slope_direction: str | None = None   # "up" / "flat" / "down"  (flat = |slope| ≤ 0.002%)
 
     # ── Volatility ────────────────────────────────────────────────────────────
     atr_14: Decimal | None = None
@@ -73,6 +79,13 @@ class BarSnapshot(BaseModel):
     is_new_lod: bool = False                    # this bar set a new session low
     is_higher_high: bool = False                # this bar's high > prior bar's high
     is_lower_low: bool = False                  # this bar's low < prior bar's low
+    is_lower_high: bool = False                 # this bar's high < prior bar's high
+    recent_lower_low: bool = False              # a lower low was made within the last 10 bars (session)
     or_mid: Decimal | None = None               # (orb_high + orb_low) / 2
     swept_below_vwap: bool = False              # low < vwap but close >= vwap
     swept_orl: bool = False                     # low < orb_low
+
+    # ── ORB cross flags (populated by Feature Engine) ─────────────────────────
+    orb_cross_down: bool = False               # first bar that closes below orb_low (one-time trigger)
+    orb_cross_up: bool = False                 # first bar that closes back above orb_low after breakdown
+    bars_since_orb_breakdown: int = 0          # bars elapsed since initial orb_cross_down (0 = not yet broken)

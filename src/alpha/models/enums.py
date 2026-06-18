@@ -142,6 +142,8 @@ class SetupType(StrEnum):
     DEEP_EXHAUSTION_RECLAIM = "deep_exhaustion_reclaim"  # capitulation candle + no new low (Grade A-)
     HOD_BREAKOUT = "hod_breakout"
     TREND_PULLBACK = "trend_pullback"
+    TREND_PULLBACK_SHORT = "trend_pullback_short"
+    VWAP_FAILED_RECLAIM_SHORT = "vwap_failed_reclaim_short"
     RELATIVE_STRENGTH_BREAKOUT = "relative_strength_breakout"
 
 
