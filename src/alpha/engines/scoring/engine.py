@@ -1,85 +1,171 @@
 """
-Engine 7 — Scoring Engine
+Engine 7 — Scoring Engine (side-aware, point-based)
 
-Responsibilities:
-  - Subscribe to SetupEvent (FORMING / CONFIRMED transitions)
-  - Score each setup candidate 0–100
-  - Assign a grade (SSS / A+ / A / B / C)
-  - Record which conditions are met vs. missing
-  - Re-score when market state changes significantly
+Scores CONFIRMED setups on an integer point scale (no upper bound, but practical
+range 0–10).  Grade thresholds:
 
-Input:  SetupEvent, MarketStateEvent
-Output: Updated Setup score + grade (stored on Setup object, re-emitted
-        via SetupEvent with enriched data)
+  B   ≤ 2   observe only
+  A   3–4   small size
+  A+  5–6   normal size
+  SSS ≥ 7   full-size / primary trade
 
-The scoring model is deterministic and rule-based at this layer.
-ML-based scoring will be a separate pluggable component.
+Short setups:
+  base score varies by setup type (VWAP_REJECTION=1, others=3)
+  + add-ons for confirmatory conditions (+1 each)
+  − penalties for contradictory conditions (−1 or −2)
+
+Long setups:
+  base score = 3
+  + add-ons symmetric to the short rubric
+
+Hard caps (applied after raw scoring):
+  VWAP_REJECTION         → max A   (initial cross-down; never SSS/A+)
+  live_bias BULLISH      → max A   for all short setups
+  live_bias BEARISH      → max A   for all long setups
+
+Scoring happens at CONFIRMED state.  The confirmation bar snapshot
+(fetched from FeatureEngine at event time) is used for volume and
+close-position checks; the forming bar snapshot (stored in Setup) is
+used for structural regime checks.
+
+NOTE: single-timeframe 1m prototype — no 5m bias input yet.
 """
 
 from __future__ import annotations
 
 import logging
+from decimal import Decimal
+from typing import ClassVar
+from uuid import UUID
 
 from alpha.config.settings import AlphaSettings
 from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
-from alpha.models.enums import EventType, HealthStatus, SetupGrade, SetupState
+from alpha.models.enums import (
+    EventType,
+    HealthStatus,
+    LiveBias,
+    SetupGrade,
+    SetupState,
+    SetupType,
+    TrendState,
+)
 from alpha.models.events import AnyEvent, SetupEvent
+from alpha.models.market_state import MarketState
 from alpha.models.setup import Setup
+from alpha.models.snapshot import BarSnapshot
 
 logger = logging.getLogger(__name__)
 
+# ── Grade order (lowest → highest) ────────────────────────────────────────────
+_GRADE_ORDER: list[SetupGrade] = [
+    SetupGrade.C,
+    SetupGrade.B,
+    SetupGrade.A,
+    SetupGrade.A_PLUS,
+    SetupGrade.SSS,
+]
 
-class ScoringRubric:
-    """
-    Declarative scoring rubric.
 
-    Each condition contributes a point value. Max possible = 100.
-    Grade thresholds mirror SSS/A+/A/B/C used in live trading review.
-    """
+def _grade_index(grade: SetupGrade) -> int:
+    try:
+        return _GRADE_ORDER.index(grade)
+    except ValueError:
+        return 0
 
-    CONDITIONS: list[tuple[str, int]] = [
-        # Trend alignment
-        ("trend_aligned_with_market", 15),
-        ("price_above_ema20", 10),
-        ("price_above_vwap", 10),
-        # Volume
-        ("relative_volume_above_1_5", 10),
-        ("volume_expanding_on_move", 10),
-        # Setup specifics
-        ("clean_level_break", 15),
-        ("orb_confirmed", 10),
-        ("no_overhead_resistance", 10),
-        # Risk quality
-        ("tight_stop_available", 10),
-    ]
 
-    GRADE_THRESHOLDS: list[tuple[SetupGrade, float]] = [
-        (SetupGrade.SSS, 90.0),
-        (SetupGrade.A_PLUS, 80.0),
-        (SetupGrade.A, 70.0),
-        (SetupGrade.B, 55.0),
-        (SetupGrade.C, 0.0),
-    ]
+def _grade_from_score(score: int) -> SetupGrade:
+    if score >= 7:
+        return SetupGrade.SSS
+    if score >= 5:
+        return SetupGrade.A_PLUS
+    if score >= 3:
+        return SetupGrade.A
+    if score >= 1:
+        return SetupGrade.B
+    return SetupGrade.C
 
-    @classmethod
-    def grade_for(cls, score: float) -> SetupGrade:
-        for grade, threshold in cls.GRADE_THRESHOLDS:
-            if score >= threshold:
-                return grade
-        return SetupGrade.C
+
+def _apply_cap(grade: SetupGrade, cap: SetupGrade) -> SetupGrade:
+    """Return the lower of grade and cap."""
+    return _GRADE_ORDER[min(_grade_index(grade), _grade_index(cap))]
+
+
+# ── Short rubric ───────────────────────────────────────────────────────────────
+
+_SHORT_BASE: dict[SetupType, int] = {
+    SetupType.VWAP_REJECTION:            1,
+    SetupType.VWAP_FAILED_RECLAIM_SHORT: 3,
+    SetupType.TREND_PULLBACK_SHORT:      3,
+    SetupType.ORB_BREAKDOWN:             2,
+}
+
+# (condition_name, points, human-readable reason string)
+_SHORT_ADD_ONS: list[tuple[str, int, str]] = [
+    ("vwap_slope_down",       1, "VWAP slope down"),
+    ("ema9_slope_down",       1, "EMA9 slope down"),
+    ("ema20_slope_down",      1, "EMA20 slope down"),
+    ("recent_lower_low",      1, "recent lower low in session"),
+    ("live_bias_bearish",     1, "live bias bearish"),
+    ("trend_down",            1, "market trending down"),
+    ("confirm_lower_40pct",   1, "confirm bar closed in lower 40%"),
+    ("rvol_above_1_0",        1, "RVOL ≥ 1.0"),
+    ("rvol_above_1_3",        1, "RVOL ≥ 1.3"),   # stacks with rvol_above_1_0 for +2 total
+    ("tight_risk_width",      1, "risk width ≤ 1× ATR"),
+]
+
+_SHORT_PENALTIES: list[tuple[str, int, str]] = [
+    ("vwap_slope_rising",    -1, "VWAP slope rising"),
+    ("ema20_slope_rising",   -1, "EMA20 slope rising"),
+    ("live_bias_bullish",    -2, "live bias bullish (contra-trend short)"),
+    ("chasing_extension",    -1, "price extended >0.50% below VWAP"),
+    ("market_not_bearish",   -1, "market regime not bearish"),
+]
+
+# Hard grade caps per setup type.
+_SHORT_GRADE_CAPS: dict[SetupType, SetupGrade] = {
+    SetupType.VWAP_REJECTION: SetupGrade.A,  # first cross-down is structurally weaker
+}
+
+# ── Long rubric ────────────────────────────────────────────────────────────────
+
+_LONG_BASE: int = 3
+
+_LONG_ADD_ONS: list[tuple[str, int, str]] = [
+    ("trend_aligned_bullish", 1, "trend aligned bullish above VWAP"),
+    ("price_above_vwap",      1, "price above VWAP"),
+    ("price_above_ema20",     1, "price above EMA20"),
+    ("live_bias_bullish",     1, "live bias bullish"),
+    ("rvol_above_1_0",        1, "RVOL ≥ 1.0"),
+    ("rvol_above_1_5",        1, "RVOL ≥ 1.5"),   # stacks with rvol_above_1_0 for +2 total
+    ("orb_confirmed",         1, "ORB volume confirmed"),
+    ("tight_risk_width",      1, "risk width ≤ 1× ATR"),
+]
+
+_LONG_PENALTIES: list[tuple[str, int, str]] = [
+    ("live_bias_bearish",    -2, "live bias bearish (contra-trend long)"),
+    ("trend_down",           -1, "market trending down"),
+    ("chasing_extension_up", -1, "price extended >0.50% above VWAP"),
+    ("market_not_bullish",   -1, "market regime not bullish"),
+]
 
 
 class ScoringEngine(BaseEngine):
-    """
-    Assigns confidence scores and letter grades to detected setups.
-    """
+    """Assigns confidence scores and grades to confirmed setups."""
+
+    _SELL_TYPES: ClassVar[frozenset[SetupType]] = frozenset({
+        SetupType.VWAP_REJECTION,
+        SetupType.VWAP_FAILED_RECLAIM_SHORT,
+        SetupType.TREND_PULLBACK_SHORT,
+        SetupType.ORB_BREAKDOWN,
+    })
 
     def __init__(self, settings: AlphaSettings, event_bus: EventBus) -> None:
         super().__init__()
         self._settings = settings
         self._event_bus = event_bus
         self._setup_engine: object | None = None
+        self._feature_engine: object | None = None
         self._scored_total: int = 0
 
     @property
@@ -88,6 +174,10 @@ class ScoringEngine(BaseEngine):
 
     def set_setup_engine(self, engine: object) -> None:
         self._setup_engine = engine
+
+    def set_feature_engine(self, engine: object) -> None:
+        """Inject FeatureEngine so we can read the confirmation bar snapshot."""
+        self._feature_engine = engine
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -110,53 +200,190 @@ class ScoringEngine(BaseEngine):
     async def _handle_setup(self, event: AnyEvent) -> None:
         if not isinstance(event, SetupEvent):
             return
-        if event.setup_state not in {SetupState.FORMING, SetupState.CONFIRMED}:
+        # Score only at CONFIRMED — entry/stop are set and confirmation bar is available.
+        if event.setup_state != SetupState.CONFIRMED:
             return
 
         setup = self._get_setup(event.symbol, event.setup_id)
         if setup is None:
             return
 
-        score, met, missing = self._score(setup)
-        grade = ScoringRubric.grade_for(score)
+        # Confirmation bar snapshot (current bar from FeatureEngine at event time).
+        confirm_snap = self._get_current_snapshot(event.symbol)
 
-        logger.debug(
-            "Score: %s %s → %.1f (%s) met=%s missing=%s",
-            setup.symbol, setup.setup_type, score, grade, met, missing,
+        score, grade, reasons, penalties = self._compute(setup, confirm_snap)
+
+        logger.info(
+            "Score: %s %s → %d (%s) reasons=%s penalties=%s",
+            setup.symbol, setup.setup_type, score, grade, reasons, penalties,
         )
         self._scored_total += 1
-        # TODO: update setup object via SetupEngine and re-emit SetupEvent
+        self._apply_score(event.symbol, event.setup_id, score, grade, reasons, penalties)
 
     # ── Scoring ───────────────────────────────────────────────────────────────
 
-    def _score(self, setup: Setup) -> tuple[float, list[str], list[str]]:
-        """Return (score 0-100, conditions_met, conditions_missing)."""
-        snap = setup.bar_snapshot
+    def _compute(
+        self,
+        setup: Setup,
+        confirm_snap: BarSnapshot | None,
+    ) -> tuple[int, SetupGrade, list[str], list[str]]:
+        """Return (raw_score, grade, reasons, penalties)."""
+        snap = setup.bar_snapshot           # forming bar snapshot
+        cs = confirm_snap or snap           # confirmation bar (fallback to forming)
         ms = setup.market_state
-        met: list[str] = []
-        missing: list[str] = []
-        total = 0.0
+
+        if setup.setup_type in self._SELL_TYPES:
+            return self._score_short(setup, snap, cs, ms)
+        return self._score_long(setup, snap, cs, ms)
+
+    def _score_short(
+        self,
+        setup: Setup,
+        snap: BarSnapshot,
+        cs: BarSnapshot,
+        ms: MarketState,
+    ) -> tuple[int, SetupGrade, list[str], list[str]]:
+        setup_type = setup.setup_type
+        base = _SHORT_BASE.get(setup_type, 1)
+        score = base
+        reasons: list[str] = [f"{setup_type.value} (base {base})"]
+        penalties: list[str] = []
+
+        bearish_bias = ms.live_bias in {LiveBias.BEARISH, LiveBias.TRANSITIONING_BEARISH}
+        bullish_bias = ms.live_bias == LiveBias.BULLISH
+        # Use confirmation bar's rvol when available; fall back to forming bar.
+        rvol = cs.relative_volume if cs.relative_volume is not None else snap.relative_volume
 
         checks: dict[str, bool] = {
-            "trend_aligned_with_market": ms.trend.value.startswith("trending"),
-            "price_above_ema20": snap.is_above_ema20 or False,
-            "price_above_vwap": snap.is_above_vwap,
-            "relative_volume_above_1_5": (snap.relative_volume or 0.0) >= 1.5,
-            "volume_expanding_on_move": False,          # TODO
-            "clean_level_break": False,                 # TODO
-            "orb_confirmed": ms.orb_volume_confirmed,
-            "no_overhead_resistance": False,            # TODO
-            "tight_stop_available": snap.atr_14 is not None,
+            "vwap_slope_down":     snap.vwap_slope_direction == "down",
+            "ema9_slope_down":     snap.ema_9_slope_direction == "down",
+            "ema20_slope_down":    snap.ema_20_slope_direction == "down",
+            "recent_lower_low":    snap.recent_lower_low,
+            "live_bias_bearish":   bearish_bias,
+            "trend_down":          ms.trend == TrendState.TRENDING_DOWN,
+            "confirm_lower_40pct": (
+                cs.bar_close_position_pct is not None
+                and cs.bar_close_position_pct <= 0.40
+            ),
+            "rvol_above_1_0":      rvol is not None and rvol >= 1.0,
+            "rvol_above_1_3":      rvol is not None and rvol >= 1.3,
+            "tight_risk_width":    self._is_tight_risk(setup, cs),
         }
 
-        for name, points in ScoringRubric.CONDITIONS:
+        for name, pts, label in _SHORT_ADD_ONS:
             if checks.get(name, False):
-                total += points
-                met.append(name)
-            else:
-                missing.append(name)
+                score += pts
+                reasons.append(label)
 
-        return total, met, missing
+        pen_checks: dict[str, bool] = {
+            "vwap_slope_rising":  snap.vwap_slope_direction == "up",
+            "ema20_slope_rising": snap.ema_20_slope_direction == "up",
+            "live_bias_bullish":  bullish_bias,
+            "chasing_extension":  snap.vwap_deviation_pct < -0.50,
+            "market_not_bearish": not bearish_bias,
+        }
+        for name, pts, label in _SHORT_PENALTIES:
+            if pen_checks.get(name, False):
+                score += pts   # pts is negative
+                penalties.append(label)
+
+        grade = _grade_from_score(score)
+
+        # Hard cap by setup type
+        cap = _SHORT_GRADE_CAPS.get(setup_type)
+        if cap is not None:
+            grade = _apply_cap(grade, cap)
+
+        # Regime cap: bullish market → short max A
+        if bullish_bias:
+            grade = _apply_cap(grade, SetupGrade.A)
+
+        return score, grade, reasons, penalties
+
+    def _score_long(
+        self,
+        setup: Setup,
+        snap: BarSnapshot,
+        cs: BarSnapshot,
+        ms: MarketState,
+    ) -> tuple[int, SetupGrade, list[str], list[str]]:
+        score = _LONG_BASE
+        reasons: list[str] = [f"{setup.setup_type.value} (base {_LONG_BASE})"]
+        penalties: list[str] = []
+
+        bullish_bias = ms.live_bias in {LiveBias.BULLISH, LiveBias.TRANSITIONING_BULLISH}
+        bearish_bias = ms.live_bias == LiveBias.BEARISH
+        rvol = cs.relative_volume if cs.relative_volume is not None else snap.relative_volume
+
+        checks: dict[str, bool] = {
+            "trend_aligned_bullish": (
+                ms.trend == TrendState.TRENDING_UP and snap.is_above_vwap
+            ),
+            "price_above_vwap":      snap.is_above_vwap,
+            "price_above_ema20":     bool(snap.is_above_ema20),
+            "live_bias_bullish":     bullish_bias,
+            "rvol_above_1_0":        rvol is not None and rvol >= 1.0,
+            "rvol_above_1_5":        rvol is not None and rvol >= 1.5,
+            "orb_confirmed":         ms.orb_volume_confirmed,
+            "tight_risk_width":      self._is_tight_risk(setup, cs),
+        }
+        for name, pts, label in _LONG_ADD_ONS:
+            if checks.get(name, False):
+                score += pts
+                reasons.append(label)
+
+        pen_checks: dict[str, bool] = {
+            "live_bias_bearish":    bearish_bias,
+            "trend_down":           ms.trend == TrendState.TRENDING_DOWN,
+            "chasing_extension_up": snap.vwap_deviation_pct > 0.50,
+            "market_not_bullish":   not bullish_bias,
+        }
+        for name, pts, label in _LONG_PENALTIES:
+            if pen_checks.get(name, False):
+                score += pts
+                penalties.append(label)
+
+        grade = _grade_from_score(score)
+
+        # Regime cap: bearish market → long max A
+        if bearish_bias:
+            grade = _apply_cap(grade, SetupGrade.A)
+
+        return score, grade, reasons, penalties
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_tight_risk(setup: Setup, snap: BarSnapshot) -> bool:
+        """True when the setup's risk (|entry - stop|) is ≤ 1× ATR-14."""
+        if setup.entry_trigger is None or setup.stop_reference is None:
+            return False
+        if snap.atr_14 is None:
+            return False
+        risk = abs(setup.entry_trigger - setup.stop_reference)
+        return risk <= snap.atr_14 * Decimal("1.0")
+
+    def _apply_score(
+        self,
+        symbol: str,
+        setup_id: UUID,
+        score: int,
+        grade: SetupGrade,
+        reasons: list[str],
+        penalties: list[str],
+    ) -> None:
+        from alpha.engines.setup.engine import SetupEngine
+        if isinstance(self._setup_engine, SetupEngine):
+            self._setup_engine.patch_setup_score(
+                symbol=symbol,
+                setup_id=setup_id,
+                score=float(score),
+                grade=grade,
+                conditions_met=reasons,
+                conditions_missing=[],
+                score_reasons=reasons,
+                score_penalties=penalties,
+            )
 
     def _get_setup(self, symbol: str, setup_id: object) -> Setup | None:
         from alpha.engines.setup.engine import SetupEngine
@@ -164,4 +391,12 @@ class ScoringEngine(BaseEngine):
             for s in self._setup_engine.active_setups(symbol):
                 if s.setup_id == setup_id:
                     return s
+        return None
+
+    def _get_current_snapshot(self, symbol: str) -> BarSnapshot | None:
+        if self._feature_engine is None:
+            return None
+        from alpha.engines.feature.engine import FeatureEngine
+        if isinstance(self._feature_engine, FeatureEngine):
+            return self._feature_engine.get_snapshot(symbol)
         return None

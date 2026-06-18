@@ -231,6 +231,7 @@ class BootstrapEngine(BaseEngine):
         self._setup.set_market_state_engine(self._market_state)
         self._scoring = ScoringEngine(self._settings, self._event_bus)
         self._scoring.set_setup_engine(self._setup)
+        self._scoring.set_feature_engine(self._feature)
         self._risk = RiskEngine(self._settings, self._event_bus)
         self._risk.set_setup_engine(self._setup)
         self._order = OrderEngine(self._settings, self._event_bus, self._registry)

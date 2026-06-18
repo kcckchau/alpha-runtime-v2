@@ -156,6 +156,41 @@ class SetupEngine(BaseEngine):
     def session_setup_context(self, symbol: str) -> SessionSetupContext | None:
         return self._session_contexts.get(symbol)
 
+    def patch_setup_score(
+        self,
+        symbol: str,
+        setup_id: "UUID",
+        score: float,
+        grade: "SetupGrade",
+        conditions_met: list[str],
+        conditions_missing: list[str],
+        score_reasons: list[str],
+        score_penalties: list[str],
+    ) -> bool:
+        """Update a confirmed setup's score/grade/reasons in-place.
+
+        Called by ScoringEngine after computing the score.  Returns True if
+        the setup was found and updated, False if it is no longer active.
+        """
+        active = self._active.get(symbol, {})
+        if setup_id not in active:
+            return False
+        patched = active[setup_id].model_copy(update={
+            "score": score,
+            "grade": grade,
+            "conditions_met": conditions_met,
+            "conditions_missing": conditions_missing,
+            "score_reasons": score_reasons,
+            "score_penalties": score_penalties,
+        })
+        active[setup_id] = patched
+        self._record_setup(symbol, patched)
+        logger.info(
+            "Setup scored: %s %s score=%.0f grade=%s",
+            symbol, patched.setup_type, score, grade,
+        )
+        return True
+
     def prev_session_setup_context(self, symbol: str) -> SessionSetupContext | None:
         return self._prev_session_contexts.get(symbol)
 
@@ -1480,6 +1515,8 @@ class SetupEngine(BaseEngine):
             structural_grade=setup.structural_grade,
             session_phase=setup.bar_snapshot.session_phase,
             invalidation_reason=setup.invalidation_reason,
+            score_reasons=setup.score_reasons,
+            score_penalties=setup.score_penalties,
         )
 
     @staticmethod

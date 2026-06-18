@@ -37,6 +37,8 @@ class Setup(BaseModel):
     conditions_met: list[str] = Field(default_factory=list)
     conditions_missing: list[str] = Field(default_factory=list)
     invalidation_reason: str | None = None
+    score_reasons: list[str] = Field(default_factory=list)    # human-readable reasons for each point earned
+    score_penalties: list[str] = Field(default_factory=list)  # human-readable reasons for each penalty applied
 
     # ── Context snapshots at detection time ──────────────────────────────────
     market_state: MarketState
@@ -87,6 +89,8 @@ class SetupHistoryEntry(BaseModel):
     structural_grade: SetupGrade | None = None
     session_phase: SessionPhase
     invalidation_reason: str | None = None
+    score_reasons: list[str] = Field(default_factory=list)
+    score_penalties: list[str] = Field(default_factory=list)
 
 
 class SessionSetupContext(BaseModel):
