@@ -79,7 +79,7 @@ def quarterly_contract_month(as_of: date | None = None) -> str:
     current = as_of or date.today()
     month = current.month
     year = current.year
-    for quarter_month in _QUARTERLY_MONTHS:
+    for i, quarter_month in enumerate(_QUARTERLY_MONTHS):
         if month < quarter_month:
             return f"{year}{quarter_month:02d}"
         if month == quarter_month:
@@ -87,7 +87,10 @@ def quarterly_contract_month(as_of: date | None = None) -> str:
             # that IBKR may no longer resolve reliably later that day.
             if current < _third_friday(year, quarter_month):
                 return f"{year}{quarter_month:02d}"
-            break
+            # Rolled past this expiry — return the next quarterly month.
+            if i + 1 < len(_QUARTERLY_MONTHS):
+                return f"{year}{_QUARTERLY_MONTHS[i + 1]:02d}"
+            return f"{year + 1}03"
     return f"{year + 1}03"
 
 
