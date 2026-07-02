@@ -344,6 +344,8 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             for record in self._client:
                 if not self._connected:
                     break
+                if not self._loop.is_running():
+                    break
                 try:
                     self._dispatch(record)
                 except Exception:
@@ -425,7 +427,10 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             ),
         )
         assert self._loop is not None
-        asyncio.run_coroutine_threadsafe(handler(event), self._loop)
+        try:
+            asyncio.run_coroutine_threadsafe(handler(event), self._loop)
+        except RuntimeError:
+            pass  # Loop closed during shutdown
 
     def _dispatch_quote(self, record: object) -> None:
         ticker = self._resolve_ticker(record)
@@ -465,7 +470,10 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             ),
         )
         assert self._loop is not None
-        asyncio.run_coroutine_threadsafe(handler(event), self._loop)
+        try:
+            asyncio.run_coroutine_threadsafe(handler(event), self._loop)
+        except RuntimeError:
+            pass  # Loop closed during shutdown
 
     def _dispatch_trade(self, record: object) -> None:
         ticker = self._resolve_ticker(record)
@@ -502,7 +510,10 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             ),
         )
         assert self._loop is not None
-        asyncio.run_coroutine_threadsafe(trade_handler(event), self._loop)
+        try:
+            asyncio.run_coroutine_threadsafe(trade_handler(event), self._loop)
+        except RuntimeError:
+            pass  # Loop closed during shutdown
 
     def _dispatch_book(self, record: object) -> None:
         ticker = self._resolve_ticker(record)
@@ -526,4 +537,7 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             ),
         )
         assert self._loop is not None
-        asyncio.run_coroutine_threadsafe(handler(event), self._loop)
+        try:
+            asyncio.run_coroutine_threadsafe(handler(event), self._loop)
+        except RuntimeError:
+            pass  # Loop closed during shutdown

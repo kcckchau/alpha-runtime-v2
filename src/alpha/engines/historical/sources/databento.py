@@ -163,9 +163,11 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
             )
         except Exception as exc:
             msg = str(exc)
-            if "data_schema_not_fully_available" in msg:
-                # Schema ingestion lags behind wall-clock; this is expected near
-                # the current time. The local cache has all available data.
+            if "data_schema_not_fully_available" in msg or "data_end_after_available_end" in msg:
+                # Per-schema ingestion lags behind wall-clock — ohlcv-1h and ohlcv-1d
+                # lag significantly more than ohlcv-1m. metadata.get_dataset_range()
+                # ignores the schema arg and returns the overall dataset end, so the
+                # clamp doesn't help for slower schemas. Expected near realtime.
                 logger.debug(
                     "Databento fetch_bars: %s [%s] schema=%s not yet available at end=%s — skipping",
                     symbol, timeframe, schema, end.isoformat(),
@@ -225,7 +227,7 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
             )
         except Exception as exc:
             msg = str(exc)
-            if "data_schema_not_fully_available" in msg:
+            if "data_schema_not_fully_available" in msg or "data_end_after_available_end" in msg:
                 logger.debug("Databento fetch_trades: %s schema not yet available at end=%s", symbol, end.isoformat())
             else:
                 logger.exception("Databento trades fetch failed for %s", symbol)
@@ -280,7 +282,7 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
             )
         except Exception as exc:
             msg = str(exc)
-            if "data_schema_not_fully_available" in msg:
+            if "data_schema_not_fully_available" in msg or "data_end_after_available_end" in msg:
                 logger.debug("Databento fetch_quotes: %s schema not yet available at end=%s", symbol, end.isoformat())
             else:
                 logger.exception("Databento quotes fetch failed for %s", symbol)
