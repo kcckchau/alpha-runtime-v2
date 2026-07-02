@@ -163,7 +163,11 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
             )
         except Exception as exc:
             msg = str(exc)
-            if "data_schema_not_fully_available" in msg or "data_end_after_available_end" in msg:
+            if (
+                "data_schema_not_fully_available" in msg
+                or "data_end_after_available_end" in msg
+                or "data_start_after_available_end" in msg
+            ):
                 # Per-schema ingestion lags behind wall-clock — ohlcv-1h and ohlcv-1d
                 # lag significantly more than ohlcv-1m. metadata.get_dataset_range()
                 # ignores the schema arg and returns the overall dataset end, so the

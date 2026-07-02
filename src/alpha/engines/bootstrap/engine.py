@@ -46,6 +46,14 @@ from alpha.models.symbol import Symbol
 from alpha.runtime_status import write_snapshot
 from alpha.timeframe_context import build_symbol_context
 
+
+def _write_snapshot_sync(settings: AlphaSettings, payload: dict[str, Any]) -> None:
+    """Run write_snapshot in a thread-executor — keeps the event loop free."""
+    try:
+        write_snapshot(settings, payload)
+    except Exception:
+        logging.getLogger(__name__).exception("Failed to write runtime snapshot")
+
 if TYPE_CHECKING:
     from alpha.engines.feature.engine import FeatureEngine
     from alpha.engines.historical.engine import HistoricalDataEngine
@@ -327,7 +335,11 @@ class BootstrapEngine(BaseEngine):
         if self._historical is None or self._storage is None:
             return
 
-        end = datetime.now(timezone.utc)
+        # Subtract a 3-minute ingestion lag buffer so the catch-up window never extends
+        # into bars that Databento hasn't settled yet. The live feed fills the remaining
+        # gap once it connects. metadata.get_dataset_range() returns the overall dataset
+        # end (ignoring schema), so _safe_end() alone cannot protect against this.
+        end = datetime.now(timezone.utc) - timedelta(minutes=3)
         vwap_start = self._vwap_session_start(end)
 
         # Per-timeframe warmup windows sized to the deepest indicator on each timeframe.
@@ -572,9 +584,15 @@ class BootstrapEngine(BaseEngine):
         return last < end
 
     async def _status_loop(self) -> None:
+        loop = asyncio.get_event_loop()
         ticks = 0
         while True:
-            self._write_runtime_snapshot()
+            # Build the snapshot on the event loop (pure Python, fast), then
+            # offload the JSON serialisation + file write to a thread so the
+            # event loop stays free to handle HTTP / WebSocket requests.
+            payload = self._build_runtime_snapshot()
+            settings = self._settings
+            loop.run_in_executor(None, _write_snapshot_sync, settings, payload)
             if ticks % 30 == 0:
                 self._log_runtime_summary()
             ticks += 1
@@ -672,11 +690,17 @@ class BootstrapEngine(BaseEngine):
             return {}
         completed = self._live.latest_bars()
         partial = self._live.latest_partial_bars()
+        now = datetime.now(timezone.utc)
+        current_minute = now.replace(second=0, microsecond=0)
         bars = {}
         for symbol in set(completed) | set(partial):
-            # Prefer the in-progress partial bar — it has the current price.
-            # Fall back to the last completed bar if no partial bar exists yet.
-            event = partial.get(symbol) or completed.get(symbol)
+            # Prefer the in-progress partial bar only when it belongs to the current
+            # minute. A stale partial bar (e.g. left over from before a reconnect)
+            # would show an extreme range on the chart for the wrong timestamp.
+            partial_event = partial.get(symbol)
+            if partial_event is not None and partial_event.timestamp < current_minute:
+                partial_event = None
+            event = partial_event or completed.get(symbol)
             if event:
                 bars[symbol] = event.model_dump(mode="json")
         return bars

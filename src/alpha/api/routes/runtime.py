@@ -315,14 +315,20 @@ async def available_dates(symbol: str) -> dict[str, Any]:
     session context files exist locally.
     """
     store = _parquet_store()
-    parquet_dates = store.list_dates(f"bars/{BarTimeframe.M1}", symbol.upper())
     ctx_store = _session_context_store()
-    context_dates = ctx_store.list_dates(symbol.upper())
-    return {
-        "symbol": symbol.upper(),
-        "bar_dates": [d.isoformat() for d in parquet_dates],
-        "context_dates": [d.isoformat() for d in context_dates],
-    }
+    sym = symbol.upper()
+    loop = asyncio.get_running_loop()
+
+    def _scan() -> dict[str, Any]:
+        parquet_dates = store.list_dates(f"bars/{BarTimeframe.M1}", sym)
+        context_dates = ctx_store.list_dates(sym)
+        return {
+            "symbol": sym,
+            "bar_dates": [d.isoformat() for d in parquet_dates],
+            "context_dates": [d.isoformat() for d in context_dates],
+        }
+
+    return await loop.run_in_executor(None, _scan)
 
 
 @router.get("/quotes")
@@ -354,37 +360,42 @@ async def list_bar_history(
     normalized_symbol = symbol.upper()
     normalized_timeframe = timeframe.lower()
 
-    if normalized_timeframe == "1mo":
-        table = store.read_range("bars/1d", normalized_symbol, start, end)
-        rows = aggregate_monthly_history(table.to_pylist())
-        return rows_to_history_payload(rows, "1mo")
+    loop = asyncio.get_running_loop()
 
-    timeframe_map = {
-        "1m": BarTimeframe.M1,
-        "5m": BarTimeframe.M5,
-        "1h": BarTimeframe.H1,
-        "1d": BarTimeframe.D1,
-    }
-    if normalized_timeframe == "15m":
+    def _load() -> list[dict[str, Any]]:  # type: ignore[type-arg]
+        if normalized_timeframe == "1mo":
+            table = store.read_range("bars/1d", normalized_symbol, start, end)
+            rows = aggregate_monthly_history(table.to_pylist())
+            return rows_to_history_payload(rows, "1mo")
+
+        timeframe_map = {
+            "1m": BarTimeframe.M1,
+            "5m": BarTimeframe.M5,
+            "1h": BarTimeframe.H1,
+            "1d": BarTimeframe.D1,
+        }
+        if normalized_timeframe == "15m":
+            table = store.read_range(
+                f"bars/{BarTimeframe.M5}",
+                normalized_symbol,
+                start,
+                end,
+            )
+            rows = _aggregate_history_rows(table.to_pylist(), "15m")
+            return rows_to_history_payload(rows, "15m")
+        if normalized_timeframe not in timeframe_map:
+            return []
+
         table = store.read_range(
-            f"bars/{BarTimeframe.M5}",
+            f"bars/{timeframe_map[normalized_timeframe]}",
             normalized_symbol,
             start,
             end,
         )
-        rows = _aggregate_history_rows(table.to_pylist(), "15m")
-        return rows_to_history_payload(rows, "15m")
-    if normalized_timeframe not in timeframe_map:
-        return []
+        rows = _sorted_history_rows(table.to_pylist())
+        return rows_to_history_payload(rows, normalized_timeframe)
 
-    table = store.read_range(
-        f"bars/{timeframe_map[normalized_timeframe]}",
-        normalized_symbol,
-        start,
-        end,
-    )
-    rows = _sorted_history_rows(table.to_pylist())
-    return rows_to_history_payload(rows, normalized_timeframe)
+    return await loop.run_in_executor(None, _load)
 
 
 @router.get("/contexts")

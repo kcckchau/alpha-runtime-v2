@@ -10,6 +10,8 @@ data_type: bars | trades | quotes | snapshots | market_states | setups | orders
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -57,20 +59,39 @@ class ParquetStore:
         if file_path.exists():
             try:
                 existing = pq.ParquetFile(file_path).read()
-                table = pa.concat_tables([existing, table], promote_options="default")
-            except Exception:
-                # File is corrupted or empty (e.g. interrupted write). Discard it
-                # and overwrite with the incoming table only.
+                # Use "permissive" so null-typed columns (e.g. optional string fields
+                # that happen to be None on the first write) merge cleanly with typed
+                # columns written in subsequent events.
+                table = pa.concat_tables([existing, table], promote_options="permissive")
+            except Exception as exc:
                 logger.warning(
-                    "Corrupted Parquet file discarded and replaced: %s", file_path
+                    "Corrupted Parquet file discarded and replaced: %s (%s: %s)",
+                    file_path,
+                    type(exc).__name__,
+                    exc,
                 )
                 file_path.unlink(missing_ok=True)
-        pq.write_table(
-            table,
-            file_path,
-            compression=self._compress,
-            row_group_size=self._row_group_size,
-        )
+
+        # Write atomically: write to a temp file in the same directory, then rename.
+        # This ensures the file is never in a partially-written state if the process
+        # is interrupted or if a concurrent reader observes the file mid-write.
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=path, suffix=".parquet.tmp")
+        try:
+            os.close(tmp_fd)
+            pq.write_table(
+                table,
+                tmp_path,
+                compression=self._compress,
+                row_group_size=self._row_group_size,
+            )
+            os.replace(tmp_path, file_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
         logger.debug("Wrote %d rows → %s", len(table), file_path)
         return file_path
 

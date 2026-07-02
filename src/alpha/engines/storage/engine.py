@@ -140,7 +140,11 @@ class StorageEngine(BaseEngine):
 
     def _subscribe_to_bus(self) -> None:
         for et in EventType:
-            self._event_bus.subscribe(et, self._on_event)
+            # Quote events arrive at very high frequency (hundreds/sec for futures).
+            # Use drop_if_full so the EventBus never blocks the publisher waiting for
+            # storage to catch up; the internal write queue already handles its own drops.
+            drop = et == EventType.QUOTE
+            self._event_bus.subscribe(et, self._on_event, drop_if_full=drop)
 
     async def _on_event(self, event: AnyEvent) -> None:
         try:
@@ -149,17 +153,22 @@ class StorageEngine(BaseEngine):
             logger.warning("StorageEngine write queue full — dropping %s", event.event_type)
 
     async def _writer_loop(self) -> None:
+        loop = asyncio.get_running_loop()
         while True:
             event = await self._write_queue.get()
             try:
-                await self._persist(event)
+                # Quotes are ephemeral high-frequency data (~hundreds/sec). They are
+                # never loaded back from Parquet and their per-row read-modify-write
+                # pattern would block the event loop for seconds by end of day.
+                if not isinstance(event, QuoteEvent):
+                    await loop.run_in_executor(None, self._persist_sync, event)
                 self._writes_total += 1
             except Exception:
                 logger.exception("StorageEngine: write error for %s", event.event_type)
             finally:
                 self._write_queue.task_done()
 
-    async def _persist(self, event: AnyEvent) -> None:
+    def _persist_sync(self, event: AnyEvent) -> None:
         import pyarrow as pa
 
         data_type = self._data_type_for(event)

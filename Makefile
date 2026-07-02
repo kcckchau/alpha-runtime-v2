@@ -15,11 +15,10 @@ setup: ## Install with dev deps and copy .env
 
 dev: ## Start DB, runtime engine, API server, and web dashboard (Ctrl-C stops all)
 	docker compose up -d db
-	@ALPHA_PID=""; API_PID=""; \
+	@ALPHA_PID=""; \
 	alpha run & ALPHA_PID=$$!; \
-	alpha api & API_PID=$$!; \
-	trap "kill $$ALPHA_PID $$API_PID 2>/dev/null; docker compose down" EXIT INT TERM; \
-	cd web && pnpm dev
+	trap "kill $$ALPHA_PID 2>/dev/null; docker compose down" EXIT INT TERM; \
+	cd web && pnpm dev --port 3001
 
 lint: ## Run ruff linter
 	ruff check src/ tests/

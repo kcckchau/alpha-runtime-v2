@@ -262,8 +262,14 @@ function formatPnl(value: number | null | undefined): string {
   return (value >= 0 ? "+" : "−") + "$" + Math.abs(value).toFixed(0);
 }
 
-function historyStartDate(symbol: string): string {
-  const lookbackDays = symbol.includes("MNQ") ? 7 : 5;
+function historyStartDate(symbol: string, timeframe: Timeframe): string {
+  // Limit rows returned per timeframe so the initial load stays fast.
+  // 1m = 2 days (~2880 bars for 24h futures), 5m/15m = 5 days, 1h/1d = 30 days.
+  const lookbackDays =
+    timeframe === "1m" ? 2
+    : timeframe === "5m" || timeframe === "15m" ? 5
+    : 30;
+  void symbol; // symbol-specific overrides can go here in the future
   const start = new Date(Date.now() - lookbackDays * 864e5);
   return start.toISOString().slice(0, 10);
 }
@@ -1646,7 +1652,7 @@ export function Dashboard() {
         // *prior* calendar day, whose UTC bars sit in the previous day's partition.
         // Pull histStart back one day so overnight bars are included in the chart.
         const is24hSymbol = /^(MNQ|NQ|ES|MES|RTY|M2K|YM|MYM|CL|GC|SI|NKD|EMD)/.test(symbol);
-        const rawHistStart = isHistorical ? selectedDate : historyStartDate(symbol);
+        const rawHistStart = isHistorical ? selectedDate : historyStartDate(symbol, selectedTimeframe);
         const histStart = (isHistorical && is24hSymbol)
           ? (() => { const d = new Date(rawHistStart + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); })()
           : rawHistStart;

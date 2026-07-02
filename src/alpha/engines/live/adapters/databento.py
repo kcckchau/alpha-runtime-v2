@@ -34,7 +34,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import threading
+from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING
@@ -140,6 +142,8 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
         self._instrument_id_to_ticker: dict[int, str] = {}
         # Databento continuous symbol (e.g. "MNQ.c.0") → internal ticker.
         self._db_to_ticker: dict[str, str] = {}
+        # schema → set of db_syms — used to replay subscriptions on reconnect.
+        self._sub_specs: dict[str, set[str]] = defaultdict(set)
 
     @property
     def source_id(self) -> DataSourceId:
@@ -221,6 +225,7 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             symbols=db_syms,
             stype_in=self._settings.stype_in,
         )
+        self._sub_specs[schema].update(db_syms)
         for ticker in symbols:
             self._bar_handlers[(ticker, schema)] = handler
 
@@ -242,6 +247,7 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             symbols=db_syms,
             stype_in=self._settings.stype_in,
         )
+        self._sub_specs["trades"].update(db_syms)
         for ticker in symbols:
             self._trade_handlers[ticker] = handler
 
@@ -263,6 +269,7 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             symbols=db_syms,
             stype_in=self._settings.stype_in,
         )
+        self._sub_specs["mbp-1"].update(db_syms)
         for ticker in symbols:
             self._quote_handlers[ticker] = handler
 
@@ -285,6 +292,7 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             symbols=db_syms,
             stype_in=self._settings.stype_in,
         )
+        self._sub_specs["mbp-10"].update(db_syms)
         for ticker in symbols:
             self._book_handlers[ticker] = handler
 
@@ -308,6 +316,7 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                 symbols=db_syms,
                 stype_in=self._settings.stype_in,
             )
+            self._sub_specs["trades"].update(db_syms)
         for ticker in symbols:
             self._tick_handlers[ticker] = handler
 
@@ -336,25 +345,80 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
         logger.info("Databento live record loop started")
 
     def _record_loop(self) -> None:
-        """Blocking record loop — runs in a dedicated background thread."""
-        assert self._client is not None
+        """Blocking record loop with auto-reconnect — runs in a dedicated background thread."""
         assert self._loop is not None
 
-        try:
-            for record in self._client:
-                if not self._connected:
-                    break
-                if not self._loop.is_running():
-                    break
-                try:
-                    self._dispatch(record)
-                except Exception:
-                    logger.exception("Databento: dispatch error for %r", record)
-        except Exception:
-            logger.exception("Databento live record loop exited with error")
-        finally:
-            self._connected = False
-            logger.warning("Databento live record loop terminated")
+        backoff = 1.0
+        max_backoff = 60.0
+
+        while self._connected:
+            if self._client is None:
+                break
+            try:
+                for record in self._client:
+                    if not self._connected:
+                        return
+                    if not self._loop.is_running():
+                        return
+                    try:
+                        self._dispatch(record)
+                    except Exception:
+                        logger.exception("Databento: dispatch error for %r", record)
+                logger.warning("Databento live record loop: server closed the connection")
+            except db.common.error.BentoError as exc:
+                msg = str(exc)
+                if "pop from an empty deque" in msg:
+                    # Databento SDK internal bug during session teardown — treat as a
+                    # normal disconnect, not an error.
+                    logger.warning("Databento live session closed unexpectedly (deque)")
+                else:
+                    logger.warning("Databento live session error: %s", exc)
+            except Exception:
+                logger.exception("Databento live record loop exited with error")
+
+            if not self._connected:
+                break
+
+            logger.info("Databento: reconnecting in %.0fs...", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+            try:
+                self._reconnect()
+                backoff = 1.0
+            except Exception:
+                logger.exception("Databento: reconnect failed — will retry")
+
+        self._connected = False
+        logger.warning("Databento live record loop terminated")
+
+    def _reconnect(self) -> None:
+        """Recreate the Live session and replay all subscriptions. Called from the background thread."""
+        assert self._loop is not None
+
+        if self._client is not None:
+            try:
+                self._client.stop()
+            except Exception:
+                pass
+
+        self._client = db.Live(key=self._settings.api_key.get_secret_value())
+        # Instrument-id mappings are session-scoped; reset so fresh SymbolMappingMsgs repopulate them.
+        self._instrument_id_to_ticker.clear()
+
+        for schema, db_syms in self._sub_specs.items():
+            self._client.subscribe(
+                dataset=self._settings.dataset,
+                schema=schema,
+                symbols=list(db_syms),
+                stype_in=self._settings.stype_in,
+            )
+
+        logger.info(
+            "Databento: reconnected (%d schema(s): %s)",
+            len(self._sub_specs),
+            list(self._sub_specs.keys()),
+        )
 
     # ── Dispatch ──────────────────────────────────────────────────────────────
 
