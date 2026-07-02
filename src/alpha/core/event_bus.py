@@ -9,6 +9,9 @@ Architecture:
   - A dispatcher task routes published events to matching queues
   - Worker tasks drain each subscription queue and call the handler
   - Backpressure: publishers wait when a subscriber queue is full
+    unless drop_if_full=True, in which case overflow events are discarded.
+    Use drop_if_full for "latest value wins" subscribers (e.g. quote handlers)
+    that only need the most recent event and can safely skip stale ones.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ class Subscription:
     symbol: str | None = None          # None → all symbols
     handler: HandlerT = field(repr=False, default=lambda e: None)  # type: ignore[assignment]
     queue: asyncio.Queue[AnyEvent] = field(repr=False, default_factory=lambda: asyncio.Queue(maxsize=1000))
+    drop_if_full: bool = False         # if True, overflow events are dropped instead of blocking
     _task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 
 
@@ -94,6 +98,9 @@ class EventBus:
             if sub.symbol is not None and sub.symbol != event.symbol:
                 continue
             if sub.queue.full():
+                if sub.drop_if_full:
+                    # Subscriber only needs latest value — silently drop stale event.
+                    continue
                 logger.warning(
                     "EventBus: queue full for subscription %s (%s/%s), applying backpressure",
                     sub.subscription_id,
@@ -109,13 +116,21 @@ class EventBus:
         *,
         symbol: str | None = None,
         queue_size: int | None = None,
+        drop_if_full: bool = False,
     ) -> Subscription:
-        """Register a handler and return a Subscription handle."""
+        """Register a handler and return a Subscription handle.
+
+        Args:
+            drop_if_full: When True, events are silently dropped rather than
+                blocking the publisher when the queue is full. Use for handlers
+                that only need the latest value (e.g. quote bid/ask updates).
+        """
         sub = Subscription(
             event_type=event_type,
             symbol=symbol,
             handler=handler,
             queue=asyncio.Queue(maxsize=queue_size or self._queue_size),
+            drop_if_full=drop_if_full,
         )
         sub._task = asyncio.ensure_future(self._drain(sub))
         self._subscriptions[event_type].append(sub)

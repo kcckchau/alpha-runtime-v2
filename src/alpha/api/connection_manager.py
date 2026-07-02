@@ -68,7 +68,7 @@ class ConnectionManager:
         if not isinstance(event_bus, EventBus):
             return
         event_bus.subscribe(EventType.BAR, self._on_bar)
-        event_bus.subscribe(EventType.QUOTE, self._on_quote)
+        event_bus.subscribe(EventType.QUOTE, self._on_quote, drop_if_full=True)
         logger.info("ConnectionManager: subscribed to EventBus (BAR + QUOTE)")
 
     # ── EventBus handlers ─────────────────────────────────────────────────────

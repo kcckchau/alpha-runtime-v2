@@ -166,7 +166,7 @@ class FeatureEngine(BaseEngine):
 
     async def _on_start(self) -> None:
         self._event_bus.subscribe(EventType.BAR, self._handle_bar)
-        self._event_bus.subscribe(EventType.QUOTE, self._handle_quote)
+        self._event_bus.subscribe(EventType.QUOTE, self._handle_quote, drop_if_full=True)
 
     async def _on_stop(self) -> None:
         pass
