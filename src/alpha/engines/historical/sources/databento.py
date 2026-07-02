@@ -102,16 +102,19 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
             return f"{root}{self._settings.continuous_suffix}"
         return sym.ticker
 
-    def _safe_end(self, end: datetime) -> datetime:
+    def _safe_end(self, end: datetime, schema: str | None = None) -> datetime:
         """
-        Clamp end to Databento's available range for the dataset.
+        Clamp end to Databento's available range for the given schema.
 
-        Databento raises 422 if end exceeds the last ingested timestamp
-        (typically a few minutes behind wall-clock). We fetch the available
-        range once per call and cap end accordingly.
+        Each schema has its own ingestion lag (ohlcv-1d lags more than ohlcv-1m).
+        Passing schema fetches the schema-specific available end; omitting it falls
+        back to the overall dataset range.
         """
         try:
-            info = self._client.metadata.get_dataset_range(dataset=self._settings.dataset)
+            kwargs: dict = {"dataset": self._settings.dataset}
+            if schema:
+                kwargs["schema"] = schema
+            info = self._client.metadata.get_dataset_range(**kwargs)
             available_end_str = info.get("end", "")
             if available_end_str:
                 available_end = datetime.fromisoformat(
@@ -134,7 +137,7 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
     ) -> AsyncIterator[BarEvent]:
         schema = _TIMEFRAME_TO_SCHEMA.get(timeframe, _FALLBACK_SCHEMA)
         db_symbol = self._databento_symbol(symbol)
-        end = self._safe_end(end)
+        end = self._safe_end(end, schema=schema)
 
         if start >= end:
             logger.debug(
@@ -158,8 +161,17 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
                 end=end.isoformat(),
                 stype_in=self._settings.stype_in,
             )
-        except Exception:
-            logger.exception("Databento timeseries.get_range failed for %s", symbol)
+        except Exception as exc:
+            msg = str(exc)
+            if "data_schema_not_fully_available" in msg:
+                # Schema ingestion lags behind wall-clock; this is expected near
+                # the current time. The local cache has all available data.
+                logger.debug(
+                    "Databento fetch_bars: %s [%s] schema=%s not yet available at end=%s — skipping",
+                    symbol, timeframe, schema, end.isoformat(),
+                )
+            else:
+                logger.exception("Databento timeseries.get_range failed for %s", symbol)
             return
 
         now = datetime.now(tz=_UTC)
@@ -193,7 +205,7 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
         end: datetime,
     ) -> AsyncIterator[TradeEvent]:
         db_symbol = self._databento_symbol(symbol)
-        end = self._safe_end(end)
+        end = self._safe_end(end, schema="trades")
 
         if start >= end:
             return
@@ -211,8 +223,12 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
                 end=end.isoformat(),
                 stype_in=self._settings.stype_in,
             )
-        except Exception:
-            logger.exception("Databento trades fetch failed for %s", symbol)
+        except Exception as exc:
+            msg = str(exc)
+            if "data_schema_not_fully_available" in msg:
+                logger.debug("Databento fetch_trades: %s schema not yet available at end=%s", symbol, end.isoformat())
+            else:
+                logger.exception("Databento trades fetch failed for %s", symbol)
             return
 
         now = datetime.now(tz=_UTC)
@@ -244,7 +260,7 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
         end: datetime,
     ) -> AsyncIterator[QuoteEvent]:
         db_symbol = self._databento_symbol(symbol)
-        end = self._safe_end(end)
+        end = self._safe_end(end, schema="mbp-1")
 
         if start >= end:
             return
@@ -262,8 +278,12 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
                 end=end.isoformat(),
                 stype_in=self._settings.stype_in,
             )
-        except Exception:
-            logger.exception("Databento quotes fetch failed for %s", symbol)
+        except Exception as exc:
+            msg = str(exc)
+            if "data_schema_not_fully_available" in msg:
+                logger.debug("Databento fetch_quotes: %s schema not yet available at end=%s", symbol, end.isoformat())
+            else:
+                logger.exception("Databento quotes fetch failed for %s", symbol)
             return
 
         now = datetime.now(tz=_UTC)
