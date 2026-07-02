@@ -15,6 +15,9 @@ The engine supports runtime symbol add/remove without restart.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
 
 from alpha.config.settings import AlphaSettings
 from alpha.core.engine import BaseEngine, EngineHealth
@@ -25,6 +28,17 @@ from alpha.models.enums import BarTimeframe, HealthStatus
 from alpha.models.events import BarEvent, OrderBookEvent, QuoteEvent, TradeEvent
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _PartialAccum:
+    """Running OHLCV state for the current 1-minute bar, built from trade ticks."""
+    minute_ts: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: int
 
 
 class LiveIngestionEngine(BaseEngine):
@@ -56,6 +70,15 @@ class LiveIngestionEngine(BaseEngine):
         self._latest_bars: dict[str, BarEvent] = {}
         self._latest_partial_bars: dict[str, BarEvent] = {}
         self._latest_quotes: dict[str, QuoteEvent] = {}
+        # Last published bid/ask prices per symbol — used to debounce quote events.
+        # mbp-1 from Databento fires on every book change including size-only updates
+        # (hundreds/sec for MNQ). We only publish to the EventBus when the price changes.
+        self._last_published_bid: dict[str, object] = {}
+        self._last_published_ask: dict[str, object] = {}
+        # Partial bar accumulators — built from trade ticks when the adapter does not
+        # natively stream in-progress bars (e.g. Databento ohlcv-1m only delivers
+        # completed bars). Keyed by symbol; reset on each new minute boundary.
+        self._partial_accum: dict[str, _PartialAccum] = {}
 
     @property
     def name(self) -> str:
@@ -98,6 +121,7 @@ class LiveIngestionEngine(BaseEngine):
             return
 
         await adapter.subscribe_bars(symbols, BarTimeframe.M1, self._on_bar)
+        await adapter.subscribe_bars(symbols, BarTimeframe.S1, self._on_bar)
         await adapter.subscribe_trades(symbols, self._on_trade)
         await adapter.subscribe_quotes(symbols, self._on_quote)
 
@@ -156,22 +180,82 @@ class LiveIngestionEngine(BaseEngine):
     async def _on_bar(self, event: BarEvent) -> None:
         self._bars_received += 1
         if event.is_partial:
-            # Partial (in-progress) bars are only used for live display — they
-            # are not published to the event bus so storage/downstream engines
-            # never see incomplete bar data.
+            # Partial bars are only for live display — not published to EventBus
+            # so downstream engines (storage, feature, setup) never see incomplete data.
             self._latest_partial_bars[event.symbol] = event
             return
-        self._latest_bars[event.symbol] = event
+        # Only M1+ bars update the snapshot state used by the dashboard and REST API.
+        # Sub-minute bars (S1) are published to the EventBus for the push WS only.
+        _SNAPSHOT_TIMEFRAMES = {BarTimeframe.M1, BarTimeframe.M5, BarTimeframe.H1, BarTimeframe.D1}
+        if event.timeframe in _SNAPSHOT_TIMEFRAMES:
+            self._latest_bars[event.symbol] = event
         await self._event_bus.publish(event)
 
     async def _on_trade(self, event: TradeEvent) -> None:
         self._trades_received += 1
         await self._event_bus.publish(event)
+        self._update_partial_bar(event)
+
+    def _update_partial_bar(self, event: TradeEvent) -> None:
+        """
+        Accumulate trade ticks into a partial 1m bar stored in _latest_partial_bars.
+
+        This provides a live forming candle for data sources (like Databento ohlcv-1m)
+        that only deliver completed bars. The partial bar is used by the dashboard
+        to show the current minute's OHLC in real-time without going through the EventBus.
+        """
+        from alpha.models.events import EventMetadata
+        minute_ts = event.timestamp.replace(second=0, microsecond=0)
+        sym = event.symbol
+        acc = self._partial_accum.get(sym)
+
+        if acc is None or acc.minute_ts != minute_ts:
+            acc = _PartialAccum(
+                minute_ts=minute_ts,
+                open=event.price,
+                high=event.price,
+                low=event.price,
+                close=event.price,
+                volume=event.size,
+            )
+        else:
+            acc.high = max(acc.high, event.price)
+            acc.low = min(acc.low, event.price)
+            acc.close = event.price
+            acc.volume += event.size
+
+        self._partial_accum[sym] = acc
+        self._latest_partial_bars[sym] = BarEvent(
+            symbol=sym,
+            timestamp=minute_ts,
+            timeframe=BarTimeframe.M1,
+            open=acc.open,
+            high=acc.high,
+            low=acc.low,
+            close=acc.close,
+            volume=acc.volume,
+            is_partial=True,
+            metadata=EventMetadata(
+                source=event.metadata.source,
+                received_at=event.metadata.received_at,
+                is_replay=False,
+            ),
+        )
 
     async def _on_quote(self, event: QuoteEvent) -> None:
         self._quotes_received += 1
         self._latest_quotes[event.symbol] = event
-        await self._event_bus.publish(event)
+        # Only publish to the EventBus when bid or ask price changes.
+        # mbp-1 also fires on size-only changes (hundreds/sec for MNQ) which
+        # would overflow subscriber queues. Downstream engines only care about price.
+        sym = event.symbol
+        if (
+            event.bid_price != self._last_published_bid.get(sym)
+            or event.ask_price != self._last_published_ask.get(sym)
+        ):
+            self._last_published_bid[sym] = event.bid_price
+            self._last_published_ask[sym] = event.ask_price
+            await self._event_bus.publish(event)
 
     async def _on_order_book(self, event: OrderBookEvent) -> None:
         await self._event_bus.publish(event)

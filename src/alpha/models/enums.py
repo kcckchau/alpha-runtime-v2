@@ -23,6 +23,7 @@ class EngineState(StrEnum):
 
 class DataSourceId(StrEnum):
     ALPACA = "alpaca"
+    DATABENTO = "databento"
     POLYGON = "polygon"
     INTERACTIVE_BROKERS = "interactive_brokers"
     TASTYTRADE = "tastytrade"

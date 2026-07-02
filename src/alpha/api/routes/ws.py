@@ -61,8 +61,44 @@ async def runtime_ws_legacy(
     timeframe: str | None = None,
     interval_ms: int = 1000,
 ) -> None:
-    # `timeframe` is accepted for backwards compatibility with the older client
-    # websocket contract. The current stream payload is symbol-scoped and emits
-    # the latest snapshot data regardless of timeframe.
     _ = timeframe
     await _runtime_ws_impl(websocket, symbol, interval_ms)
+
+
+@router.websocket("/runtime/ws/live")
+async def runtime_ws_live(websocket: WebSocket, symbol: str) -> None:
+    """
+    Push-based WebSocket endpoint.
+
+    Broadcasts BarEvent and QuoteEvent messages immediately as they arrive
+    from the EventBus — no polling, no file reads. Only active when the
+    API runs inside `alpha run` (requires injected EventBus).
+
+    Message types:
+      {"type": "bar",   "symbol": ..., "timeframe": ..., "timestamp": ...,
+       "open": ..., "high": ..., "low": ..., "close": ..., "volume": ...,
+       "vwap": ..., "partial": bool}
+      {"type": "quote", "symbol": ..., "timestamp": ...,
+       "bid_price": ..., "ask_price": ..., "last_price": ...,
+       "bid_size": ..., "ask_size": ...}
+    """
+    manager = getattr(websocket.app.state, "connection_manager", None)
+    if manager is None:
+        await websocket.close(code=1013, reason="ConnectionManager not available")
+        return
+
+    normalized = symbol.upper()
+    await manager.connect(websocket, normalized)
+    try:
+        # Hold the connection open; manager broadcasts on incoming events.
+        # We also send periodic pings to detect dead connections.
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await websocket.send_json({"type": "ping"})
+            except Exception:
+                break
+    except WebSocketDisconnect:
+        pass
+    finally:
+        manager.disconnect(websocket, normalized)

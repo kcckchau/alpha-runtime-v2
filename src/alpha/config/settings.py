@@ -134,6 +134,18 @@ class PolygonSettings(BaseSettings):
     base_url: str = "https://api.polygon.io"
 
 
+class DatabentoSettings(BaseSettings):
+    api_key: SecretStr = SecretStr("")
+    # Default dataset for CME Globex US futures (ES, NQ, CL, GC, etc.)
+    dataset: str = "GLBX.MDP3"
+    # Symbol type for live and historical requests — "continuous" uses roll-adjusted
+    # front-month contracts (e.g. ES.c.0) without manual contract-month tracking.
+    stype_in: str = "continuous"
+    # Suffix appended to root_symbol to build the Databento continuous symbol.
+    # ".c.0" = front-month, ".c.1" = second-month, etc.
+    continuous_suffix: str = ".c.0"
+
+
 class RiskSettings(BaseSettings):
     # Legacy scalar fields — used when no accounts file / RISK__ACCOUNTS is set
     account_size: Decimal = Decimal("25000.00")
@@ -207,6 +219,7 @@ class AlphaSettings(BaseSettings):
     historical: HistoricalSettings = Field(default_factory=HistoricalSettings)
     live: LiveSettings = Field(default_factory=LiveSettings)
     alpaca: AlpacaSettings = Field(default_factory=AlpacaSettings)
+    databento: DatabentoSettings = Field(default_factory=DatabentoSettings)
     polygon: PolygonSettings = Field(default_factory=PolygonSettings)
     ibkr: IBKRSettings = Field(default_factory=IBKRSettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)

@@ -28,6 +28,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "click>=8.1",
     "ib_insync>=0.9.86",
+    "databento>=0.38",
 ]
 
 [project.optional-dependencies]

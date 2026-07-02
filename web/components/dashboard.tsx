@@ -1836,8 +1836,82 @@ export function Dashboard() {
       // Polling remains active, so websocket failures should stay non-fatal.
     };
 
+    // Push-based live WS — receives bar and quote events immediately from the EventBus.
+    // Only active when alpha run embeds the API (requires injected EventBus).
+    const liveWs = new WebSocket(
+      `${websocketBaseUrl()}/runtime/ws/live?symbol=${encodeURIComponent(selectedSymbol)}`
+    );
+
+    liveWs.onmessage = (ev) => {
+      if (isHistorical) return;
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.symbol !== selectedSymbol) return;
+
+        if (msg.type === "bar") {
+          const barRow: BarHistoryRow = {
+            symbol: msg.symbol,
+            timeframe: msg.timeframe,
+            timestamp: msg.timestamp,
+            open: msg.open,
+            high: msg.high,
+            low: msg.low,
+            close: msg.close,
+            volume: Number(msg.volume),
+            vwap: msg.vwap ?? null,
+          };
+          setBars((prev) => mergeLiveBar(prev, barRow, selectedTimeframe));
+        }
+
+        if (msg.type === "quote" && msg.last_price != null) {
+          const price = Number(msg.last_price);
+          if (isFinite(price) && price > 0) {
+            setQuotes((prev) => ({
+              ...prev,
+              [selectedSymbol]: {
+                symbol: msg.symbol,
+                bid_price: msg.bid_price,
+                ask_price: msg.ask_price,
+                bid_size: msg.bid_size,
+                ask_size: msg.ask_size,
+                last_price: msg.last_price,
+                last_size: msg.last_size ?? null,
+                timestamp: msg.timestamp,
+              },
+            }));
+            setBars((prev) => {
+              if (prev.length === 0) return prev;
+              const lastBar = prev[prev.length - 1];
+              if (
+                bucketTimestamp(msg.timestamp, selectedTimeframe) !==
+                bucketTimestamp(lastBar.timestamp, selectedTimeframe)
+              ) {
+                return prev;
+              }
+              return [
+                ...prev.slice(0, -1),
+                {
+                  ...lastBar,
+                  close: String(price),
+                  high: String(Math.max(Number(lastBar.high), price)),
+                  low: String(Math.min(Number(lastBar.low), price)),
+                },
+              ];
+            });
+          }
+        }
+      } catch {
+        // Ignore malformed messages
+      }
+    };
+
+    liveWs.onerror = () => {
+      // Push WS is best-effort; polling WS remains the fallback.
+    };
+
     return () => {
       ws.close();
+      liveWs.close();
     };
   }, [selectedSymbol, selectedTimeframe, selectedDate]);
 

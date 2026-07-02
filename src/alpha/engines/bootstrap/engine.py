@@ -238,6 +238,7 @@ class BootstrapEngine(BaseEngine):
         self._risk.set_order_engine(self._order)
 
         self._wire_ibkr()
+        self._wire_databento()
 
         self._engines = [
             self._storage,
@@ -285,6 +286,31 @@ class BootstrapEngine(BaseEngine):
         if self._risk is not None:
             self._risk.set_broker_adapter(ibkr_adapter)
         logger.info("IBKR adapters registered (paper=%s)", self._settings.ibkr.is_paper)
+
+    def _wire_databento(self) -> None:
+        """Register Databento adapters if Databento is configured as the data source."""
+        from alpha.models.enums import DataSourceId
+
+        hist_src = self._settings.historical.primary_source
+        live_src = self._settings.live.primary_source
+
+        if DataSourceId.DATABENTO not in {hist_src, live_src}:
+            return
+
+        from alpha.engines.historical.sources.databento import DatabentoHistoricalDataSource
+        from alpha.engines.live.adapters.databento import DatabentoLiveFeedAdapter
+
+        if hist_src == DataSourceId.DATABENTO:
+            self._historical.register_source(
+                DatabentoHistoricalDataSource(self._registry, self._settings.databento)
+            )
+
+        if live_src == DataSourceId.DATABENTO:
+            self._live.register_adapter(
+                DatabentoLiveFeedAdapter(self._settings.databento, self._registry)
+            )
+
+        logger.info("Databento adapters registered (dataset=%s)", self._settings.databento.dataset)
 
     async def _run_catchup(self) -> None:
         """Load recent history before connecting the live feed."""
