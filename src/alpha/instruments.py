@@ -96,14 +96,31 @@ def quarterly_contract_month(as_of: date | None = None) -> str:
 
 def resolve_symbol(ticker: str, *, as_of: date | None = None) -> Symbol:
     normalized = ticker.upper().strip()
-    spec = _FUTURES.get(normalized)
+
+    # Support "ROOT-MM" style tickers (e.g. "MNQ-09" for the September MNQ contract).
+    # The root is looked up in _FUTURES; root_symbol on the resulting Symbol is always
+    # the bare root so that Databento can append the continuous suffix (e.g. "MNQ.c.0").
+    root = normalized
+    contract_month: str | None = None
+    if "-" in normalized:
+        parts = normalized.split("-", 1)
+        root_candidate, suffix = parts[0], parts[1]
+        if suffix.isdigit() and len(suffix) == 2 and root_candidate in _FUTURES:
+            root = root_candidate
+            # Determine year: if the month has already passed this year, it's next year.
+            current = as_of or date.today()
+            month = int(suffix)
+            year = current.year if month >= current.month else current.year + 1
+            contract_month = f"{year}{month:02d}"
+
+    spec = _FUTURES.get(root)
     if spec is not None:
         return Symbol(
-            ticker=spec.ticker,
+            ticker=normalized,
             exchange=spec.exchange,
             asset_class=AssetClass.FUTURE,
-            root_symbol=spec.ticker,
-            contract_month=quarterly_contract_month(as_of),
+            root_symbol=spec.ticker,   # bare root — used by Databento for continuous suffix
+            contract_month=contract_month or quarterly_contract_month(as_of),
             currency=spec.currency,
             description=spec.description,
             tick_size=spec.tick_size,
