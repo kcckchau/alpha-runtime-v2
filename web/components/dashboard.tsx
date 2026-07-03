@@ -323,6 +323,32 @@ function mergeLiveBar(
     timestamp: bucket,
   };
 
+  // When the incoming bar's native timeframe matches the chart timeframe, the
+  // backend has already accumulated the correct OHLCV for that period. Trust it
+  // directly — do NOT take Math.max/Math.min, which would lock in any stale or
+  // bad value from a previous update and prevent it from ever being corrected.
+  //
+  // Math.max/Math.min is only correct when aggregating sub-timeframe bars into a
+  // higher timeframe (e.g. 1m bars into a 5m bucket), where the frontend must
+  // accumulate highs/lows across several incoming bars.
+  const nativeTf = String(incomingBar.timeframe ?? "").toLowerCase();
+  const sameTimeframe = nativeTf === timeframe || nativeTf === "";
+
+  function mergeInto(existing: BarHistoryRow): BarHistoryRow {
+    if (sameTimeframe) {
+      // Replace: backend is authoritative, bad values from prior updates get corrected.
+      return { ...nextBar, open: existing.open };
+    }
+    // Cross-timeframe: accumulate across sub-bars.
+    return {
+      ...existing,
+      ...nextBar,
+      open: existing.open,
+      high: String(Math.max(Number(existing.high), Number(nextBar.high))),
+      low: String(Math.min(Number(existing.low), Number(nextBar.low))),
+    };
+  }
+
   const merged = [...existingBars];
   const lastIndex = merged.length - 1;
   const lastBar = merged[lastIndex];
@@ -330,37 +356,49 @@ function mergeLiveBar(
   if (!lastBar) return [nextBar];
 
   if (lastBar.timestamp === bucket) {
-    merged[lastIndex] = {
-      ...lastBar,
-      ...nextBar,
-      open: lastBar.open,
-      high: String(Math.max(Number(lastBar.high), Number(nextBar.high))),
-      low: String(Math.min(Number(lastBar.low), Number(nextBar.low))),
-    };
+    merged[lastIndex] = mergeInto(lastBar);
     return merged;
   }
 
   if (new Date(lastBar.timestamp).getTime() > new Date(bucket).getTime()) {
     const byTimestamp = new Map(merged.map((bar) => [bar.timestamp, bar]));
     const existing = byTimestamp.get(bucket);
-    byTimestamp.set(
-      bucket,
-      existing
-        ? {
-            ...existing,
-            ...nextBar,
-            open: existing.open,
-            high: String(Math.max(Number(existing.high), Number(nextBar.high))),
-            low: String(Math.min(Number(existing.low), Number(nextBar.low))),
-          }
-        : nextBar
-    );
+    byTimestamp.set(bucket, existing ? mergeInto(existing) : nextBar);
     return [...byTimestamp.values()].sort(
       (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
     );
   }
 
   return [...merged, nextBar];
+}
+
+function symbolsMatch(a: string, b: string): boolean {
+  const au = a.toUpperCase();
+  const bu = b.toUpperCase();
+  if (au === bu) return true;
+  return au.split("-")[0] === bu.split("-")[0];
+}
+
+/** Keep WS-appended bars when a history poll returns stale parquet data. */
+function mergeHistoryWithLiveTail(
+  barData: BarHistoryRow[],
+  latestLiveBar: BarHistoryRow | null,
+  prevBars: BarHistoryRow[],
+  timeframe: Timeframe,
+): BarHistoryRow[] {
+  let merged = latestLiveBar
+    ? mergeLiveBar(barData, latestLiveBar, timeframe)
+    : barData;
+  if (prevBars.length === 0 || barData.length === 0) return merged;
+
+  const lastHistTs = new Date(barData[barData.length - 1].timestamp).getTime();
+  const liveTail = prevBars.filter(
+    (b) => new Date(b.timestamp).getTime() > lastHistTs
+  );
+  for (const bar of liveTail) {
+    merged = mergeLiveBar(merged, bar, timeframe);
+  }
+  return merged;
 }
 
 type RuntimeWsMessage = {
@@ -1730,7 +1768,9 @@ export function Dashboard() {
         }
 
         const latestLiveBar = !isHistorical ? (latestBarData[symbol] ?? null) : null;
-        setBars(latestLiveBar ? mergeLiveBar(barData, latestLiveBar, selectedTimeframe) : barData);
+        setBars((prev) =>
+          mergeHistoryWithLiveTail(barData, latestLiveBar, prev, selectedTimeframe)
+        );
         setSetups(setupData);
         setSetupContexts((prev) => ({ ...prev, ...setupContextData }));
         setPrevSetupContexts((prev) => ({ ...prev, ...prevSetupContextData }));
@@ -1763,7 +1803,7 @@ export function Dashboard() {
     ws.onmessage = (event) => {
       try {
         const payload = JSON.parse(event.data) as RuntimeWsMessage;
-        if (payload.type !== "runtime_update" || payload.symbol !== selectedSymbol) return;
+        if (payload.type !== "runtime_update" || !symbolsMatch(payload.symbol, selectedSymbol)) return;
 
         // Always update runtime status (mode / health)
         setStatus((prev) =>
@@ -1793,10 +1833,15 @@ export function Dashboard() {
           // Use last trade price to keep the live candle close current between
           // partial bar updates (which arrive every few seconds). The partial
           // bar will correct the full OHLCV when it arrives.
-          const { last_price, timestamp } = payload.quote;
+          const { last_price, bid_price, ask_price, timestamp } = payload.quote;
           if (last_price != null) {
             const price = Number(last_price);
-            if (isFinite(price) && price > 0) {
+            const bid = Number(bid_price);
+            const ask = Number(ask_price);
+            // Validate last_price is near the current spread to reject off-market prints.
+            const mid = isFinite(bid) && isFinite(ask) && ask > bid ? (bid + ask) / 2 : 0;
+            const inRange = mid === 0 || Math.abs(price - mid) / mid < 0.005;
+            if (isFinite(price) && price > 0 && inRange) {
               setBars((prev) => {
                 if (prev.length === 0) return prev;
                 const lastBar = prev[prev.length - 1];
@@ -1811,8 +1856,6 @@ export function Dashboard() {
                   {
                     ...lastBar,
                     close: String(price),
-                    high: String(Math.max(Number(lastBar.high), price)),
-                    low: String(Math.min(Number(lastBar.low), price)),
                   },
                 ];
               });
@@ -1852,9 +1895,11 @@ export function Dashboard() {
       if (isHistorical) return;
       try {
         const msg = JSON.parse(ev.data);
-        if (msg.symbol !== selectedSymbol) return;
+        if (!symbolsMatch(msg.symbol, selectedSymbol)) return;
 
         if (msg.type === "bar") {
+          const tf = String(msg.timeframe).toLowerCase();
+          if (tf !== selectedTimeframe) return;
           const barRow: BarHistoryRow = {
             symbol: msg.symbol,
             timeframe: msg.timeframe,
@@ -1871,6 +1916,10 @@ export function Dashboard() {
 
         if (msg.type === "quote" && msg.last_price != null) {
           const price = Number(msg.last_price);
+          const bid = Number(msg.bid_price);
+          const ask = Number(msg.ask_price);
+          const mid = isFinite(bid) && isFinite(ask) && ask > bid ? (bid + ask) / 2 : 0;
+          const inRange = mid === 0 || Math.abs(price - mid) / mid < 0.005;
           if (isFinite(price) && price > 0) {
             setQuotes((prev) => ({
               ...prev,
@@ -1885,25 +1934,25 @@ export function Dashboard() {
                 timestamp: msg.timestamp,
               },
             }));
-            setBars((prev) => {
-              if (prev.length === 0) return prev;
-              const lastBar = prev[prev.length - 1];
-              if (
-                bucketTimestamp(msg.timestamp, selectedTimeframe) !==
-                bucketTimestamp(lastBar.timestamp, selectedTimeframe)
-              ) {
-                return prev;
-              }
-              return [
-                ...prev.slice(0, -1),
-                {
-                  ...lastBar,
-                  close: String(price),
-                  high: String(Math.max(Number(lastBar.high), price)),
-                  low: String(Math.min(Number(lastBar.low), price)),
-                },
-              ];
-            });
+            if (inRange) {
+              setBars((prev) => {
+                if (prev.length === 0) return prev;
+                const lastBar = prev[prev.length - 1];
+                if (
+                  bucketTimestamp(msg.timestamp, selectedTimeframe) !==
+                  bucketTimestamp(lastBar.timestamp, selectedTimeframe)
+                ) {
+                  return prev;
+                }
+                return [
+                  ...prev.slice(0, -1),
+                  {
+                    ...lastBar,
+                    close: String(price),
+                  },
+                ];
+              });
+            }
           }
         }
       } catch {
