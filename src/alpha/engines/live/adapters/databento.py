@@ -544,6 +544,23 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
         if ticker is None:
             return
 
+        # Filter out non-standard trade types so partial bar accumulation
+        # matches Databento's ohlcv-* bars (which only include match_type='E').
+        #
+        # CME Globex match_type values:
+        #   'E' = auction entry (standard CLOB match)   ← keep
+        #   'B' = block trade (off-market, any price)   ← reject
+        #   'T' = EFRP (exchange for related position)  ← reject
+        #   'I' = implied (spread-leg synthetic print)  ← reject
+        #   None/unknown → accept (be permissive for unknown venues)
+        match_type = getattr(record, "match_type", None)
+        if match_type is not None and str(match_type) not in {"E", ""}:
+            logger.debug(
+                "Databento: skipping non-standard trade match_type=%s price=%s sym=%s",
+                match_type, getattr(record, "price", None), ticker,
+            )
+            return
+
         price = float(_to_decimal(record.price))  # type: ignore[union-attr]
         size = int(record.size)                    # type: ignore[union-attr]
 
