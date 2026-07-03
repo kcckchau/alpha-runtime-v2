@@ -209,6 +209,8 @@ class StorageEngine(BaseEngine):
         `_flush_loop` batch them into far fewer, larger writes.
         """
         data_type = self._data_type_for(event)
+        if data_type is None:
+            return
         row = self._serialize_event(event)
         key = (data_type, self._storage_symbol(event), event.timestamp.date())
         self._buffers[key].append(row)
@@ -248,7 +250,7 @@ class StorageEngine(BaseEngine):
         self._parquet.write(table, data_type, symbol, d)
 
     @staticmethod
-    def _data_type_for(event: AnyEvent) -> str:
+    def _data_type_for(event: AnyEvent) -> str | None:
         if isinstance(event, BarEvent):
             return f"bars/{event.timeframe}"
         if isinstance(event, TradeEvent):
@@ -265,7 +267,7 @@ class StorageEngine(BaseEngine):
             return "orders"
         if isinstance(event, SystemEvent):
             return "system"
-        raise TypeError(f"Unsupported event type: {type(event).__name__}")
+        return None  # unrecognised event types are not persisted
 
     def _serialize_event(self, event: AnyEvent) -> dict[str, Any]:
         base = {
