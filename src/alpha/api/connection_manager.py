@@ -22,6 +22,28 @@ from alpha.models.events import AnyEvent, BarEvent, QuoteEvent
 logger = logging.getLogger(__name__)
 
 
+def _symbol_broadcast_keys(symbol: str) -> set[str]:
+    """Return WS connection keys that should receive events for this symbol."""
+    upper = symbol.upper()
+    keys = {upper}
+    if "-" in upper:
+        keys.add(upper.split("-", 1)[0])
+    return keys
+
+
+def _resolve_snapshot_symbol(snapshot: dict, symbol: str) -> str:
+    """Map a client symbol (e.g. MNQ) to the snapshot key (e.g. MNQ-09)."""
+    bars = snapshot.get("bars") or {}
+    upper = symbol.upper()
+    if upper in bars:
+        return upper
+    root = upper.split("-", 1)[0]
+    for key in bars:
+        if key.split("-", 1)[0] == root:
+            return key
+    return upper
+
+
 def _decimal_str(v: Decimal | None) -> str | None:
     return str(v) if v is not None else None
 
@@ -110,7 +132,9 @@ class ConnectionManager:
     # ── Broadcast ─────────────────────────────────────────────────────────────
 
     async def _broadcast(self, symbol: str, payload: dict) -> None:  # type: ignore[type-arg]
-        clients = self._connections.get(symbol.upper(), set())
+        clients: set[WebSocket] = set()
+        for key in _symbol_broadcast_keys(symbol):
+            clients.update(self._connections.get(key, set()))
         if not clients:
             return
         dead: set[WebSocket] = set()
@@ -120,4 +144,5 @@ class ConnectionManager:
             except Exception:
                 dead.add(ws)
         for ws in dead:
-            clients.discard(ws)
+            for key in _symbol_broadcast_keys(symbol):
+                self._connections.get(key, set()).discard(ws)

@@ -29,7 +29,16 @@
       "Bash(git remote:*)",
       "Bash(git config:*)",
       "Bash(git push:*)",
-      "Bash(ls -la /Users/kennethchau/Projects/alpha-runtime-v2/.env*)"
+      "Bash(ls -la /Users/kennethchau/Projects/alpha-runtime-v2/.env*)",
+      "Bash(git commit:*)",
+      "Bash(lsof:*)",
+      "Bash(ps:*)",
+      "Bash(kill 54928)",
+      "Bash(ls data/parquet/MNQ*)",
+      "Bash([ -d \"data/parquet/bars/$tf/MNQ\" ])",
+      "Bash([ -d \"data/parquet/$subdir/MNQ\" ])",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(pnpm tsc:*)"
     ]
   }
 }

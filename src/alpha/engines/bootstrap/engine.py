@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     from alpha.engines.scoring.engine import ScoringEngine
     from alpha.engines.setup.engine import SetupEngine
     from alpha.engines.storage.engine import StorageEngine
+    from alpha.engines.thesis.engine import ThesisEngine
 
 logger = logging.getLogger(__name__)
 
@@ -92,12 +93,14 @@ class BootstrapEngine(BaseEngine):
         self._feature: FeatureEngine | None = None
         self._market_state: MarketStateEngine | None = None
         self._setup: SetupEngine | None = None
+        self._thesis: ThesisEngine | None = None
         self._scoring: ScoringEngine | None = None
         self._risk: RiskEngine | None = None
         self._order: OrderEngine | None = None
 
         self._engines: list[BaseEngine] = []
         self._status_task: asyncio.Task[None] | None = None
+        self._tail_catchup_task: asyncio.Task[None] | None = None
         self._startup_context: dict[str, dict[str, Any]] = {}
         self._ibkr_conn: object | None = None  # IBKRConnection, kept for clean shutdown
 
@@ -120,6 +123,10 @@ class BootstrapEngine(BaseEngine):
     @property
     def calendar(self) -> SessionCalendar:
         return self._calendar
+
+    @property
+    def thesis_engine(self) -> "ThesisEngine | None":
+        return self._thesis
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -221,6 +228,7 @@ class BootstrapEngine(BaseEngine):
         from alpha.engines.scoring.engine import ScoringEngine
         from alpha.engines.setup.engine import SetupEngine
         from alpha.engines.storage.engine import StorageEngine
+        from alpha.engines.thesis.engine import ThesisEngine
 
         self._storage = StorageEngine(self._settings, self._event_bus)
         self._historical = HistoricalDataEngine(
@@ -237,6 +245,8 @@ class BootstrapEngine(BaseEngine):
         self._setup = SetupEngine(self._settings, self._event_bus, self._registry)
         self._setup.set_feature_engine(self._feature)
         self._setup.set_market_state_engine(self._market_state)
+        self._thesis = ThesisEngine(self._settings, self._event_bus, self._registry)
+        self._thesis.set_feature_engine(self._feature)
         self._scoring = ScoringEngine(self._settings, self._event_bus)
         self._scoring.set_setup_engine(self._setup)
         self._scoring.set_feature_engine(self._feature)
@@ -255,6 +265,7 @@ class BootstrapEngine(BaseEngine):
             self._feature,
             self._market_state,
             self._setup,
+            self._thesis,
             self._scoring,
             self._risk,
             self._order,
@@ -408,6 +419,25 @@ class BootstrapEngine(BaseEngine):
                 len(hourly_bars),
                 len(daily_bars),
             )
+
+    async def _run_tail_catchup(self) -> None:
+        """Fill recent 1m gaps while live so chart history stays current."""
+        if self._historical is None or self._storage is None:
+            return
+        end = datetime.now(timezone.utc) - timedelta(minutes=1)
+        start = end - timedelta(minutes=45)
+        for symbol in self._settings.runtime.symbols:
+            try:
+                await self._load_or_fetch_bars(
+                    symbol=symbol,
+                    timeframe=BarTimeframe.M1,
+                    start=start,
+                    end=end,
+                    emit=True,
+                    persist_direct=False,
+                )
+            except Exception:
+                logger.exception("Tail catch-up failed for %s", symbol)
 
     def _vwap_session_start(self, now: datetime) -> datetime:
         """Return the start of the current (or most recent completed) VWAP session in UTC.
@@ -595,6 +625,10 @@ class BootstrapEngine(BaseEngine):
             loop.run_in_executor(None, _write_snapshot_sync, settings, payload)
             if ticks % 30 == 0:
                 self._log_runtime_summary()
+            # First tail fill 30s after start, then every 5 minutes.
+            if ticks == 30 or (ticks > 0 and ticks % 300 == 0):
+                if self._tail_catchup_task is None or self._tail_catchup_task.done():
+                    self._tail_catchup_task = asyncio.create_task(self._run_tail_catchup())
             ticks += 1
             await asyncio.sleep(1)
 
@@ -694,13 +728,19 @@ class BootstrapEngine(BaseEngine):
         current_minute = now.replace(second=0, microsecond=0)
         bars = {}
         for symbol in set(completed) | set(partial):
-            # Prefer the in-progress partial bar only when it belongs to the current
-            # minute. A stale partial bar (e.g. left over from before a reconnect)
-            # would show an extreme range on the chart for the wrong timestamp.
+            completed_event = completed.get(symbol)
             partial_event = partial.get(symbol)
-            if partial_event is not None and partial_event.timestamp < current_minute:
-                partial_event = None
-            event = partial_event or completed.get(symbol)
+            if partial_event is not None:
+                if partial_event.timestamp < current_minute:
+                    partial_event = None
+                elif (
+                    completed_event is not None
+                    and completed_event.timestamp >= partial_event.timestamp
+                ):
+                    # Completed exchange bar wins over trade-accumulated partial
+                    # for the same minute — prevents wick flicker at bar close.
+                    partial_event = None
+            event = partial_event or completed_event
             if event:
                 bars[symbol] = event.model_dump(mode="json")
         return bars

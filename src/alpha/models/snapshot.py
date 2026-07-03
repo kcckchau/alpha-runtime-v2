@@ -89,3 +89,12 @@ class BarSnapshot(BaseModel):
     orb_cross_down: bool = False               # first bar that closes below orb_low (one-time trigger)
     orb_cross_up: bool = False                 # first bar that closes back above orb_low after breakdown
     bars_since_orb_breakdown: int = 0          # bars elapsed since initial orb_cross_down (0 = not yet broken)
+
+    # ── VWAP interaction memory ───────────────────────────────────────────────
+    vwap_touch_count: int = 0              # VWAP cross/sweep events this session
+    last_vwap_outcome: str | None = None   # "swept","reclaimed","broken","rejected"
+    bars_since_last_vwap_touch: int = 0
+
+    # ── Additional volatility ─────────────────────────────────────────────────
+    atr_30: Decimal | None = None           # M1 30-period ATR
+    ema_9_slope_accel: float | None = None  # slope acceleration (d²EMA9/dt²)

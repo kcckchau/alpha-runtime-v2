@@ -68,6 +68,7 @@ class EventType(StrEnum):
     ORDER_BOOK = "order_book"
     MARKET_STATE = "market_state"
     SETUP = "setup"
+    THESIS = "thesis"
     ORDER_UPDATE = "order_update"
     EXECUTION = "execution"
     SYSTEM = "system"
@@ -219,3 +220,26 @@ class KillSwitchReason(StrEnum):
     DAILY_LOSS_LIMIT = "daily_loss_limit"
     PROFIT_PROTECTION = "profit_protection"
     MANUAL = "manual"
+
+
+class ThesisState(StrEnum):
+    WATCHING = "watching"
+    BUILDING = "building"
+    READY = "ready"
+    ORDER_WORKING = "order_working"
+    TRIGGERED = "triggered"
+    INVALIDATED = "invalidated"
+    FLIPPED = "flipped"
+    EXPIRED = "expired"
+
+
+class ThesisType(StrEnum):
+    FAKE_BREAKDOWN_RECLAIM_LONG = "fake_breakdown_reclaim_long"
+    VWAP_FAILED_RECLAIM_SHORT = "vwap_failed_reclaim_short"
+
+
+class VWAPEpisodeOutcome(StrEnum):
+    SWEPT = "swept"          # low < VWAP but close >= VWAP (approached from above)
+    RECLAIMED = "reclaimed"  # crossed from below to above
+    BROKEN = "broken"        # crossed from above to below
+    REJECTED = "rejected"    # cross_up quickly followed by cross_down (failed reclaim)

@@ -119,6 +119,44 @@ class SetupEvent(BaseEvent):
     prev_state: SetupState | None = None
 
 
+class ThesisEvent(BaseEvent):
+    """Emitted by ThesisEngine on every thesis state change or bar update."""
+
+    event_type: Literal[EventType.THESIS] = EventType.THESIS
+
+    thesis_id: UUID
+    thesis_type: str          # ThesisType value
+    thesis_state: str         # ThesisState value
+    confidence: float
+    bars_alive: int
+
+    # Entry plan
+    entry: Decimal | None = None
+    stop: Decimal | None = None
+    target: Decimal | None = None
+    risk_pts: Decimal | None = None
+    reward_pts: Decimal | None = None
+    risk_ratio: float | None = None
+
+    # Key levels
+    key_level: Decimal | None = None
+    sweep_low: Decimal | None = None
+    rejection_high: Decimal | None = None
+
+    # Narrative
+    evidence_positive: list[str] = Field(default_factory=list)   # supporting items
+    evidence_negative: list[str] = Field(default_factory=list)   # weakening items
+    commit_conditions: list[str] = Field(default_factory=list)
+    invalidation_conditions: list[str] = Field(default_factory=list)
+    possible_flip: str | None = None
+    invalidation_reason: str | None = None
+
+    # Context at time of emission
+    vwap_touch_count: int = 0
+    last_vwap_outcome: str | None = None
+    session_phase: str | None = None
+
+
 class OrderUpdateEvent(BaseEvent):
     """Emitted by OrderEngine on any order lifecycle change."""
 
@@ -151,6 +189,7 @@ AnyEvent = Annotated[
     | OrderBookEvent
     | MarketStateEvent
     | SetupEvent
+    | ThesisEvent
     | OrderUpdateEvent
     | SystemEvent,
     Field(discriminator="event_type"),

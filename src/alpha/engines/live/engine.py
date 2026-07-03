@@ -29,6 +29,18 @@ from alpha.models.events import BarEvent, OrderBookEvent, QuoteEvent, TradeEvent
 
 logger = logging.getLogger(__name__)
 
+# Outlier-tick guard for the live partial bar. CME trade tapes (via Databento's
+# `trades` schema) include off-market prints — block trades, spread-implied fills,
+# late-reported negotiated trades — that can sit far from the current market. A
+# single such tick folded into acc.high/acc.low would spike the live wick until
+# the next completed exchange bar (which excludes these prints) corrects it,
+# producing a visible flicker to an extreme value. We bound accepted ticks to a
+# band around the current best bid/ask (or the last accepted price if no quote
+# is available yet), sized adaptively off the live spread.
+_OUTLIER_SPREAD_MULT = Decimal("30")
+_OUTLIER_PRICE_PCT = Decimal("0.001")      # 0.1% of mid when a quote is available
+_OUTLIER_FALLBACK_PCT = Decimal("0.002")   # 0.2% of last price when no quote yet
+
 
 @dataclass
 class _PartialAccum:
@@ -184,6 +196,13 @@ class LiveIngestionEngine(BaseEngine):
             # so downstream engines (storage, feature, setup) never see incomplete data.
             self._latest_partial_bars[event.symbol] = event
             return
+        # Completed 1m bar supersedes any trade-accumulated partial for that minute.
+        if event.timeframe == BarTimeframe.M1:
+            sym = event.symbol
+            self._partial_accum.pop(sym, None)
+            stale_partial = self._latest_partial_bars.get(sym)
+            if stale_partial is not None and stale_partial.timestamp <= event.timestamp:
+                del self._latest_partial_bars[sym]
         # Only M1+ bars update the snapshot state used by the dashboard and REST API.
         # Sub-minute bars (S1) are published to the EventBus for the push WS only.
         _SNAPSHOT_TIMEFRAMES = {BarTimeframe.M1, BarTimeframe.M5, BarTimeframe.H1, BarTimeframe.D1}
@@ -195,6 +214,26 @@ class LiveIngestionEngine(BaseEngine):
         self._trades_received += 1
         await self._event_bus.publish(event)
         self._update_partial_bar(event)
+
+    def _is_outlier_trade(self, sym: str, price: Decimal, reference: Decimal | None) -> bool:
+        """Return True if `price` is implausibly far from the current market.
+
+        Prefers an anchor derived from the live bid/ask (adaptive to current
+        spread/volatility); falls back to the last accepted trade price when no
+        quote has arrived yet. Returns False (accept) if neither is available —
+        we never want to silently drop every tick for a symbol we know nothing about.
+        """
+        quote = self._latest_quotes.get(sym)
+        if quote is not None and quote.bid_price is not None and quote.ask_price is not None:
+            anchor = (quote.bid_price + quote.ask_price) / 2
+            spread = quote.ask_price - quote.bid_price
+            band = max(anchor * _OUTLIER_PRICE_PCT, spread * _OUTLIER_SPREAD_MULT)
+        elif reference is not None:
+            anchor = reference
+            band = anchor * _OUTLIER_FALLBACK_PCT
+        else:
+            return False
+        return band > 0 and abs(price - anchor) > band
 
     def _update_partial_bar(self, event: TradeEvent) -> None:
         """
@@ -208,6 +247,14 @@ class LiveIngestionEngine(BaseEngine):
         minute_ts = event.timestamp.replace(second=0, microsecond=0)
         sym = event.symbol
         acc = self._partial_accum.get(sym)
+        reference_close = acc.close if acc is not None else None
+
+        if self._is_outlier_trade(sym, event.price, reference_close):
+            logger.debug(
+                "LiveIngestionEngine: rejecting outlier trade tick for %s partial bar (price=%s)",
+                sym, event.price,
+            )
+            return
 
         if acc is None or acc.minute_ts != minute_ts:
             acc = _PartialAccum(

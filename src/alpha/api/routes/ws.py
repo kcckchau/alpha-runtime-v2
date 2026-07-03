@@ -11,22 +11,36 @@ from alpha.api.routes.runtime import _snapshot_or_default
 router = APIRouter(tags=["ws"])
 
 
+def _resolve_snapshot_symbol(snapshot: dict[str, Any], symbol: str) -> str:
+    """Map a client symbol (e.g. MNQ) to the snapshot key (e.g. MNQ-09)."""
+    bars = snapshot.get("bars") or {}
+    upper = symbol.upper()
+    if upper in bars:
+        return upper
+    root = upper.split("-", 1)[0]
+    for key in bars:
+        if key.split("-", 1)[0] == root:
+            return key
+    return upper
+
+
 def _symbol_payload(snapshot: dict[str, Any], symbol: str) -> dict[str, Any]:
+    resolved = _resolve_snapshot_symbol(snapshot, symbol)
     return {
         "type": "runtime_update",
-        "symbol": symbol,
+        "symbol": resolved,
         "updated_at": snapshot.get("updated_at"),
         "runtime_state": snapshot.get("runtime_state"),
         "mode": snapshot.get("mode"),
         "runtime_available": snapshot.get("runtime_available", False),
-        "quote": snapshot.get("quotes", {}).get(symbol),
-        "bar": snapshot.get("bars", {}).get(symbol),
-        "context": snapshot.get("contexts", {}).get(symbol),
-        "market_state": snapshot.get("market_states", {}).get(symbol),
-        "setup_context": snapshot.get("setup_contexts", {}).get(symbol),
-        "prev_setup_context": snapshot.get("prev_setup_contexts", {}).get(symbol),
+        "quote": snapshot.get("quotes", {}).get(resolved),
+        "bar": snapshot.get("bars", {}).get(resolved),
+        "context": snapshot.get("contexts", {}).get(resolved),
+        "market_state": snapshot.get("market_states", {}).get(resolved),
+        "setup_context": snapshot.get("setup_contexts", {}).get(resolved),
+        "prev_setup_context": snapshot.get("prev_setup_contexts", {}).get(resolved),
         "setups": [
-            setup for setup in snapshot.get("setups", []) if setup.get("symbol") == symbol
+            setup for setup in snapshot.get("setups", []) if setup.get("symbol") == resolved
         ],
     }
 

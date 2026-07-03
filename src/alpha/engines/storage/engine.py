@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import defaultdict
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -60,6 +61,12 @@ class StorageEngine(BaseEngine):
         bars = await storage.load_bars("AAPL", BarTimeframe.M1, start, end)
     """
 
+    # How often buffered rows are flushed to Parquet. Each flush does a full
+    # read-modify-write of the target day's file, so batching many events into
+    # one flush (rather than one flush per event) is what keeps the writer
+    # ahead of high-frequency trade/quote volume as the file grows over the day.
+    _FLUSH_INTERVAL_SECONDS = 2.0
+
     def __init__(self, settings: AlphaSettings, event_bus: EventBus) -> None:
         super().__init__()
         self._settings = settings
@@ -68,7 +75,11 @@ class StorageEngine(BaseEngine):
         self._postgres = PostgresStore()
         self._write_queue: asyncio.Queue[AnyEvent] = asyncio.Queue(maxsize=10_000)
         self._writer_task: asyncio.Task[None] | None = None
+        self._flush_task: asyncio.Task[None] | None = None
         self._writes_total: int = 0
+        # Buffered rows awaiting flush, keyed by (data_type, symbol, date).
+        # Populated synchronously (no I/O) by the writer loop; drained by _flush_loop.
+        self._buffers: dict[tuple[str, str, date], list[dict[str, Any]]] = defaultdict(list)
 
     @property
     def name(self) -> str:
@@ -83,16 +94,22 @@ class StorageEngine(BaseEngine):
 
     async def _on_start(self) -> None:
         self._writer_task = asyncio.ensure_future(self._writer_loop())
+        self._flush_task = asyncio.ensure_future(self._flush_loop())
         self._subscribe_to_bus()
 
     async def _on_stop(self) -> None:
         if self._writer_task and not self._writer_task.done():
             await self._write_queue.join()
             self._writer_task.cancel()
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+        # Final flush so nothing buffered in memory is lost on shutdown.
+        await self._flush_all()
 
     async def _health_check(self) -> EngineHealth:
         details = {
             "queue_depth": self._write_queue.qsize(),
+            "buffered_rows": sum(len(rows) for rows in self._buffers.values()),
             "writes_total": self._writes_total,
         }
         return EngineHealth(HealthStatus.HEALTHY, self.name, details)
@@ -104,6 +121,10 @@ class StorageEngine(BaseEngine):
 
     async def flush(self) -> None:
         await self._write_queue.join()
+        # Draining the queue only moves events into the in-memory buffer; force
+        # an actual Parquet write so callers relying on `flush()` for durability
+        # (e.g. catch-up) get a correct guarantee.
+        await self._flush_all()
 
     # ── Public read API ───────────────────────────────────────────────────────
 
@@ -138,48 +159,93 @@ class StorageEngine(BaseEngine):
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
+    # Event types storage already treats as best-effort (dropped under backpressure
+    # at the internal write-queue level — see `_on_event`). Also exempting them at
+    # the EventBus subscription level (drop_if_full=True) means a slow storage
+    # consumer never blocks the publisher for these — critical for TRADE, since
+    # LiveIngestionEngine awaits `event_bus.publish()` before updating the live
+    # partial bar, so backpressure here would directly delay the chart's live candle.
+    _BEST_EFFORT_TYPES = frozenset({EventType.QUOTE, EventType.TRADE})
+
     def _subscribe_to_bus(self) -> None:
         for et in EventType:
-            # Quote events arrive at very high frequency (hundreds/sec for futures).
-            # Use drop_if_full so the EventBus never blocks the publisher waiting for
-            # storage to catch up; the internal write queue already handles its own drops.
-            drop = et == EventType.QUOTE
+            drop = et in self._BEST_EFFORT_TYPES
             self._event_bus.subscribe(et, self._on_event, drop_if_full=drop)
 
     async def _on_event(self, event: AnyEvent) -> None:
+        if isinstance(event, BarEvent):
+            # Bars are low-frequency and critical to the chart — never drop them.
+            # A brief await here applies natural backpressure instead of data loss.
+            await self._write_queue.put(event)
+            return
         try:
             self._write_queue.put_nowait(event)
         except asyncio.QueueFull:
             logger.warning("StorageEngine write queue full — dropping %s", event.event_type)
 
     async def _writer_loop(self) -> None:
-        loop = asyncio.get_running_loop()
         while True:
             event = await self._write_queue.get()
             try:
                 # Quotes are ephemeral high-frequency data (~hundreds/sec). They are
-                # never loaded back from Parquet and their per-row read-modify-write
-                # pattern would block the event loop for seconds by end of day.
+                # never loaded back from Parquet, so skip buffering/writing them
+                # entirely — the write queue and buffers below only ever see the
+                # other (much lower-frequency) event types.
                 if not isinstance(event, QuoteEvent):
-                    await loop.run_in_executor(None, self._persist_sync, event)
+                    self._buffer_event(event)
                 self._writes_total += 1
             except Exception:
                 logger.exception("StorageEngine: write error for %s", event.event_type)
             finally:
                 self._write_queue.task_done()
 
-    def _persist_sync(self, event: AnyEvent) -> None:
-        import pyarrow as pa
+    def _buffer_event(self, event: AnyEvent) -> None:
+        """Append the serialized row to an in-memory buffer (no I/O).
 
+        Writing to Parquet requires reading, concatenating, and rewriting the
+        *entire* existing file for that partition, so doing this once per event
+        (as the file grows across the trading day) cannot keep up with
+        high-frequency trade ticks. Instead we accumulate rows here and let
+        `_flush_loop` batch them into far fewer, larger writes.
+        """
         data_type = self._data_type_for(event)
         row = self._serialize_event(event)
-        table = pa.Table.from_pylist([row])
-        self._parquet.write(
-            table,
-            data_type,
-            self._storage_symbol(event),
-            event.timestamp.date(),
-        )
+        key = (data_type, self._storage_symbol(event), event.timestamp.date())
+        self._buffers[key].append(row)
+
+    async def _flush_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._FLUSH_INTERVAL_SECONDS)
+            await self._flush_all()
+
+    async def _flush_all(self) -> None:
+        if not self._buffers:
+            return
+        # Swap out the buffer up front (single-threaded event loop — no race
+        # with `_buffer_event`, which never awaits between read and append)
+        # so new events keep accumulating in a fresh buffer while this flush
+        # writes the previous batch out.
+        pending, self._buffers = self._buffers, defaultdict(list)
+        loop = asyncio.get_running_loop()
+        for (data_type, symbol, d), rows in pending.items():
+            if not rows:
+                continue
+            try:
+                await loop.run_in_executor(None, self._write_rows_sync, rows, data_type, symbol, d)
+            except Exception:
+                logger.exception("StorageEngine: flush error for %s/%s/%s", data_type, symbol, d)
+
+    def _write_rows_sync(
+        self,
+        rows: list[dict[str, Any]],
+        data_type: str,
+        symbol: str,
+        d: date,
+    ) -> None:
+        import pyarrow as pa
+
+        table = pa.Table.from_pylist(rows)
+        self._parquet.write(table, data_type, symbol, d)
 
     @staticmethod
     def _data_type_for(event: AnyEvent) -> str:

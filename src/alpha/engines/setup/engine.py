@@ -35,6 +35,7 @@ from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.models.enums import (
     AssetClass,
+    BarTimeframe,
     EventType,
     HealthStatus,
     ORBState,
@@ -199,6 +200,8 @@ class SetupEngine(BaseEngine):
     async def _handle_bar(self, event: AnyEvent) -> None:
         if not isinstance(event, BarEvent):
             return
+        if event.timeframe != BarTimeframe.M1:
+            return  # S1 and other sub-minute bars are for push WS only
 
         symbol = event.symbol
         # Roll session BEFORE reading session_key so the bar counter compares

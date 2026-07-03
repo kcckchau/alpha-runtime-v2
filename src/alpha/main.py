@@ -58,6 +58,10 @@ def run() -> None:
         # ConnectionManager.subscribe_to_event_bus() is called in the lifespan.
         api_app.state.event_bus = engine.event_bus
 
+        # Register bootstrap for API route access (thesis, runtime state, etc.)
+        from alpha.runtime_registry import set_bootstrap
+        set_bootstrap(engine)
+
         await engine.initialize()
 
         import uvicorn

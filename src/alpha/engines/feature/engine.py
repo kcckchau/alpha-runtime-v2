@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Deque
 
@@ -28,7 +28,7 @@ from alpha.core.clock import Clock
 from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
-from alpha.models.enums import AssetClass, EventType, HealthStatus, ORBState, SessionPhase
+from alpha.models.enums import AssetClass, BarTimeframe, EventType, HealthStatus, ORBState, SessionPhase
 from alpha.models.events import AnyEvent, BarEvent, QuoteEvent
 from alpha.models.snapshot import BarSnapshot
 
@@ -86,6 +86,21 @@ class SymbolFeatureState:
         self.bars_since_last_lower_low: int = 999  # 999 = no lower low yet this session
         self.session_key: str | None = None
 
+        # VWAP interaction memory
+        self.vwap_touch_count: int = 0
+        self.last_vwap_outcome: str | None = None
+        self.bars_since_last_vwap_touch: int = 0
+        self._vwap_last_cross_direction: str | None = None  # "up" or "down"
+        self._vwap_bars_since_cross: int = 0
+        self.session_sweep_low: Decimal | None = None
+        self.session_reject_high: Decimal | None = None
+        # ATR-30
+        self.atr_30_buffer: Deque[Decimal] = deque(maxlen=30)
+        self.atr_30: Decimal | None = None
+        # EMA9 slope acceleration
+        self.prev_ema_9_slope: float | None = None
+        self.ema_9_slope_accel: float | None = None
+
     def reset_session(self) -> None:
         self.bars_since_open = 0
         self.cumulative_volume = 0
@@ -116,6 +131,17 @@ class SymbolFeatureState:
         self.prev_vwap = None
         self.bars_since_last_lower_low = 999
         self.session_key = None
+        self.vwap_touch_count = 0
+        self.last_vwap_outcome = None
+        self.bars_since_last_vwap_touch = 0
+        self._vwap_last_cross_direction = None
+        self._vwap_bars_since_cross = 0
+        self.session_sweep_low = None
+        self.session_reject_high = None
+        self.atr_30_buffer.clear()
+        self.atr_30 = None
+        self.prev_ema_9_slope = None
+        self.ema_9_slope_accel = None
 
     @property
     def vwap(self) -> Decimal:
@@ -183,6 +209,24 @@ class FeatureEngine(BaseEngine):
     def get_snapshot(self, symbol: str) -> BarSnapshot | None:
         return self._snapshots.get(symbol)
 
+    def get_level_memory(self, ticker: str) -> "LevelMemorySnapshot | None":
+        """Return VWAP interaction memory for a symbol. Used by ThesisEngine."""
+        from alpha.models.thesis import LevelMemorySnapshot
+        state = self._states.get(ticker)
+        if state is None:
+            return None
+        snap = self._snapshots.get(ticker)
+        return LevelMemorySnapshot(
+            symbol=ticker,
+            timestamp=snap.timestamp if snap else datetime.now(timezone.utc),
+            vwap_touch_count=state.vwap_touch_count,
+            last_vwap_outcome=state.last_vwap_outcome,
+            bars_since_last_vwap_touch=state.bars_since_last_vwap_touch,
+            current_side="above" if state.prev_above_vwap else ("below" if state.prev_above_vwap is not None else None),
+            session_sweep_low=state.session_sweep_low,
+            session_reject_high=state.session_reject_high,
+        )
+
     def record_trade(self, symbol: str, price: float, size: int) -> None:
         """Sync tick handler: update intraday high/low from raw trade ticks.
 
@@ -193,6 +237,15 @@ class FeatureEngine(BaseEngine):
         if state is None:
             return
         p = Decimal(str(price))
+        # Guard against off-market prints (block trades, spread-implied fills)
+        # that sit far outside the current bid/ask — otherwise a single bad tick
+        # can falsely mark a new intraday high/low and trigger false breakout setups.
+        if state.latest_bid is not None and state.latest_ask is not None:
+            anchor = (state.latest_bid + state.latest_ask) / 2
+            spread = state.latest_ask - state.latest_bid
+            band = max(anchor * Decimal("0.001"), spread * Decimal("30"))
+            if band > 0 and abs(p - anchor) > band:
+                return
         if state.intraday_high is None or p > state.intraday_high:
             state.intraday_high = p
         if state.intraday_low is None or p < state.intraday_low:
@@ -203,6 +256,8 @@ class FeatureEngine(BaseEngine):
     async def _handle_bar(self, event: AnyEvent) -> None:
         if not isinstance(event, BarEvent):
             return
+        if event.timeframe != BarTimeframe.M1:
+            return  # S1 and other sub-minute bars are for push WS only
         state = self._get_or_create(event.symbol)
         self._update_state(state, event)
         snapshot = self._build_snapshot(state, event)
@@ -308,6 +363,44 @@ class FeatureEngine(BaseEngine):
                     and dev_pct > 0
                 )
                 state.prev_vwap_deviation_pct = dev_pct
+
+                # ── VWAP interaction tracking ─────────────────────────────────────────
+                # Note: prev_above_vwap was already set to is_above above; capture the
+                # prior-bar side before it was updated for the swept check below.
+                swept = vwap > _ZERO and bar.low < vwap <= bar.close
+                if state.vwap_cross_up:
+                    state.vwap_touch_count += 1
+                    state.last_vwap_outcome = "reclaimed"
+                    state.bars_since_last_vwap_touch = 0
+                    state._vwap_last_cross_direction = "up"
+                    state._vwap_bars_since_cross = 0
+                elif state.vwap_cross_down:
+                    state.vwap_touch_count += 1
+                    if (
+                        state._vwap_last_cross_direction == "up"
+                        and state._vwap_bars_since_cross <= 3
+                    ):
+                        state.last_vwap_outcome = "rejected"
+                    else:
+                        state.last_vwap_outcome = "broken"
+                    state.bars_since_last_vwap_touch = 0
+                    state._vwap_last_cross_direction = "down"
+                    state._vwap_bars_since_cross = 0
+                elif swept and is_above:
+                    # Low dipped below VWAP but close recovered — approached from above
+                    state.vwap_touch_count += 1
+                    state.last_vwap_outcome = "swept"
+                    state.bars_since_last_vwap_touch = 0
+                else:
+                    if state.last_vwap_outcome is not None:
+                        state.bars_since_last_vwap_touch += 1
+                    if state._vwap_last_cross_direction is not None:
+                        state._vwap_bars_since_cross += 1
+
+                # Track session extremes for thesis context
+                if vwap > _ZERO and bar.low < vwap:
+                    if state.session_sweep_low is None or bar.low < state.session_sweep_low:
+                        state.session_sweep_low = bar.low
             else:
                 state.vwap_cross_up = False
                 state.vwap_cross_down = False
@@ -360,6 +453,10 @@ class FeatureEngine(BaseEngine):
                 abs(bar.low - state.prev_close),
             )
             state.atr_buffer.append(tr)
+            # ATR-30 (alongside existing ATR-14)
+            state.atr_30_buffer.append(tr)
+            if len(state.atr_30_buffer) >= 2:
+                state.atr_30 = sum(state.atr_30_buffer) / len(state.atr_30_buffer)
         state.prev_close = bar.close
 
         # RVOL — compare this bar's volume to the average of the last 20 bars.
@@ -395,6 +492,11 @@ class FeatureEngine(BaseEngine):
             if state.ema_9 is not None and state.prev_ema_9 is not None and state.prev_ema_9 > _ZERO
             else None
         )
+        ema_9_slope_accel: float | None = None
+        if state.prev_ema_9_slope is not None and ema_9_slope is not None:
+            ema_9_slope_accel = ema_9_slope - state.prev_ema_9_slope
+        state.prev_ema_9_slope = ema_9_slope
+        state.ema_9_slope_accel = ema_9_slope_accel
         ema_20_slope: float | None = (
             float((state.ema_20 - state.prev_ema_20) / state.prev_ema_20 * 100)
             if state.ema_20 is not None and state.prev_ema_20 is not None and state.prev_ema_20 > _ZERO
@@ -486,6 +588,11 @@ class FeatureEngine(BaseEngine):
             or_mid=or_mid,
             swept_below_vwap=swept_below,
             swept_orl=swept_orl,
+            vwap_touch_count=state.vwap_touch_count,
+            last_vwap_outcome=state.last_vwap_outcome,
+            bars_since_last_vwap_touch=state.bars_since_last_vwap_touch,
+            atr_30=state.atr_30,
+            ema_9_slope_accel=state.ema_9_slope_accel,
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────────

@@ -424,3 +424,44 @@ async def list_open_orders(symbol: str | None = None) -> list[dict]:  # type: ig
     if symbol is None:
         return orders
     return [order for order in orders if order.get("symbol") == symbol]
+
+
+@router.get("/thesis/{symbol}")
+async def get_thesis(symbol: str) -> dict[str, Any]:
+    """Return the current thesis state for a symbol."""
+    from alpha.runtime_registry import get_bootstrap
+    bootstrap = get_bootstrap()
+    if bootstrap is None or bootstrap.thesis_engine is None:
+        return {"state": "no_engine"}
+    active = bootstrap.thesis_engine.get_thesis(symbol.upper())
+    if active is None:
+        return {"symbol": symbol.upper(), "state": "none", "dominant": None, "flip": None}
+
+    def _serialize(c: Any) -> Any:
+        if c is None:
+            return None
+        return {
+            "thesis_id": str(c.thesis_id),
+            "thesis_type": str(c.thesis_type),
+            "state": str(c.state),
+            "confidence": round(c.confidence, 3),
+            "bars_alive": c.bars_alive,
+            "entry": str(c.entry) if c.entry else None,
+            "stop": str(c.stop) if c.stop else None,
+            "target": str(c.target) if c.target else None,
+            "key_level": str(c.key_level) if c.key_level else None,
+            "sweep_low": str(c.sweep_low) if c.sweep_low else None,
+            "rejection_high": str(c.rejection_high) if c.rejection_high else None,
+            "evidence_positive": [e.text for e in c.evidence if e.positive],
+            "evidence_negative": [e.text for e in c.evidence if not e.positive],
+            "commit_conditions": c.commit_conditions,
+            "invalidation_conditions": c.invalidation_conditions,
+            "possible_flip": str(c.possible_flip) if c.possible_flip else None,
+            "invalidation_reason": c.invalidation_reason,
+        }
+
+    return {
+        "symbol": symbol.upper(),
+        "dominant": _serialize(active.dominant),
+        "flip": _serialize(active.flip),
+    }
