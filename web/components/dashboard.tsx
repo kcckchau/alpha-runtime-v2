@@ -156,6 +156,32 @@ type SetupHistoryEntry = {
   invalidation_reason?: string | null;
 };
 
+type ThesisCandidate = {
+  thesis_id: string;
+  thesis_type: string;
+  state: string;
+  confidence: number;
+  bars_alive: number;
+  entry: string | null;
+  stop: string | null;
+  target: string | null;
+  key_level: string | null;
+  sweep_low: string | null;
+  rejection_high: string | null;
+  evidence_positive: string[];
+  evidence_negative: string[];
+  commit_conditions: string[];
+  invalidation_conditions: string[];
+  possible_flip: string | null;
+  invalidation_reason: string | null;
+};
+
+type ThesisData = {
+  symbol: string;
+  dominant: ThesisCandidate | null;
+  flip: ThesisCandidate | null;
+};
+
 type SetupSessionContext = {
   symbol: string;
   session_key: string;
@@ -704,6 +730,204 @@ function SetupsPanel({ setups }: { setups: SetupRow[] }) {
             {past.map((s) => <SetupItem key={s.setup_id} setup={s} past />)}
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Thesis panel ─────────────────────────────────────────────────────────────
+
+const THESIS_LABELS: Record<string, string> = {
+  fake_breakdown_reclaim_long: "FAKE BREAKDOWN RECLAIM",
+  vwap_failed_reclaim_short:   "VWAP FAILED RECLAIM",
+};
+
+const THESIS_STATE_COLOR: Record<string, string> = {
+  watching:      "rgba(255,255,255,0.35)",
+  building:      "#fbbf24",
+  ready:         "#22c55e",
+  order_working: "#60a5fa",
+  triggered:     "#22c55e",
+  invalidated:   "#ef4444",
+  flipped:       "#a78bfa",
+  expired:       "rgba(255,255,255,0.25)",
+};
+
+function ThesisPanel({ thesis }: { thesis: ThesisData | null }) {
+  const dominant = thesis?.dominant ?? null;
+
+  if (!dominant) {
+    return (
+      <div style={S.panel}>
+        <div style={S.panelHd}>
+          <span style={S.panelLbl}>CURRENT THESIS</span>
+        </div>
+        <div style={{ padding: "10px 12px", ...S.mono, fontSize: 11, color: "rgba(255,255,255,0.3)" }}>
+          Watching for setup…
+        </div>
+      </div>
+    );
+  }
+
+  const stateColor = THESIS_STATE_COLOR[dominant.state] ?? "rgba(255,255,255,0.4)";
+  const label = THESIS_LABELS[dominant.thesis_type] ?? dominant.thesis_type.replace(/_/g, " ").toUpperCase();
+  const isLong = dominant.thesis_type.includes("long");
+  const dirColor = isLong ? "#22c55e" : "#ef4444";
+  const confPct = Math.round(dominant.confidence * 100);
+  const confBarFill = Math.round(dominant.confidence * 14); // 14 segments
+
+  // Risk/reward
+  const entry = dominant.entry ? Number(dominant.entry) : null;
+  const stop  = dominant.stop  ? Number(dominant.stop)  : null;
+  const tgt   = dominant.target ? Number(dominant.target) : null;
+  const riskPts   = entry !== null && stop  !== null ? Math.abs(entry - stop)  : null;
+  const rewardPts = entry !== null && tgt   !== null ? Math.abs(tgt  - entry)  : null;
+  const rr = riskPts && rewardPts && riskPts > 0 ? (rewardPts / riskPts) : null;
+
+  const flipLabel = dominant.possible_flip
+    ? THESIS_LABELS[dominant.possible_flip] ?? dominant.possible_flip
+    : null;
+
+  return (
+    <div style={S.panel}>
+      {/* Header */}
+      <div style={{ ...S.panelHd, borderBottom: "0.5px solid rgba(255,255,255,0.06)" }}>
+        <span style={S.panelLbl}>CURRENT THESIS</span>
+        <span style={{ ...S.mono, fontSize: 9, color: `${stateColor}`, textTransform: "uppercase", letterSpacing: 1 }}>
+          {dominant.state}
+        </span>
+      </div>
+
+      <div style={{ padding: "9px 12px", display: "flex", flexDirection: "column", gap: 7 }}>
+
+        {/* Thesis type + direction */}
+        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 4 }}>
+          <span style={{ ...S.mono, fontSize: 10, fontWeight: 600, color: dirColor, lineHeight: 1.3 }}>
+            {label}
+          </span>
+          <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.4)", whiteSpace: "nowrap" }}>
+            {dominant.bars_alive}b
+          </span>
+        </div>
+
+        {/* Confidence bar */}
+        <div>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+            <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.4)" }}>confidence</span>
+            <span style={{ ...S.mono, fontSize: 9, color: stateColor, fontWeight: 600 }}>{confPct}%</span>
+          </div>
+          <div style={{ display: "flex", gap: 1.5 }}>
+            {Array.from({ length: 14 }).map((_, i) => (
+              <div
+                key={i}
+                style={{
+                  flex: 1, height: 4, borderRadius: 1,
+                  background: i < confBarFill ? stateColor : "rgba(255,255,255,0.08)",
+                }}
+              />
+            ))}
+          </div>
+        </div>
+
+        {/* Key level */}
+        {dominant.key_level && (
+          <div style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.45)" }}>
+            VWAP <span style={{ color: "rgba(255,255,255,0.75)" }}>{formatPrice(dominant.key_level)}</span>
+            {dominant.sweep_low && (
+              <span>  sweep <span style={{ color: "#ef444490" }}>{formatPrice(dominant.sweep_low)}</span></span>
+            )}
+            {dominant.rejection_high && (
+              <span>  rej <span style={{ color: "#ef444490" }}>{formatPrice(dominant.rejection_high)}</span></span>
+            )}
+          </div>
+        )}
+
+        {/* Evidence */}
+        {(dominant.evidence_positive.length > 0 || dominant.evidence_negative.length > 0) && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            {dominant.evidence_positive.slice(0, 3).map((e, i) => (
+              <div key={i} style={{ ...S.mono, fontSize: 9, color: "#22c55e", lineHeight: 1.4 }}>
+                + {e}
+              </div>
+            ))}
+            {dominant.evidence_negative.slice(0, 2).map((e, i) => (
+              <div key={i} style={{ ...S.mono, fontSize: 9, color: "#ef4444", lineHeight: 1.4 }}>
+                − {e}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Commit conditions — only show in WATCHING/BUILDING */}
+        {["watching", "building"].includes(dominant.state) && dominant.commit_conditions.length > 0 && (
+          <div>
+            <div style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.3)", marginBottom: 2, textTransform: "uppercase", letterSpacing: 0.5 }}>commit if</div>
+            {dominant.commit_conditions.slice(0, 2).map((c, i) => (
+              <div key={i} style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.5)", lineHeight: 1.4 }}>
+                • {c}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Invalidation reason — only when invalidated */}
+        {dominant.state === "invalidated" && dominant.invalidation_reason && (
+          <div style={{ ...S.mono, fontSize: 9, color: "#ef4444", lineHeight: 1.4 }}>
+            ✕ {dominant.invalidation_reason}
+          </div>
+        )}
+
+        {/* Entry plan — show when READY or ORDER_WORKING */}
+        {["ready", "order_working", "triggered"].includes(dominant.state) && entry !== null && stop !== null && (
+          <div
+            style={{
+              background: "rgba(255,255,255,0.04)",
+              border: "0.5px solid rgba(255,255,255,0.08)",
+              borderRadius: 4, padding: "6px 8px",
+              display: "flex", flexDirection: "column", gap: 3,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.4)" }}>ENTRY</span>
+              <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.85)" }}>{formatPrice(dominant.entry)}</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.4)" }}>STOP</span>
+              <span style={{ ...S.mono, fontSize: 9, color: "#ef4444" }}>{formatPrice(dominant.stop)}</span>
+            </div>
+            {tgt !== null && (
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.4)" }}>TP</span>
+                <span style={{ ...S.mono, fontSize: 9, color: "#22c55e" }}>{formatPrice(dominant.target)}</span>
+              </div>
+            )}
+            {riskPts !== null && (
+              <div
+                style={{
+                  display: "flex", justifyContent: "space-between",
+                  borderTop: "0.5px solid rgba(255,255,255,0.06)", paddingTop: 3, marginTop: 1,
+                }}
+              >
+                <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.4)" }}>
+                  RISK {riskPts.toFixed(2)} pts
+                </span>
+                {rr !== null && (
+                  <span style={{ ...S.mono, fontSize: 9, color: stateColor, fontWeight: 600 }}>
+                    {rr.toFixed(1)}R
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Flip indicator */}
+        {flipLabel && dominant.state !== "invalidated" && (
+          <div style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.25)", lineHeight: 1.4 }}>
+            ↓ flip → {flipLabel.toLowerCase()}
+          </div>
+        )}
+
       </div>
     </div>
   );
@@ -1633,6 +1857,7 @@ export function Dashboard() {
   const [quotes, setQuotes] = useState<Record<string, QuoteRow | null>>({});
   const [bars, setBars] = useState<BarHistoryRow[]>([]);
   const [setups, setSetups] = useState<SetupRow[]>([]);
+  const [thesis, setThesis] = useState<ThesisData | null>(null);
   const [setupContexts, setSetupContexts] = useState<Record<string, SetupSessionContext | null>>({});
   const [prevSetupContexts, setPrevSetupContexts] = useState<Record<string, SetupSessionContext | null>>({});
   const [riskState, setRiskState] = useState<RiskData | null>(null);
@@ -1730,6 +1955,10 @@ export function Dashboard() {
           isHistorical
             ? Promise.resolve({})
             : fetchJson<Record<string, MarketStateData | null>>(`/runtime/market-states?symbol=${symbol}`).catch(() => ({})),
+          // [8] thesis (live only — ThesisEngine is a real-time engine)
+          isHistorical
+            ? Promise.resolve(null)
+            : fetchJson<ThesisData>(`/runtime/thesis/${symbol}`).catch(() => null),
         ];
 
         const [
@@ -1741,6 +1970,7 @@ export function Dashboard() {
           setupContextData,
           prevSetupContextData,
           marketStateData,
+          thesisData,
         ] = await Promise.all(requests) as [
           Record<string, SymbolContext | null>,
           Record<string, QuoteRow | null>,
@@ -1750,6 +1980,7 @@ export function Dashboard() {
           Record<string, SetupSessionContext | null>,
           Record<string, SetupSessionContext | null>,
           Record<string, MarketStateData | null>,
+          ThesisData | null,
         ];
 
         const riskData = isHistorical
@@ -1772,6 +2003,7 @@ export function Dashboard() {
           mergeHistoryWithLiveTail(barData, latestLiveBar, prev, selectedTimeframe)
         );
         setSetups(setupData);
+        if (!isHistorical) setThesis(thesisData);
         setSetupContexts((prev) => ({ ...prev, ...setupContextData }));
         setPrevSetupContexts((prev) => ({ ...prev, ...prevSetupContextData }));
 
@@ -2635,6 +2867,7 @@ export function Dashboard() {
 
         {/* Sidebar */}
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {selectedDate === null && <ThesisPanel thesis={thesis} />}
           <SetupHistoryPanel
             context={activeSetupCtx}
             selectedDate={selectedDate}
