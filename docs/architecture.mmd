@@ -1,0 +1,112 @@
+flowchart LR
+
+    subgraph EXT[" External "]
+        direction TB
+        DB_LIVE([Databento\nLive WS])
+        DB_HIST([Databento\nHistorical API])
+        IBKR([IBKR])
+    end
+
+    subgraph ING[" Ingestion "]
+        direction TB
+        HistoricalDataEngine[Historical Data Engine]
+        LiveIngestionEngine[Live Ingestion Engine]
+    end
+
+    EB{{EventBus}}
+
+    subgraph PROC[" Processing "]
+        direction TB
+        FeatureEngine[Feature Engine]
+        MarketStateEngine[Market State Engine]
+        ScoringEngine[Scoring Engine]
+        SetupEngine[Setup Engine]
+        ThesisEngine[Thesis Engine]
+    end
+
+    subgraph ORD_RISK[" Execution "]
+        direction TB
+        OrderEngine[Order Engine]
+        RiskEngine[Risk Engine]
+    end
+
+    subgraph STOR[" Storage "]
+        direction TB
+        StorageEngine[Storage Engine]
+        PQ[(Parquet)]
+        PG[(PostgreSQL)]
+    end
+
+    subgraph API[" API / UI "]
+        direction TB
+        REST[FastAPI REST]
+        WS[WebSocket Push]
+        UI([Web Dashboard])
+    end
+
+    DB_LIVE -->|ohlcv-1m / trades / mbp-1| LiveIngestionEngine
+    DB_HIST -->|historical bars| HistoricalDataEngine
+    IBKR    -->|historical bars| HistoricalDataEngine
+    IBKR    -->|order routing| OrderEngine
+
+    HistoricalDataEngine --> EB
+    LiveIngestionEngine -->|"BAR, BOOK, QUOTE, TRADE"| EB
+
+    EB -->|"BAR, QUOTE"| FeatureEngine
+    EB -->|"BAR"| MarketStateEngine
+    EB -->|"ORDER_UPD, SETUP"| RiskEngine
+    EB -->|"SETUP"| ScoringEngine
+    EB -->|"BAR"| SetupEngine
+    EB -->|"ALL events"| StorageEngine
+    EB -->|"BAR, TRADE"| ThesisEngine
+
+    MarketStateEngine -->|"MKT_STATE"| EB
+    SetupEngine -->|"SETUP"| EB
+    ThesisEngine -->|"THESIS"| EB
+    OrderEngine -->|"ORDER_UPD"| EB
+
+    BootstrapEngine -. snapshot .-> FeatureEngine
+    BootstrapEngine -. snapshot .-> MarketStateEngine
+    BootstrapEngine -. snapshot .-> OrderEngine
+    BootstrapEngine -. snapshot .-> SetupEngine
+    MarketStateEngine -. snapshot .-> FeatureEngine
+    RiskEngine -. snapshot .-> OrderEngine
+    RiskEngine -. snapshot .-> SetupEngine
+    ScoringEngine -. snapshot .-> FeatureEngine
+    ScoringEngine -. snapshot .-> SetupEngine
+    SetupEngine -. snapshot .-> FeatureEngine
+    SetupEngine -. snapshot .-> MarketStateEngine
+    ThesisEngine -. snapshot .-> FeatureEngine
+
+    StorageEngine -->|bars / trades / books| PQ
+    StorageEngine -->|states / setups / orders| PG
+
+    LiveIngestionEngine -->|latest bars & quotes| REST
+    FeatureEngine       -->|snapshots| REST
+    ThesisEngine        -->|thesis state| REST
+    SetupEngine         -->|setups| REST
+    LiveIngestionEngine -->|BAR / QUOTE push| WS
+    REST --> UI
+    WS   --> UI
+
+    classDef ingestion  fill:#1e3a5f,stroke:#60a5fa,color:#e0f2fe
+    classDef processing fill:#1a3a2a,stroke:#4ade80,color:#dcfce7
+    classDef execution  fill:#3b1f1f,stroke:#f87171,color:#fee2e2
+    classDef storage    fill:#2d2418,stroke:#fbbf24,color:#fef3c7
+    classDef external   fill:#1e1b4b,stroke:#a78bfa,color:#ede9fe
+    classDef bus        fill:#4a1d96,stroke:#c084fc,color:#f3e8ff
+    classDef api        fill:#1c2b3a,stroke:#38bdf8,color:#e0f2fe
+    class HistoricalDataEngine ingestion
+    class LiveIngestionEngine ingestion
+    class FeatureEngine processing
+    class MarketStateEngine processing
+    class ScoringEngine processing
+    class SetupEngine processing
+    class ThesisEngine processing
+    class OrderEngine execution
+    class RiskEngine execution
+    class StorageEngine storage
+    class DB_LIVE,DB_HIST,IBKR external
+    class EB bus
+    class REST,WS,UI api
+    class PQ,PG storage

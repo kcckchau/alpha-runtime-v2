@@ -108,8 +108,35 @@ const timeFormatter = (time: Time): string => {
 
 // ─── Incremental state types ──────────────────────────────────────────────────
 
-type VwapState = { cumTPV: number; cumVol: number; prevTime: number | null };
+type VwapState = { cumTPV: number; cumVol: number; prevTime: number | null; session: string | null };
 type EmaState = { value: number; index: number };
+
+// ─── CME session helpers ──────────────────────────────────────────────────────
+//
+// CME Globex equity-index futures roll their session at 18:00 ET (23:00 UTC).
+// Bars timestamped at 18:00+ ET belong to the *next* calendar day's session,
+// matching the FeatureEngine's session_key logic.
+//
+// `t` here is the ET wall-clock epoch (already shifted by toETEpoch), so
+// reading UTC date/hour fields gives us ET date/hour directly.
+
+function cmeSessionId(etEpoch: number): string {
+  const d = new Date(etEpoch * 1000);
+  const h = d.getUTCHours();
+  if (h >= 18) {
+    const next = new Date(d);
+    next.setUTCDate(next.getUTCDate() + 1);
+    return next.toISOString().slice(0, 10);
+  }
+  return d.toISOString().slice(0, 10);
+}
+
+function shouldResetVwap(prevTime: number | null, t: number, is24h: boolean): boolean {
+  if (prevTime === null) return false;
+  if (is24h) return cmeSessionId(t) !== cmeSessionId(prevTime);
+  // Equities: reset on any gap > 1 hour (overnight, weekend, holiday)
+  return t - prevTime > 3600;
+}
 
 // ─── Data helpers ─────────────────────────────────────────────────────────────
 
@@ -153,7 +180,9 @@ type VwapResult = {
   stateLast: VwapState;
 };
 
-function buildVwapData(bars: BarRow[], cache: Map<string, number>): VwapResult {
+const VWAP_STATE_INIT: VwapState = { cumTPV: 0, cumVol: 0, prevTime: null, session: null };
+
+function buildVwapData(bars: BarRow[], cache: Map<string, number>, is24h: boolean): VwapResult {
   const items = buildSortedDeduped(bars, cache).filter((i) =>
     isFinite(Number(i.b.close))
   );
@@ -161,23 +190,23 @@ function buildVwapData(bars: BarRow[], cache: Map<string, number>): VwapResult {
   let cumTPV = 0,
     cumVol = 0,
     prevTime: number | null = null;
-  let statePreLast: VwapState = { cumTPV: 0, cumVol: 0, prevTime: null };
+  let statePreLast: VwapState = { ...VWAP_STATE_INIT };
   const data: LineData<Time>[] = [];
 
   for (let i = 0; i < items.length; i++) {
     const { t, b } = items[i];
 
-    // Capture state before last bar
+    // Capture state before last bar (before any session reset at this bar)
     if (i === items.length - 1) {
-      statePreLast = { cumTPV, cumVol, prevTime };
+      statePreLast = { cumTPV, cumVol, prevTime, session: prevTime !== null ? cmeSessionId(prevTime) : null };
     }
 
-    // Session reset on gap > 1 hour
-    if (prevTime !== null && t - prevTime > 3600) {
+    // Session reset: CME session boundary for 24h futures, gap > 1h for equities
+    if (shouldResetVwap(prevTime, t, is24h)) {
       cumTPV = 0;
       cumVol = 0;
       if (i === items.length - 1) {
-        statePreLast = { cumTPV: 0, cumVol: 0, prevTime };
+        statePreLast = { cumTPV: 0, cumVol: 0, prevTime, session: prevTime !== null ? cmeSessionId(prevTime) : null };
       }
     }
 
@@ -189,7 +218,11 @@ function buildVwapData(bars: BarRow[], cache: Map<string, number>): VwapResult {
     data.push({ time: t as Time, value: cumVol > 0 ? cumTPV / cumVol : Number(b.close) });
   }
 
-  return { data, statePreLast, stateLast: { cumTPV, cumVol, prevTime } };
+  return {
+    data,
+    statePreLast,
+    stateLast: { cumTPV, cumVol, prevTime, session: prevTime !== null ? cmeSessionId(prevTime) : null },
+  };
 }
 
 type EmaResult = {
@@ -234,10 +267,11 @@ function buildEmaData(
 function vwapPointFromState(
   state: VwapState,
   bar: BarRow,
-  t: number
+  t: number,
+  is24h: boolean,
 ): { value: number; nextState: VwapState } {
   let { cumTPV, cumVol } = state;
-  if (state.prevTime !== null && t - state.prevTime > 3600) {
+  if (shouldResetVwap(state.prevTime, t, is24h)) {
     cumTPV = 0;
     cumVol = 0;
   }
@@ -247,7 +281,7 @@ function vwapPointFromState(
   cumVol += vol;
   return {
     value: cumVol > 0 ? cumTPV / cumVol : Number(bar.close),
-    nextState: { cumTPV, cumVol, prevTime: t },
+    nextState: { cumTPV, cumVol, prevTime: t, session: cmeSessionId(t) },
   };
 }
 
@@ -322,8 +356,8 @@ export function CandlesChart({
   const epochCacheRef = useRef<Map<string, number>>(new Map());
 
   // Incremental VWAP state: state before and at the last bar
-  const vwapPreLastRef = useRef<VwapState>({ cumTPV: 0, cumVol: 0, prevTime: null });
-  const vwapLastRef = useRef<VwapState>({ cumTPV: 0, cumVol: 0, prevTime: null });
+  const vwapPreLastRef = useRef<VwapState>({ ...VWAP_STATE_INIT });
+  const vwapLastRef = useRef<VwapState>({ ...VWAP_STATE_INIT });
 
   // Incremental EMA state per period
   const emaPreLastRef = useRef<Map<number, EmaState>>(new Map());
@@ -507,7 +541,7 @@ export function CandlesChart({
 
       // VWAP
       const preLastVwap = isNewBar ? vwapLastRef.current : vwapPreLastRef.current;
-      const { value: vwapValue, nextState: newVwapState } = vwapPointFromState(preLastVwap, lastBar, t);
+      const { value: vwapValue, nextState: newVwapState } = vwapPointFromState(preLastVwap, lastBar, t, is24h ?? false);
       vwap.update({ time: t as Time, value: vwapValue });
       if (isNewBar) vwapPreLastRef.current = vwapLastRef.current;
       vwapLastRef.current = newVwapState;
@@ -578,7 +612,7 @@ export function CandlesChart({
         }));
       volRef.current?.setData(volData);
 
-      const { data: vwapData, statePreLast, stateLast } = buildVwapData(bars, cache);
+      const { data: vwapData, statePreLast, stateLast } = buildVwapData(bars, cache, is24h ?? false);
       vwap.setData(vwapData);
       vwapPreLastRef.current = statePreLast;
       vwapLastRef.current = stateLast;
