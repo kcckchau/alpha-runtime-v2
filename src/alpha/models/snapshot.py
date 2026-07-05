@@ -35,9 +35,10 @@ class BarSnapshot(BaseModel):
     session_phase: SessionPhase = SessionPhase.CLOSED
     bars_since_open: int = 0
 
-    # ── Trend indicators ─────────────────────────────────────────────────────
+    # ── Trend indicators — 1m ────────────────────────────────────────────────
     ema_9: Decimal | None = None
     ema_20: Decimal | None = None
+    ema_21: Decimal | None = None             # EMA21 (user's primary 1m fast EMA)
     ema_50: Decimal | None = None
     ema_9_slope: float | None = None          # % rate-of-change of EMA9 vs prior bar (positive = rising)
     ema_9_slope_direction: str | None = None  # "up" / "flat" / "down"  (flat = |slope| ≤ 0.005%)
@@ -45,6 +46,17 @@ class BarSnapshot(BaseModel):
     ema_20_slope_direction: str | None = None  # "up" / "flat" / "down"
     vwap_slope: float | None = None           # % rate-of-change of VWAP vs prior bar
     vwap_slope_direction: str | None = None   # "up" / "flat" / "down"  (flat = |slope| ≤ 0.002%)
+
+    # ── Trend indicators — 5m (carry-forward: updated on each M5 bar) ────────
+    ema9_5m: Decimal | None = None            # 5m EMA9
+    ema21_5m: Decimal | None = None           # 5m EMA21
+
+    # ── Trend indicators — 1h (carry-forward: updated on each H1 bar) ────────
+    # SMA200 requires 200 H1 bars (~8.5 trading days); will be None until warm.
+    ema9_1h: Decimal | None = None            # 1h EMA9
+    ema21_1h: Decimal | None = None           # 1h EMA21
+    ema50_1h: Decimal | None = None           # 1h EMA50
+    sma200_1h: Decimal | None = None          # 1h SMA200
 
     # ── Volatility ────────────────────────────────────────────────────────────
     atr_14: Decimal | None = None

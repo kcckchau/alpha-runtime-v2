@@ -53,6 +53,7 @@ class SymbolFeatureState:
         self.session_date: datetime | None = None
         self.ema_9: Decimal | None = None
         self.ema_20: Decimal | None = None
+        self.ema_21: Decimal | None = None
         self.ema_50: Decimal | None = None
         self.latest_bid: Decimal | None = None
         self.latest_ask: Decimal | None = None
@@ -150,6 +151,28 @@ class SymbolFeatureState:
         return self.cumulative_vwap_num / Decimal(self.cumulative_volume)
 
 
+class _HTFEMAState:
+    """Lightweight EMA/SMA state for a single higher timeframe (M5, H1, D1).
+
+    Holds only what's needed to compute EMAs bar-by-bar. Values are carried
+    forward to the M1 BarSnapshot so downstream engines always have the latest
+    HTF EMA without needing to subscribe to HTF bar events themselves.
+
+    EMA50 and SMA200 are optional — only computed when the state is created
+    with track_ema50=True / track_sma200=True (used for H1 and D1).
+    """
+
+    def __init__(self, track_ema50: bool = False, track_sma200: bool = False) -> None:
+        self.ema_9: Decimal | None = None
+        self.ema_21: Decimal | None = None
+        self.ema_50: Decimal | None = None          # None unless track_ema50
+        self._track_ema50 = track_ema50
+        self._sma200_buf: deque[Decimal] | None = (
+            deque(maxlen=200) if track_sma200 else None
+        )
+        self.sma_200: Decimal | None = None         # None until 200 bars seen
+
+
 class FeatureEngine(BaseEngine):
     """
     Computes indicators and microstructure features per bar.
@@ -176,6 +199,10 @@ class FeatureEngine(BaseEngine):
         self._snapshots: dict[str, BarSnapshot] = {}
         self._symbol_calendars: dict[str, SessionCalendar] = {}
         self._snapshots_emitted: int = 0
+        # Higher-timeframe EMA state — keyed by symbol, updated on HTF bar events,
+        # carried forward into every M1 BarSnapshot.
+        self._m5_ema: dict[str, _HTFEMAState] = {}
+        self._h1_ema: dict[str, _HTFEMAState] = {}
 
     @property
     def name(self) -> str:
@@ -256,8 +283,14 @@ class FeatureEngine(BaseEngine):
     async def _handle_bar(self, event: AnyEvent) -> None:
         if not isinstance(event, BarEvent):
             return
+        if event.timeframe == BarTimeframe.M5:
+            self._update_htf_ema(self._m5_ema, event)
+            return
+        if event.timeframe == BarTimeframe.H1:
+            self._update_htf_ema(self._h1_ema, event, track_ema50=True, track_sma200=True)
+            return
         if event.timeframe != BarTimeframe.M1:
-            return  # S1 and other sub-minute bars are for push WS only
+            return  # S1, D1 and other bars not processed here
         state = self._get_or_create(event.symbol)
         self._update_state(state, event)
         snapshot = self._build_snapshot(state, event)
@@ -442,6 +475,7 @@ class FeatureEngine(BaseEngine):
         prev_ema_20 = state.ema_20
         state.ema_9 = self._ema(bar.close, state.ema_9, 9)
         state.ema_20 = self._ema(bar.close, state.ema_20, 20)
+        state.ema_21 = self._ema(bar.close, state.ema_21, 21)
         state.ema_50 = self._ema(bar.close, state.ema_50, 50)
         state.prev_ema_9 = prev_ema_9
         state.prev_ema_20 = prev_ema_20
@@ -554,7 +588,14 @@ class FeatureEngine(BaseEngine):
             bars_since_open=state.bars_since_open,
             ema_9=state.ema_9,
             ema_20=state.ema_20,
+            ema_21=state.ema_21,
             ema_50=state.ema_50,
+            ema9_5m=self._m5_ema[bar.symbol].ema_9 if bar.symbol in self._m5_ema else None,
+            ema21_5m=self._m5_ema[bar.symbol].ema_21 if bar.symbol in self._m5_ema else None,
+            ema9_1h=self._h1_ema[bar.symbol].ema_9 if bar.symbol in self._h1_ema else None,
+            ema21_1h=self._h1_ema[bar.symbol].ema_21 if bar.symbol in self._h1_ema else None,
+            ema50_1h=self._h1_ema[bar.symbol].ema_50 if bar.symbol in self._h1_ema else None,
+            sma200_1h=self._h1_ema[bar.symbol].sma_200 if bar.symbol in self._h1_ema else None,
             ema_9_slope=ema_9_slope,
             ema_9_slope_direction=ema_9_slope_direction,
             ema_20_slope=ema_20_slope,
@@ -596,6 +637,27 @@ class FeatureEngine(BaseEngine):
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _update_htf_ema(
+        self,
+        store: dict[str, _HTFEMAState],
+        bar: BarEvent,
+        track_ema50: bool = False,
+        track_sma200: bool = False,
+    ) -> None:
+        """Update EMA9/EMA21 (and optionally EMA50/SMA200) for a HTF bar."""
+        sym = bar.symbol
+        if sym not in store:
+            store[sym] = _HTFEMAState(track_ema50=track_ema50, track_sma200=track_sma200)
+        s = store[sym]
+        s.ema_9 = self._ema(bar.close, s.ema_9, 9)
+        s.ema_21 = self._ema(bar.close, s.ema_21, 21)
+        if s._track_ema50:
+            s.ema_50 = self._ema(bar.close, s.ema_50, 50)
+        if s._sma200_buf is not None:
+            s._sma200_buf.append(bar.close)
+            if len(s._sma200_buf) == 200:
+                s.sma_200 = sum(s._sma200_buf) / Decimal(200)
 
     @staticmethod
     def _ema(price: Decimal, prev: Decimal | None, period: int) -> Decimal:
