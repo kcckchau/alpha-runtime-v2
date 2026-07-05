@@ -37,6 +37,20 @@ logger = logging.getLogger(__name__)
 _ZERO = Decimal("0")
 
 
+def _percentile(data: list[Decimal], pct: float) -> Decimal | None:
+    """Linear-interpolation percentile over a list of Decimals.  No minimum size."""
+    if not data:
+        return None
+    s = sorted(data)
+    idx = pct * (len(s) - 1)
+    lo = int(idx)
+    hi = min(lo + 1, len(s) - 1)
+    if lo == hi:
+        return s[lo]
+    frac = Decimal(str(round(idx - lo, 6)))
+    return s[lo] + (s[hi] - s[lo]) * frac
+
+
 class SymbolFeatureState:
     """Per-symbol rolling indicator state."""
 
@@ -101,6 +115,11 @@ class SymbolFeatureState:
         # EMA9 slope acceleration
         self.prev_ema_9_slope: float | None = None
         self.ema_9_slope_accel: float | None = None
+        # RTH candle-range distribution (reset each RTH session)
+        self.rth_ranges: list[Decimal] = []
+        self.rth_median_1m_range: Decimal | None = None
+        self.rth_p75_1m_range: Decimal | None = None
+        self.rth_p90_1m_range: Decimal | None = None
 
     def reset_session(self) -> None:
         self.bars_since_open = 0
@@ -143,6 +162,10 @@ class SymbolFeatureState:
         self.atr_30 = None
         self.prev_ema_9_slope = None
         self.ema_9_slope_accel = None
+        self.rth_ranges = []
+        self.rth_median_1m_range = None
+        self.rth_p75_1m_range = None
+        self.rth_p90_1m_range = None
 
     @property
     def vwap(self) -> Decimal:
@@ -369,6 +392,12 @@ class FeatureEngine(BaseEngine):
                         state.orb_low = bar.low
                 elif not state.orb_established and bar.timestamp >= orb_end:
                     state.orb_established = True
+
+                # RTH candle-range distribution — used to normalize sweep depth
+                state.rth_ranges.append(bar.high - bar.low)
+                state.rth_median_1m_range = _percentile(state.rth_ranges, 0.50)
+                state.rth_p75_1m_range = _percentile(state.rth_ranges, 0.75)
+                state.rth_p90_1m_range = _percentile(state.rth_ranges, 0.90)
 
             # ── Setup detection features ──────────────────────────────────────
             vwap = state.vwap
@@ -650,6 +679,9 @@ class FeatureEngine(BaseEngine):
             bars_since_last_vwap_touch=state.bars_since_last_vwap_touch,
             atr_30=state.atr_30,
             ema_9_slope_accel=state.ema_9_slope_accel,
+            rth_median_1m_range=state.rth_median_1m_range,
+            rth_p75_1m_range=state.rth_p75_1m_range,
+            rth_p90_1m_range=state.rth_p90_1m_range,
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────────

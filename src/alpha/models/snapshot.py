@@ -114,3 +114,8 @@ class BarSnapshot(BaseModel):
     # ── Additional volatility ─────────────────────────────────────────────────
     atr_30: Decimal | None = None           # M1 30-period ATR
     ema_9_slope_accel: float | None = None  # slope acceleration (d²EMA9/dt²)
+
+    # ── RTH candle-range distribution (so far today, RTH bars only) ───────────
+    rth_median_1m_range: Decimal | None = None  # median 1m bar range this RTH session
+    rth_p75_1m_range: Decimal | None = None     # 75th pct — "large but normal" candle
+    rth_p90_1m_range: Decimal | None = None     # 90th pct — "abnormally large" candle

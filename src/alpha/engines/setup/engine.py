@@ -988,12 +988,15 @@ class SetupEngine(BaseEngine):
         """
         Pure read — no state mutations.  Called both from _detect and _detector_reason.
 
-        Fires when:
-          - Active sweep state exists (price went below ONL on a prior or current bar)
-          - This bar closes above ONL (reclaim)
-          - Sweep depth ≤ min(30 pts, 2× ATR_14); fallback 0.15%
-          - Strong close: bar_close_position_pct ≥ 0.5
+        Sweep depth classification (ATR-normalized):
+          0 – 2.0× ATR  : clean liquidity sweep  → fires
+          2.0 – 3.0× ATR: deep sweep             → fires, strong close required
+          > 3.0× ATR    : likely breakdown        → blocked
 
+        Secondary check: sweep depth vs RTH candle distribution.
+          > rth_p90 × 2 : abnormally large for today → blocked
+
+        Hard cap: 30 pts regardless of ATR / distribution.
         5M21 / VWAP reclaim are confirmation score signals — not hard gates.
         """
         if self._context_engine is None:
@@ -1011,13 +1014,33 @@ class SetupEngine(BaseEngine):
             return "close_not_above_onl"
 
         sweep_pts = onl - state["sweep_low"]
-        max_sweep = (
-            min(Decimal("30"), snap.atr_14 * Decimal("2"))
-            if snap.atr_14 else onl * Decimal("0.0015")
-        )
-        if sweep_pts > max_sweep:
-            return "sweep_too_deep"
 
+        # Hard cap — 30 pts regardless of session volatility
+        if sweep_pts > Decimal("30"):
+            return "sweep_too_deep_gt_30pts_hard_cap"
+
+        # ATR-normalized classification
+        if snap.atr_14 and snap.atr_14 > Decimal("0"):
+            sweep_atrs = float(sweep_pts) / float(snap.atr_14)
+            if sweep_atrs > 3.0:
+                return f"sweep_too_deep_likely_breakdown_{sweep_atrs:.1f}atrs"
+            # 2–3 ATR: deep but valid only with strong close
+            if sweep_atrs > 2.0:
+                if snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.6:
+                    return "deep_sweep_requires_strong_close_ge_60pct"
+        else:
+            # ATR not yet available — fall back to RTH p75 then percentage
+            if snap.rth_p75_1m_range is not None:
+                if sweep_pts > snap.rth_p75_1m_range * Decimal("2"):
+                    return "sweep_too_deep_vs_rth_p75_fallback"
+            elif float(sweep_pts) / float(onl) > 0.0015:
+                return "sweep_too_deep_pct_fallback"
+
+        # RTH distribution check: sweep > 2× p90 of today's candles → abnormal
+        if snap.rth_p90_1m_range is not None and sweep_pts > snap.rth_p90_1m_range * Decimal("2"):
+            return "sweep_too_deep_vs_rth_p90_distribution"
+
+        # Base close-quality gate (≥ 50th pct for clean sweeps; ≥ 60th enforced above for deep)
         if snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.5:
             return "close_in_lower_half"
 
