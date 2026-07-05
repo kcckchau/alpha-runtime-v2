@@ -42,6 +42,7 @@ from alpha.config.settings import AlphaSettings, RuntimeSettings, StorageSetting
 from alpha.core.clock import WallClock
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
+from alpha.engines.context.engine import ContextEngine
 from alpha.engines.feature.engine import FeatureEngine
 from alpha.engines.historical.sources.databento import DatabentoHistoricalDataSource as DatabentoHistoricalSource
 from alpha.engines.market_state.engine import MarketStateEngine
@@ -347,6 +348,7 @@ async def replay(
 
     clock = WallClock()
     feature_engine      = FeatureEngine(settings, bus, registry, calendar, clock)
+    context_engine      = ContextEngine(settings, bus, registry, calendar, clock)
     market_state_engine = MarketStateEngine(settings, bus, registry)
     setup_engine        = SetupEngine(settings, bus, registry)
     thesis_engine       = ThesisEngine(settings, bus, registry)
@@ -355,13 +357,18 @@ async def replay(
     setup_engine.set_feature_engine(feature_engine)
     setup_engine.set_market_state_engine(market_state_engine)
     thesis_engine.set_feature_engine(feature_engine)
+    context_engine.set_feature_engine(feature_engine)
 
     await feature_engine.initialize()
+    await context_engine.initialize()
     await market_state_engine.initialize()
     await setup_engine.initialize()
     await thesis_engine.initialize()
 
+    # ContextEngine must start AFTER FeatureEngine so its BAR subscription
+    # fires second — guaranteeing FeatureEngine.get_snapshot() is current.
     await feature_engine.start()
+    await context_engine.start()
     await market_state_engine.start()
     await setup_engine.start()
     await thesis_engine.start()
@@ -500,6 +507,7 @@ async def replay(
 
         ts            = _ts(bar.timestamp)
         snap          = feature_engine.get_snapshot(symbol)
+        ctx           = context_engine.get_context(symbol)
         thesis        = thesis_engine.get_thesis(symbol)
         active_setups = setup_engine.active_setups(symbol)
         vwap_str      = _fmt_dec(snap.vwap if snap else None)
@@ -538,6 +546,12 @@ async def replay(
             print(f"         EMA9={_fmt_dec(snap.ema_9)}  EMA20={_fmt_dec(snap.ema_20)}  "
                   f"ATR14={_fmt_dec(snap.atr_14)}  AboveVWAP={'Y' if snap.is_above_vwap else 'N'}  "
                   f"ORBhigh={_fmt_dec(snap.orb_high)}  ORBlow={_fmt_dec(snap.orb_low)}")
+        if verbose and ctx:
+            wz = f"{ctx.nearest_war_zone}@{_fmt_dec(ctx.nearest_war_zone_price)} ({_fmt_dec(ctx.nearest_war_zone_dist, 1)}pts)" if ctx.nearest_war_zone else "—"
+            gap_str = f"{ctx.gap_points:+.2f}pts ({ctx.gap_pct:+.2f}%)" if ctx.gap_points is not None else "—"
+            print(f"         ONH={_fmt_dec(ctx.onh)}  ONL={_fmt_dec(ctx.onl)}  "
+                  f"PDH={_fmt_dec(ctx.pdh)}  PDL={_fmt_dec(ctx.pdl)}  "
+                  f"Gap={gap_str}  NearestWZ={wz}")
 
         for s in active_setups:
             stype  = s.setup_type.value if hasattr(s.setup_type, "value") else str(s.setup_type)
@@ -579,6 +593,20 @@ async def replay(
         for s in active_setups:
             print(f"  {s.setup_type} | {s.state} | score={s.score}")
 
+    ctx_final = context_engine.get_context(symbol)
+    if ctx_final:
+        print(f"\nSession context:")
+        print(f"  ONH      : {_fmt_dec(ctx_final.onh)}")
+        print(f"  ONL      : {_fmt_dec(ctx_final.onl)}")
+        print(f"  PDH      : {_fmt_dec(ctx_final.pdh)}")
+        print(f"  PDL      : {_fmt_dec(ctx_final.pdl)}")
+        print(f"  PrevClose: {_fmt_dec(ctx_final.prev_rth_close)}")
+        print(f"  RTH Open : {_fmt_dec(ctx_final.rth_open)}")
+        if ctx_final.gap_points is not None:
+            print(f"  Gap      : {ctx_final.gap_points:+.2f} pts ({ctx_final.gap_pct:+.2f}%)")
+        if ctx_final.nearest_war_zone:
+            print(f"  Nearest WZ: {ctx_final.nearest_war_zone} @ {_fmt_dec(ctx_final.nearest_war_zone_price)}")
+
     snap = feature_engine.get_snapshot(symbol)
     if snap:
         print(f"\nFinal indicators:")
@@ -615,6 +643,7 @@ async def replay(
     await thesis_engine.stop()
     await setup_engine.stop()
     await market_state_engine.stop()
+    await context_engine.stop()
     await feature_engine.stop()
     await bus.stop()
 
