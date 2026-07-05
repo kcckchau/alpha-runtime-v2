@@ -111,6 +111,8 @@ class SetupEngine(BaseEngine):
         self._last_close_bar: dict[str, dict["SetupType", int]] = {}
         self._bar_counts: dict[str, int] = {}  # rolling bar count per symbol per session
         self._bar_count_session: dict[str, str] = {}
+        # Double-bottom candidate tracking: symbol → (first_bottom_low, bar_count)
+        self._dbl_first_bottom: dict[str, tuple[Decimal, int] | None] = {}
         self._setups_detected: int = 0
         self._setups_triggered: int = 0
 
@@ -218,6 +220,7 @@ class SetupEngine(BaseEngine):
             self._bar_count_session[symbol] = session_key
             self._bar_counts[symbol] = 0
             self._last_close_bar.pop(symbol, None)
+            self._dbl_first_bottom.pop(symbol, None)
         self._bar_counts[symbol] = self._bar_counts.get(symbol, 0) + 1
 
         snapshot = self._get_snapshot(symbol)
@@ -260,6 +263,9 @@ class SetupEngine(BaseEngine):
             # ORB family
             (SetupType.ORB_BREAKOUT, self._detect_orb_breakout),
             (SetupType.ORB_BREAKDOWN, self._detect_orb_breakdown),
+            # Failed-breakdown / key-level reclaim family
+            (SetupType.ONL_SWEEP_RECLAIM_LONG, self._detect_onl_sweep_reclaim_long),
+            (SetupType.DOUBLE_BOTTOM_RECLAIM_LONG, self._detect_double_bottom_reclaim_long),
         ]
         current_bar = self._bar_counts.get(symbol, 0)
         for setup_type, detector in detectors:
@@ -929,6 +935,210 @@ class SetupEngine(BaseEngine):
             return "close_not_below_orb_low"
         return None
 
+    # ── ONL_SWEEP_RECLAIM_LONG ────────────────────────────────────────────────
+
+    def _detect_onl_sweep_reclaim_long(self, snap: BarSnapshot, ms: MarketState) -> bool:
+        return self._reason_onl_sweep_reclaim_long(snap, ms) is None
+
+    def _reason_onl_sweep_reclaim_long(self, snap: BarSnapshot, ms: MarketState) -> str | None:
+        """
+        Bar swept below ONL (low < onl) and closed back above ONL in the same bar.
+        Sweep depth ≤ 0.5% — a genuine wick, not an extended breakdown.
+        Strong close: bar_close_position_pct ≥ 0.5 — buyers absorbed the sweep.
+
+        Requires ContextEngine for ONL; silently skips when context is unavailable.
+        5M21 / VWAP reclaim are confirmation score signals — not hard gates here.
+        """
+        if self._context_engine is None:
+            return "no_context_engine"
+        ctx = self._context_engine.get_context(snap.symbol)
+        if ctx is None or ctx.onl is None:
+            return "no_onl"
+        onl = ctx.onl
+        if snap.bar.low >= onl:
+            return "low_not_below_onl"
+        if snap.bar.close <= onl:
+            return "close_not_above_onl"
+        sweep_depth_pct = float(onl - snap.bar.low) / float(onl)
+        if sweep_depth_pct > 0.005:
+            return "sweep_too_deep_gt_0.5pct"
+        if snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.5:
+            return "close_in_lower_half"
+        return None
+
+    def _advance_onl_sweep_reclaim_long(
+        self, setup: Setup, snap: BarSnapshot, ms: MarketState
+    ) -> tuple[Setup, str]:
+        """
+        FORMING → CONFIRMED: next bar holds above ONL, no new lower low, close ≥ 40th percentile.
+        Entry = forming bar's high.  Stop = forming bar's low (sweep low).
+        Timeout: 6 bars.
+        """
+        if setup.state == SetupState.FORMING:
+            bars = self._forming_bars.get(setup.setup_id, 0) + 1
+            self._forming_bars[setup.setup_id] = bars
+
+            ctx = self._context_engine.get_context(setup.symbol) if self._context_engine else None
+            onl = ctx.onl if ctx else None
+
+            if onl is not None and snap.bar.close < onl:
+                return setup.transition(SetupState.INVALIDATED, "close_below_onl_reclaim_failed", bar_time=snap.timestamp), ""
+            if bars > 6:
+                return setup.transition(SetupState.INVALIDATED, "forming_timeout_gt_6_bars", bar_time=snap.timestamp), ""
+
+            if onl is not None and snap.bar.close > onl:
+                no_lower_low = not snap.is_lower_low
+                close_pos_ok = snap.bar_close_position_pct is None or snap.bar_close_position_pct >= 0.4
+                if no_lower_low and close_pos_ok:
+                    entry = setup.bar_snapshot.bar.high
+                    stop = setup.bar_snapshot.bar.low
+                    rw_reason = self._risk_width_rejection(entry, stop, snap)
+                    if rw_reason:
+                        return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
+                    mult = self._target_mult("buy", ms)
+                    target = entry + (entry - stop) * mult
+                    confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
+                        update={"entry_trigger": entry, "stop_reference": stop, "target_reference": target}
+                    )
+                    logger.info(
+                        "Setup confirmed: %s %s entry=%.2f stop=%.2f target=%.2f",
+                        setup.symbol, setup.setup_type,
+                        float(entry), float(stop), float(target),
+                    )
+                    return confirmed, "confirmed"
+
+        elif setup.state == SetupState.CONFIRMED:
+            if setup.stop_reference and snap.bar.low <= setup.stop_reference:
+                return setup.transition(SetupState.FAILED, bar_time=snap.timestamp), "stop hit"
+            if setup.entry_trigger and snap.bar.high >= setup.entry_trigger:
+                return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"
+
+        return setup, ""
+
+    # ── DOUBLE_BOTTOM_RECLAIM_LONG ────────────────────────────────────────────
+
+    def _detect_double_bottom_reclaim_long(self, snap: BarSnapshot, ms: MarketState) -> bool:
+        """
+        Stateful detector.  On each bar:
+          1. Check if this bar is the second bottom (pure read of stored state).
+          2. If not, update the first-bottom candidate state.
+        This order prevents overwriting the first-bottom state with the second bottom's low.
+        """
+        symbol = snap.symbol
+        bar_count = self._bar_counts.get(symbol, 0)
+
+        # Check second bottom BEFORE potentially updating first-bottom state
+        is_second = self._reason_double_bottom_reclaim_long(snap, ms) is None
+
+        if not is_second:
+            # Update first-bottom candidate
+            if snap.is_new_lod:
+                close_pos = snap.bar_close_position_pct
+                close_in_upper = close_pos is None or close_pos >= 0.5
+                if close_in_upper:
+                    first = self._dbl_first_bottom.get(symbol)
+                    # Only update when clearly lower than prior candidate
+                    if first is None or snap.bar.low < first[0] * Decimal("0.9997"):
+                        self._dbl_first_bottom[symbol] = (snap.bar.low, bar_count)
+                else:
+                    # Weak close on new low — likely breakdown; clear candidate
+                    first = self._dbl_first_bottom.get(symbol)
+                    if first is not None and snap.bar.low < first[0] * Decimal("0.997"):
+                        self._dbl_first_bottom.pop(symbol, None)
+
+        return is_second
+
+    def _reason_double_bottom_reclaim_long(self, snap: BarSnapshot, ms: MarketState) -> str | None:
+        """
+        Pure read of double-bottom state — no mutations.
+        Conditions (v0):
+          - First bottom tracked: a prior new-session-low bar that closed in the upper half
+          - Second bottom: low within 0.5% of first bottom, ≥ 3 bars later, ≤ 60 bars later
+          - Second low does not materially extend (low ≥ first_bottom * 0.997)
+          - Strong close on second bottom (bar_close_position_pct ≥ 0.5)
+          - Close above first bottom's low (buyers won the zone)
+        5M21 / VWAP reclaim are confirmation score signals — not hard gates.
+        """
+        symbol = snap.symbol
+        bar_count = self._bar_counts.get(symbol, 0)
+        first = self._dbl_first_bottom.get(symbol)
+
+        if first is None:
+            return "no_first_bottom_tracked"
+
+        first_low, first_bar = first
+        bars_since_first = bar_count - first_bar
+
+        if bars_since_first < 3:
+            return "too_few_bars_since_first_bottom"
+        if bars_since_first > 60:
+            return "first_bottom_too_stale"
+
+        low_pct_diff = abs(float(snap.bar.low - first_low)) / float(first_low)
+        if low_pct_diff > 0.005:
+            return "low_not_near_first_bottom_zone"
+
+        if snap.bar.low < first_low * Decimal("0.997"):
+            return "second_low_extends_materially_below_first"
+
+        if snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.5:
+            return "second_bottom_close_in_lower_half"
+
+        if snap.bar.close <= first_low:
+            return "second_bottom_close_not_above_first_low"
+
+        return None
+
+    def _advance_double_bottom_reclaim_long(
+        self, setup: Setup, snap: BarSnapshot, ms: MarketState
+    ) -> tuple[Setup, str]:
+        """
+        FORMING → CONFIRMED: next bar holds above second bottom's low, no new lower low,
+        and close ≥ second bottom bar's close.
+        Entry = second bottom bar's high.  Stop = second bottom bar's low.
+        Timeout: 8 bars.
+        """
+        if setup.state == SetupState.FORMING:
+            bars = self._forming_bars.get(setup.setup_id, 0) + 1
+            self._forming_bars[setup.setup_id] = bars
+
+            # Invalidation: lower low below the second bottom
+            if snap.bar.low < setup.bar_snapshot.bar.low:
+                return setup.transition(SetupState.INVALIDATED, "new_lower_low_below_second_bottom", bar_time=snap.timestamp), ""
+            if bars > 8:
+                return setup.transition(SetupState.INVALIDATED, "forming_timeout_gt_8_bars", bar_time=snap.timestamp), ""
+
+            # Confirm: hold above second bottom's close, no lower low
+            if snap.bar.close >= setup.bar_snapshot.bar.close and not snap.is_lower_low:
+                entry = setup.bar_snapshot.bar.high
+                stop = setup.bar_snapshot.bar.low
+                rw_reason = self._risk_width_rejection(entry, stop, snap)
+                if rw_reason:
+                    return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
+                mult = self._target_mult("buy", ms)
+                target = (
+                    snap.intraday_high
+                    if snap.intraday_high is not None and snap.intraday_high > entry
+                    else entry + (entry - stop) * mult
+                )
+                confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
+                    update={"entry_trigger": entry, "stop_reference": stop, "target_reference": target}
+                )
+                logger.info(
+                    "Setup confirmed: %s %s entry=%.2f stop=%.2f target=%.2f",
+                    setup.symbol, setup.setup_type,
+                    float(entry), float(stop), float(target),
+                )
+                return confirmed, "confirmed"
+
+        elif setup.state == SetupState.CONFIRMED:
+            if setup.stop_reference and snap.bar.low <= setup.stop_reference:
+                return setup.transition(SetupState.FAILED, bar_time=snap.timestamp), "stop hit"
+            if setup.entry_trigger and snap.bar.high >= setup.entry_trigger:
+                return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"
+
+        return setup, ""
+
     # ── Stub detectors (not yet implemented) ─────────────────────────────────
 
     def _detect_orb_breakout(self, snap: BarSnapshot, ms: MarketState) -> bool:
@@ -964,6 +1174,10 @@ class SetupEngine(BaseEngine):
             return self._reason_orb_breakdown(snapshot, market_state)
         if setup_type == SetupType.ORB_BREAKOUT:
             return "not_implemented"
+        if setup_type == SetupType.ONL_SWEEP_RECLAIM_LONG:
+            return self._reason_onl_sweep_reclaim_long(snapshot, market_state)
+        if setup_type == SetupType.DOUBLE_BOTTOM_RECLAIM_LONG:
+            return self._reason_double_bottom_reclaim_long(snapshot, market_state)
         return "no_reason_available"
 
     # ── State machine ─────────────────────────────────────────────────────────
@@ -1130,6 +1344,10 @@ class SetupEngine(BaseEngine):
             return self._advance_trend_pullback_short(setup, snapshot, market_state)
         if setup.setup_type == SetupType.ORB_BREAKDOWN:
             return self._advance_orb_breakdown(setup, snapshot, market_state)
+        if setup.setup_type == SetupType.ONL_SWEEP_RECLAIM_LONG:
+            return self._advance_onl_sweep_reclaim_long(setup, snapshot, market_state)
+        if setup.setup_type == SetupType.DOUBLE_BOTTOM_RECLAIM_LONG:
+            return self._advance_double_bottom_reclaim_long(setup, snapshot, market_state)
         return setup, ""
 
     # ── Per-type advance methods ───────────────────────────────────────────────

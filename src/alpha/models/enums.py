@@ -147,6 +147,8 @@ class SetupType(StrEnum):
     TREND_PULLBACK_SHORT = "trend_pullback_short"
     VWAP_FAILED_RECLAIM_SHORT = "vwap_failed_reclaim_short"
     RELATIVE_STRENGTH_BREAKOUT = "relative_strength_breakout"
+    ONL_SWEEP_RECLAIM_LONG = "onl_sweep_reclaim_long"         # ONL sweep + reclaim (key-level failed breakdown)
+    DOUBLE_BOTTOM_RECLAIM_LONG = "double_bottom_reclaim_long"  # two lows near same zone, second fails to extend
 
 
 class SetupState(StrEnum):
