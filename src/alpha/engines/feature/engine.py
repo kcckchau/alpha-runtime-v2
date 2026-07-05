@@ -393,11 +393,14 @@ class FeatureEngine(BaseEngine):
                 elif not state.orb_established and bar.timestamp >= orb_end:
                     state.orb_established = True
 
-                # RTH candle-range distribution — used to normalize sweep depth
-                state.rth_ranges.append(bar.high - bar.low)
+                # RTH candle-range distribution — used to normalize sweep depth.
+                # Compute percentiles from PRIOR bars before appending the current
+                # bar's range, so classifiers on the current bar are not polluted
+                # by the candle they are evaluating.
                 state.rth_median_1m_range = _percentile(state.rth_ranges, 0.50)
                 state.rth_p75_1m_range = _percentile(state.rth_ranges, 0.75)
                 state.rth_p90_1m_range = _percentile(state.rth_ranges, 0.90)
+                state.rth_ranges.append(bar.high - bar.low)
 
             # ── Setup detection features ──────────────────────────────────────
             vwap = state.vwap

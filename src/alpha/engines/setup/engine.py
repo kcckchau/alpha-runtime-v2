@@ -1015,16 +1015,21 @@ class SetupEngine(BaseEngine):
 
         sweep_pts = onl - state["sweep_low"]
 
-        # Hard cap — 30 pts regardless of session volatility
-        if sweep_pts > Decimal("30"):
-            return "sweep_too_deep_gt_30pts_hard_cap"
+        # Dynamic hard cap: max(30 pts, 2.5× ATR_14), absolute ceiling 60 pts.
+        # On a high-volatility day (FOMC/CPI/open panic), a 40-pt sweep that is
+        # only 2× ATR should not be blocked by a rigid 30-pt cap.
+        if snap.atr_14 and snap.atr_14 > Decimal("0"):
+            dynamic_cap = max(Decimal("30"), snap.atr_14 * Decimal("2.5"))
+            hard_cap = min(dynamic_cap, Decimal("60"))
+        else:
+            hard_cap = Decimal("30")
+        if sweep_pts > hard_cap:
+            return f"sweep_too_deep_gt_{float(hard_cap):.0f}pts_cap"
 
-        # ATR-normalized classification
+        # ATR-normalized classification (cap above already blocks > 2.5× ATR)
         if snap.atr_14 and snap.atr_14 > Decimal("0"):
             sweep_atrs = float(sweep_pts) / float(snap.atr_14)
-            if sweep_atrs > 3.0:
-                return f"sweep_too_deep_likely_breakdown_{sweep_atrs:.1f}atrs"
-            # 2–3 ATR: deep but valid only with strong close
+            # 2–2.5× ATR: deep but valid — require strong close (≥ 60th pct)
             if sweep_atrs > 2.0:
                 if snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.6:
                     return "deep_sweep_requires_strong_close_ge_60pct"
@@ -1036,9 +1041,12 @@ class SetupEngine(BaseEngine):
             elif float(sweep_pts) / float(onl) > 0.0015:
                 return "sweep_too_deep_pct_fallback"
 
-        # RTH distribution check: sweep > 2× p90 of today's candles → abnormal
-        if snap.rth_p90_1m_range is not None and sweep_pts > snap.rth_p90_1m_range * Decimal("2"):
-            return "sweep_too_deep_vs_rth_p90_distribution"
+        # RTH distribution check — only once we have ≥ 15 bars of RTH history.
+        # Early RTH (first ~15 min) has too few samples; ATR is more reliable then.
+        rth_mature = snap.bars_since_open is not None and snap.bars_since_open >= 15
+        if rth_mature and snap.rth_p90_1m_range is not None:
+            if sweep_pts > snap.rth_p90_1m_range * Decimal("2"):
+                return "sweep_too_deep_vs_rth_p90_distribution"
 
         # Base close-quality gate (≥ 50th pct for clean sweeps; ≥ 60th enforced above for deep)
         if snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.5:
