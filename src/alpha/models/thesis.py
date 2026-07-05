@@ -68,6 +68,11 @@ class TickFlowSnapshot:
     # Rolling session baseline (updated every bar)
     session_avg_tps: float = 0.0
 
+    # Order flow signals
+    bar_delta: float = 0.0          # net buy_vol - sell_vol in 30s window (positive = net buying)
+    absorption: bool = False         # True when bar is bearish but buy volume dominated (buyers absorbed)
+    book_imbalance: float | None = None  # (bid_size - ask_size) / (bid_size + ask_size); negative = ask heavy
+
 
 @dataclass
 class ThesisCandidate:
@@ -101,6 +106,10 @@ class ThesisCandidate:
     # Flip path
     possible_flip: ThesisType | None = None
     invalidation_reason: str | None = None
+
+    # Pre-VWAP-break detection: True when thesis was triggered while price still above VWAP.
+    # Suppresses the normal bars_above_vwap >= 2 invalidation until the VWAP cross confirms.
+    pre_vwap_break: bool = False
 
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

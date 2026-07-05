@@ -1,6 +1,7 @@
 {
   "permissions": {
     "allow": [
+      "Bash(*)",
       "Bash(pip install *)",
       "Bash(python *)",
       "Bash(npx tsc:*)",
@@ -38,7 +39,10 @@
       "Bash([ -d \"data/parquet/bars/$tf/MNQ\" ])",
       "Bash([ -d \"data/parquet/$subdir/MNQ\" ])",
       "Bash(curl -s http://localhost:8000/health)",
-      "Bash(pnpm tsc:*)"
+      "Bash(pnpm tsc:*)",
+      "Bash(cat config/*.toml)",
+      "Bash(grep -v \"^$\")",
+      "Bash(grep -E \"^[ ]{0,2}[0-9]|^=|^Final|^  Type|^  State|^  Conf|^  Entry|^  Stop|^  Target|^  Bars|^  Evidence|^  Need|^  Invalid|^  VWAP|^  EMA|^  ATR|^  ORB|Active set\")"
     ]
   }
 }

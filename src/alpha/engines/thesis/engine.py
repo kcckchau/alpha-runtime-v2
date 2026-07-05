@@ -34,7 +34,7 @@ from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.config.settings import AlphaSettings
 from alpha.models.enums import BarTimeframe, EventType, HealthStatus, ThesisState, ThesisType
-from alpha.models.events import AnyEvent, BarEvent, ThesisEvent, TradeEvent
+from alpha.models.events import AnyEvent, BarEvent, QuoteEvent, ThesisEvent, TradeEvent
 from alpha.models.thesis import (
     ActiveThesis,
     EvidenceItem,
@@ -55,7 +55,10 @@ _WATCHING_TO_BUILDING = 0.30
 _BUILDING_TO_READY = 0.65
 
 # Risk gates
-_MAX_RISK_ATR_MULT = Decimal("1.5")    # stop must be <= 1.5x ATR from entry
+# Stop distance gate: entry risk must be <= 0.5% of entry price.
+# ATR-based gates don't work for futures where structural stops (25–150 pts)
+# are naturally large relative to the 1-minute bar ATR (~7 pts for MNQ).
+_MAX_RISK_PCT = Decimal("0.005")       # 0.5% of entry price
 _MIN_REWARD_RATIO = Decimal("2.0")     # minimum R:R to commit
 
 # Thesis expires after this many bars without reaching READY
@@ -113,6 +116,9 @@ class ThesisEngine(BaseEngine):
         self._bars_processed: int = 0
         self._thesis_created: int = 0
 
+        # Latest QuoteEvent per symbol — used for bid/ask imbalance in tick flow
+        self._latest_quotes: dict[str, QuoteEvent] = {}
+
     @property
     def name(self) -> str:
         return "ThesisEngine"
@@ -128,6 +134,7 @@ class ThesisEngine(BaseEngine):
     async def _on_start(self) -> None:
         self._event_bus.subscribe(EventType.BAR, self._handle_bar)
         self._event_bus.subscribe(EventType.TRADE, self._handle_trade)
+        self._event_bus.subscribe(EventType.QUOTE, self._handle_quote, drop_if_full=True)
         logger.info("ThesisEngine started — shadow narrative mode active")
 
     async def _on_stop(self) -> None:
@@ -232,6 +239,11 @@ class ThesisEngine(BaseEngine):
         # Track session count for baseline TPS
         self._session_trades[sym] = self._session_trades.get(sym, 0) + 1
 
+    async def _handle_quote(self, event: AnyEvent) -> None:
+        if not isinstance(event, QuoteEvent):
+            return
+        self._latest_quotes[event.symbol] = event
+
     # ── Thesis detection ──────────────────────────────────────────────────────
 
     def _detect_thesis(
@@ -242,6 +254,32 @@ class ThesisEngine(BaseEngine):
         trigger: BarEvent,
     ) -> ThesisCandidate | None:
         """Return a new WATCHING thesis if a trigger condition is met, else None."""
+
+        # PRE-BREAKDOWN SHORT: price still above VWAP but showing distribution.
+        # Detects failed bounce (lower high) + EMA rolling over + weak close + near VWAP.
+        # The thesis waits for the VWAP cross to confirm before READY is possible.
+        if (
+            snap.is_above_vwap
+            and snap.bars_above_vwap >= 2
+            and snap.is_lower_high
+            and snap.ema_9_slope is not None and snap.ema_9_slope < -0.003
+            and snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.40
+            and snap.vwap is not None and snap.vwap > 0
+            and snap.vwap_deviation_pct <= 0.8   # within 0.8% of VWAP — not too extended
+        ):
+            return ThesisCandidate(
+                thesis_id=uuid4(),
+                thesis_type=ThesisType.VWAP_FAILED_RECLAIM_SHORT,
+                symbol=symbol,
+                state=ThesisState.WATCHING,
+                confidence=0.10,
+                key_level=snap.vwap,
+                rejection_high=trigger.high,
+                pre_vwap_break=True,
+                possible_flip=ThesisType.FAKE_BREAKDOWN_RECLAIM_LONG,
+                created_at=trigger.timestamp,
+                updated_at=trigger.timestamp,
+            )
 
         # FAKE_BREAKDOWN_RECLAIM_LONG triggers:
         # 1. Price just crossed below VWAP — watching whether sellers fail
@@ -357,7 +395,7 @@ class ThesisEngine(BaseEngine):
                 return False
             if snap.atr_14 is not None and snap.atr_14 > 0:
                 risk = snap.bar.close - thesis.sweep_low
-                if risk > snap.atr_14 * _MAX_RISK_ATR_MULT:
+                if risk > snap.atr_14 * Decimal("1.5"):
                     return False
             return True
 
@@ -368,9 +406,12 @@ class ThesisEngine(BaseEngine):
                 return False
             if thesis.rejection_high is None:
                 return False
-            if snap.atr_14 is not None and snap.atr_14 > 0:
-                risk = thesis.rejection_high - snap.bar.close
-                if risk > snap.atr_14 * _MAX_RISK_ATR_MULT:
+            # Risk is measured from the intended entry (near VWAP) to the stop (rejection_high).
+            # Using current bar.close over-estimates risk after price has already moved;
+            # using VWAP gives the realistic entry-to-stop distance.
+            if snap.vwap is not None and snap.vwap > 0:
+                risk = thesis.rejection_high - snap.vwap
+                if risk / snap.vwap > _MAX_RISK_PCT:
                     return False
             return True
 
@@ -531,10 +572,43 @@ class ThesisEngine(BaseEngine):
             thesis.rejection_high = trigger.high
 
         # INVALIDATION checks
-        if snap.bars_above_vwap >= 2:
-            thesis.state = ThesisState.INVALIDATED
-            thesis.invalidation_reason = f"price held above VWAP for {snap.bars_above_vwap} bars — buyers in control"
-            return
+        if thesis.pre_vwap_break:
+            # Pre-breakdown thesis: still above VWAP waiting for confirmation.
+            # Invalidate only if price strengthens away from VWAP.
+            if snap.is_new_hod:
+                thesis.state = ThesisState.INVALIDATED
+                thesis.invalidation_reason = "new session high — distribution thesis failed"
+                return
+            if snap.vwap_deviation_pct > 1.2:
+                thesis.state = ThesisState.INVALIDATED
+                thesis.invalidation_reason = "price moved too far above VWAP — setup no longer near entry"
+                return
+            # VWAP cross = thesis confirmed, switch to normal tracking
+            if snap.vwap_cross_down:
+                thesis.pre_vwap_break = False
+                delta += 0.25
+                evidence.append(EvidenceItem("VWAP crossed below — pre-breakdown confirmed", positive=True, weight=0.25))
+            else:
+                # Still above VWAP — build confidence on structural signals only
+                if snap.is_lower_high:
+                    delta += 0.07
+                    evidence.append(EvidenceItem("lower high forming — distribution continuing", positive=True, weight=0.07))
+                if snap.ema_9_slope is not None and snap.ema_9_slope < -0.005:
+                    delta += 0.06
+                    evidence.append(EvidenceItem("EMA9 declining toward VWAP", positive=True, weight=0.06))
+                if snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.35:
+                    delta += 0.05
+                    evidence.append(EvidenceItem("weak close — sellers controlling the bar", positive=True, weight=0.05))
+                thesis.confidence = max(0.0, min(1.0, thesis.confidence + delta))
+                thesis.evidence = evidence
+                thesis.commit_conditions = self._commit_conditions_short(thesis, snap, level)
+                thesis.invalidation_conditions = self._invalidation_conditions_short(snap)
+                return  # Don't run normal SHORT logic while still above VWAP
+        else:
+            if snap.bars_above_vwap >= 2:
+                thesis.state = ThesisState.INVALIDATED
+                thesis.invalidation_reason = f"price held above VWAP for {snap.bars_above_vwap} bars — buyers in control"
+                return
 
         if snap.is_higher_high and snap.is_above_vwap:
             thesis.state = ThesisState.INVALIDATED
@@ -621,6 +695,23 @@ class ThesisEngine(BaseEngine):
             elif risk_atr > 1.5:
                 delta -= 0.10
                 evidence.append(EvidenceItem(f"stop too wide ({risk_atr:.1f}× ATR)", positive=False, weight=0.10))
+
+        # Absorption: buyers present but price still falling — supply overwhelming demand
+        if tick.absorption:
+            delta += 0.10
+            evidence.append(EvidenceItem("buyers absorbed — supply overwhelming demand", positive=True, weight=0.10))
+        elif tick.bar_delta < -50:
+            delta += 0.06
+            evidence.append(EvidenceItem(f"net sell flow ({tick.bar_delta:.0f} contracts)", positive=True, weight=0.06))
+
+        # Book imbalance: ask heavy = sellers stacking the offer
+        if tick.book_imbalance is not None:
+            if tick.book_imbalance < -0.30:
+                delta += 0.08
+                evidence.append(EvidenceItem(f"ask-heavy book ({tick.book_imbalance:+.2f}) — sellers stacking offer", positive=True, weight=0.08))
+            elif tick.book_imbalance > 0.30:
+                delta -= 0.06
+                evidence.append(EvidenceItem(f"bid-heavy book ({tick.book_imbalance:+.2f}) — buyers present", positive=False, weight=0.06))
 
         thesis.confidence = max(0.0, min(1.0, thesis.confidence + delta))
         thesis.evidence = evidence
@@ -719,6 +810,22 @@ class ThesisEngine(BaseEngine):
 
         session_avg = self._session_avg_tps(symbol)
 
+        # Bar delta: net buy - sell volume in 30s window
+        buy_30s = sum(r.size for r in records_30 if r.is_buy)
+        sell_30s = sum(r.size for r in records_30 if r.is_sell)
+        bar_delta_val = float(buy_30s - sell_30s)
+
+        # Absorption: buyers are aggressing (positive delta) but volume is decelerating
+        # and price is trending down — supply is overwhelming demand
+        absorption_val = bar_delta_val > 0 and vol_accel < 0.8
+
+        # Book imbalance from latest quote
+        quote = self._latest_quotes.get(symbol)
+        book_imb: float | None = None
+        if quote is not None and quote.bid_size > 0 and quote.ask_size > 0:
+            total = quote.bid_size + quote.ask_size
+            book_imb = (quote.bid_size - quote.ask_size) / total
+
         return TickFlowSnapshot(
             symbol=symbol,
             timestamp=as_of,
@@ -734,6 +841,9 @@ class ThesisEngine(BaseEngine):
             large_burst_count_10s=large_burst,
             volume_acceleration=vol_accel,
             session_avg_tps=session_avg,
+            bar_delta=bar_delta_val,
+            absorption=absorption_val,
+            book_imbalance=book_imb,
         )
 
     def _session_avg_tps(self, symbol: str) -> float:
