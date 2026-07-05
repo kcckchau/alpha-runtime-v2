@@ -102,6 +102,7 @@ class ThesisEngine(BaseEngine):
         self._event_bus = event_bus
         self._registry = registry
         self._feature_engine: FeatureEngine | None = None
+        self._context_engine: object | None = None   # ContextEngine, avoid circular import
 
         # Active thesis per symbol
         self._active: dict[str, ActiveThesis] = {}
@@ -125,6 +126,9 @@ class ThesisEngine(BaseEngine):
 
     def set_feature_engine(self, engine: "FeatureEngine") -> None:
         self._feature_engine = engine
+
+    def set_context_engine(self, engine: object) -> None:
+        self._context_engine = engine
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 

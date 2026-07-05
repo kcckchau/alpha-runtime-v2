@@ -97,6 +97,7 @@ class SetupEngine(BaseEngine):
         self._registry = registry
         self._feature_engine: object | None = None
         self._market_state_engine: object | None = None
+        self._context_engine: object | None = None
         # Active setups: symbol → {setup_id → Setup}
         self._active: dict[str, dict[UUID, Setup]] = {}
         self._session_contexts: dict[str, SessionSetupContext] = {}
@@ -122,6 +123,9 @@ class SetupEngine(BaseEngine):
 
     def set_market_state_engine(self, engine: object) -> None:
         self._market_state_engine = engine
+
+    def set_context_engine(self, engine: object) -> None:
+        self._context_engine = engine
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 

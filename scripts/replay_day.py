@@ -358,6 +358,9 @@ async def replay(
     setup_engine.set_market_state_engine(market_state_engine)
     thesis_engine.set_feature_engine(feature_engine)
     context_engine.set_feature_engine(feature_engine)
+    market_state_engine.set_context_engine(context_engine)
+    setup_engine.set_context_engine(context_engine)
+    thesis_engine.set_context_engine(context_engine)
 
     await feature_engine.initialize()
     await context_engine.initialize()

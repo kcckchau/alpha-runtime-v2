@@ -85,6 +85,7 @@ class MarketStateEngine(BaseEngine):
         self._event_bus = event_bus
         self._registry = registry
         self._feature_engine: object | None = None   # FeatureEngine, avoid circular import
+        self._context_engine: object | None = None   # ContextEngine, avoid circular import
         self._latest_states: dict[str, MarketState] = {}
         self._classifications_total: int = 0
 
@@ -105,6 +106,9 @@ class MarketStateEngine(BaseEngine):
 
     def set_feature_engine(self, feature_engine: object) -> None:
         self._feature_engine = feature_engine
+
+    def set_context_engine(self, context_engine: object) -> None:
+        self._context_engine = context_engine
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 

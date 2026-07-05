@@ -8,18 +8,26 @@ Responsibilities:
   - Compute signed distances from current price to all key war-zone levels
   - Expose ContextSnapshot as the single "where are we?" reference
 
-Input:  BarEvent (M1 only, from EventBus)
-Output: ContextSnapshot (via get_context())
+Input:  BarEvent (M1 only, from EventBus) — updates session-level state only
+Output: ContextSnapshot (via get_context(), which computes distances lazily)
 
-Ordering guarantee: ContextEngine must be started AFTER FeatureEngine so that
-when _handle_bar fires, FeatureEngine.get_snapshot() is already current for this bar.
+Ordering design:
+  _handle_bar updates session state (ONH/ONL, PDH/PDL, RTH open, gap) only.
+  Distance computation is deferred to get_context(), which is called AFTER
+  bus.flush() completes. At that point FeatureEngine.get_snapshot() is
+  guaranteed to reflect the current bar. This removes any dependency on
+  EventBus subscription order.
 
 Session boundaries (CME equity-index futures / MNQ):
-  Overnight / Globex : 18:00 ET prior calendar day → 09:30 ET session date
-  RTH                : 09:30 ET → 16:00 ET
-  After-hours        : 16:00 ET → 17:00 ET  (not tracked)
+  Overnight / Globex : SessionPhase.PRE_MARKET
+                       = 18:00 ET prior calendar day → 09:30 ET session date
+                       This covers the FULL Globex window (Asia + London + US
+                       pre-market). CME calendar pre_market_open(d) = 18:00 ET
+                       on (d-1), so no bars from that window are missed.
+  RTH                : 09:30 ET → 16:00 ET  (all non-PRE_MARKET / AFTER_HOURS)
+  After-hours        : 16:00 ET → 17:00 ET  (not tracked; used as cooldown)
 
-No datetime.now() is used — all boundaries derived from each bar's timestamp.
+No datetime.now() is used — all session boundaries derived from bar timestamps.
 """
 
 from __future__ import annotations
@@ -63,7 +71,7 @@ class _ContextState:
         self._cur_rth_low: Decimal | None = None
         self._cur_rth_close: Decimal | None = None
 
-        # ── Overnight (Globex) ─────────────────────────────────────────────────
+        # ── Overnight (Globex) ────────────────────────────────────────────────
         self.onh: Decimal | None = None
         self.onl: Decimal | None = None
 
@@ -94,8 +102,11 @@ class _ContextState:
 
 class ContextEngine(BaseEngine):
     """
-    Produces a ContextSnapshot on every M1 bar with current session-level
-    key levels and signed distances from price to each war zone.
+    Produces a ContextSnapshot on demand with current session-level key levels
+    and signed distances from price to each war zone.
+
+    Downstream engines and the replay loop call get_context(symbol) after
+    bus.flush() to get a fully populated snapshot with current distances.
     """
 
     def __init__(
@@ -113,7 +124,7 @@ class ContextEngine(BaseEngine):
         self._calendar = calendar
         self._clock = clock
         self._states: dict[str, _ContextState] = {}
-        self._snapshots: dict[str, ContextSnapshot] = {}
+        self._last_bars: dict[str, BarEvent] = {}   # for lazy snapshot building
         self._symbol_calendars: dict[str, SessionCalendar] = {}
         self._feature_engine: FeatureEngine | None = None
 
@@ -132,8 +143,6 @@ class ContextEngine(BaseEngine):
             self._states[sym.ticker] = _ContextState()
 
     async def _on_start(self) -> None:
-        # Subscribe AFTER FeatureEngine so its snapshot is already updated
-        # when our handler fires on the same bar event.
         self._event_bus.subscribe(EventType.BAR, self._handle_bar)
 
     async def _on_stop(self) -> None:
@@ -149,9 +158,22 @@ class ContextEngine(BaseEngine):
     # ── Public API ────────────────────────────────────────────────────────────
 
     def get_context(self, symbol: str) -> ContextSnapshot | None:
-        return self._snapshots.get(symbol)
+        """Build and return a ContextSnapshot with current distances.
 
-    # ── Handler ───────────────────────────────────────────────────────────────
+        Called after bus.flush() — FeatureEngine.get_snapshot() is guaranteed
+        to be current for the same bar, so distances are always accurate.
+        """
+        state = self._states.get(symbol)
+        bar = self._last_bars.get(symbol)
+        if state is None or bar is None:
+            return None
+        feat = (
+            self._feature_engine.get_snapshot(symbol)
+            if self._feature_engine else None
+        )
+        return self._build_snapshot(state, bar, feat)
+
+    # ── Handler — session state only, no distances ────────────────────────────
 
     async def _handle_bar(self, event: AnyEvent) -> None:
         if not isinstance(event, BarEvent):
@@ -183,7 +205,8 @@ class ContextEngine(BaseEngine):
             SessionPhase.CLOSED,
         }
 
-        # ── Overnight high/low (PRE_MARKET = Globex for CME futures) ─────────
+        # ── Overnight high/low ────────────────────────────────────────────────
+        # For CME: PRE_MARKET = 18:00 ET prior day → 09:30 ET = full Globex window
         if phase == SessionPhase.PRE_MARKET:
             if state.onh is None or event.high > state.onh:
                 state.onh = event.high
@@ -201,22 +224,19 @@ class ContextEngine(BaseEngine):
                     state.gap_pct = gap / float(state.prev_rth_close) * 100
                     state.gap_midpoint = (state.rth_open + state.prev_rth_close) / 2
 
-            # Accumulate RTH high/low/close (will become PDH/PDL next session)
+            # Accumulate RTH high/low/close (promoted to PDH/PDL next session)
             if state._cur_rth_high is None or event.high > state._cur_rth_high:
                 state._cur_rth_high = event.high
             if state._cur_rth_low is None or event.low < state._cur_rth_low:
                 state._cur_rth_low = event.low
             state._cur_rth_close = event.close
 
-        self._snapshots[sym] = self._build_snapshot(state, event)
+        # Store bar for lazy snapshot building in get_context()
+        self._last_bars[sym] = event
 
     # ── Snapshot builder ──────────────────────────────────────────────────────
 
-    def _build_snapshot(self, state: _ContextState, bar: BarEvent) -> ContextSnapshot:
-        feat = (
-            self._feature_engine.get_snapshot(bar.symbol)
-            if self._feature_engine else None
-        )
+    def _build_snapshot(self, state: _ContextState, bar: BarEvent, feat) -> ContextSnapshot:
         price = bar.close
 
         # Pull live indicators from FeatureEngine snapshot
@@ -227,16 +247,19 @@ class ContextEngine(BaseEngine):
         or_mid  = feat.or_mid if feat else None
 
         # ── War zone candidates ───────────────────────────────────────────────
+        # All named key levels: structural, session, and live indicators.
         candidates: list[tuple[str, Decimal]] = []
-        if state.onl is not None:           candidates.append(("ONL",        state.onl))
-        if state.onh is not None:           candidates.append(("ONH",        state.onh))
-        if state.pdl is not None:           candidates.append(("PDL",        state.pdl))
-        if state.pdh is not None:           candidates.append(("PDH",        state.pdh))
-        if state.prev_rth_close is not None:
-            candidates.append(("PREV_CLOSE", state.prev_rth_close))
-        if vwap and vwap > _ZERO:           candidates.append(("VWAP",       vwap))
-        if orb_h is not None:               candidates.append(("ORH",        orb_h))
-        if orb_l is not None:               candidates.append(("ORL",        orb_l))
+        if state.onl is not None:             candidates.append(("ONL",        state.onl))
+        if state.onh is not None:             candidates.append(("ONH",        state.onh))
+        if state.pdl is not None:             candidates.append(("PDL",        state.pdl))
+        if state.pdh is not None:             candidates.append(("PDH",        state.pdh))
+        if state.prev_rth_close is not None:  candidates.append(("PREV_CLOSE", state.prev_rth_close))
+        if state.rth_open is not None:        candidates.append(("RTH_OPEN",   state.rth_open))
+        if state.gap_midpoint is not None:    candidates.append(("GAP_MID",    state.gap_midpoint))
+        if vwap and vwap > _ZERO:             candidates.append(("VWAP",       vwap))
+        if m5_21 is not None:                 candidates.append(("5M21",       m5_21))
+        if orb_h is not None:                 candidates.append(("ORH",        orb_h))
+        if orb_l is not None:                 candidates.append(("ORL",        orb_l))
 
         nearest_name: str | None = None
         nearest_price: Decimal | None = None
