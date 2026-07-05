@@ -120,6 +120,9 @@ class SymbolFeatureState:
         self.rth_median_1m_range: Decimal | None = None
         self.rth_p75_1m_range: Decimal | None = None
         self.rth_p90_1m_range: Decimal | None = None
+        # RTH-specific low — resets at RTH open, independent of Globex low
+        self.rth_intraday_low: Decimal | None = None
+        self.is_new_rth_lod: bool = False
 
     def reset_session(self) -> None:
         self.bars_since_open = 0
@@ -166,6 +169,8 @@ class SymbolFeatureState:
         self.rth_median_1m_range = None
         self.rth_p75_1m_range = None
         self.rth_p90_1m_range = None
+        self.rth_intraday_low = None
+        self.is_new_rth_lod = False
 
     @property
     def vwap(self) -> Decimal:
@@ -393,6 +398,17 @@ class FeatureEngine(BaseEngine):
                 elif not state.orb_established and bar.timestamp >= orb_end:
                     state.orb_established = True
 
+                # RTH-specific intraday low — resets at RTH open each session.
+                # is_new_rth_lod is True whenever this bar makes a new RTH low,
+                # even if the all-session low (Globex) is lower. Overnight lows
+                # are excluded, so opening panics and ORL breaks are correctly
+                # flagged for intraday pattern detectors.
+                state.is_new_rth_lod = (
+                    state.rth_intraday_low is None or bar.low < state.rth_intraday_low
+                )
+                if state.is_new_rth_lod:
+                    state.rth_intraday_low = bar.low
+
                 # RTH candle-range distribution — used to normalize sweep depth.
                 # Compute percentiles from PRIOR bars before appending the current
                 # bar's range, so classifiers on the current bar are not polluted
@@ -513,6 +529,7 @@ class FeatureEngine(BaseEngine):
             state.vwap_deviation_shrinking = False
             state.is_new_hod = False
             state.is_new_lod = False
+            state.is_new_rth_lod = False
             state.is_higher_high = False
             state.is_lower_low = False
             state.is_lower_high = False
@@ -670,6 +687,7 @@ class FeatureEngine(BaseEngine):
             intraday_low=state.intraday_low,
             is_new_hod=state.is_new_hod,
             is_new_lod=state.is_new_lod,
+            is_new_rth_lod=state.is_new_rth_lod,
             is_higher_high=state.is_higher_high,
             is_lower_low=state.is_lower_low,
             is_lower_high=state.is_lower_high,

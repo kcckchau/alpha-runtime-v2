@@ -92,7 +92,8 @@ class BarSnapshot(BaseModel):
     intraday_high: Decimal | None = None        # session high so far
     intraday_low: Decimal | None = None         # session low so far
     is_new_hod: bool = False                    # this bar set a new session high
-    is_new_lod: bool = False                    # this bar set a new session low
+    is_new_lod: bool = False                    # this bar set a new session low (full Globex session)
+    is_new_rth_lod: bool = False                # this bar set a new RTH low (resets at 09:30, ignores overnight)
     is_higher_high: bool = False                # this bar's high > prior bar's high
     is_lower_low: bool = False                  # this bar's low < prior bar's low
     is_lower_high: bool = False                 # this bar's high < prior bar's high

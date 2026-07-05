@@ -1123,7 +1123,7 @@ class SetupEngine(BaseEngine):
             # First bottom does NOT require a strong close — panic sellers and exhaustion
             # candles can both be valid first legs.  Only the SECOND bottom needs to close
             # in the upper half (showing buyers won the zone).
-            if snap.is_new_lod:
+            if snap.is_new_lod or snap.is_new_rth_lod:
                 first = self._dbl_first_bottom.get(symbol)
                 close_pos = snap.bar_close_position_pct
                 weak_close = close_pos is not None and close_pos < 0.3
