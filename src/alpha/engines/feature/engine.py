@@ -162,10 +162,20 @@ class _HTFEMAState:
     with track_ema50=True / track_sma200=True (used for H1 and D1).
     """
 
-    def __init__(self, track_ema50: bool = False, track_sma200: bool = False) -> None:
+    def __init__(
+        self,
+        track_ema10: bool = False,
+        track_ema20: bool = False,
+        track_ema50: bool = False,
+        track_sma200: bool = False,
+    ) -> None:
         self.ema_9: Decimal | None = None
         self.ema_21: Decimal | None = None
+        self.ema_10: Decimal | None = None          # None unless track_ema10
+        self.ema_20: Decimal | None = None          # None unless track_ema20
         self.ema_50: Decimal | None = None          # None unless track_ema50
+        self._track_ema10 = track_ema10
+        self._track_ema20 = track_ema20
         self._track_ema50 = track_ema50
         self._sma200_buf: deque[Decimal] | None = (
             deque(maxlen=200) if track_sma200 else None
@@ -203,6 +213,7 @@ class FeatureEngine(BaseEngine):
         # carried forward into every M1 BarSnapshot.
         self._m5_ema: dict[str, _HTFEMAState] = {}
         self._h1_ema: dict[str, _HTFEMAState] = {}
+        self._d1_ema: dict[str, _HTFEMAState] = {}
 
     @property
     def name(self) -> str:
@@ -283,6 +294,9 @@ class FeatureEngine(BaseEngine):
     async def _handle_bar(self, event: AnyEvent) -> None:
         if not isinstance(event, BarEvent):
             return
+        if event.timeframe == BarTimeframe.D1:
+            self._update_htf_ema(self._d1_ema, event, track_ema10=True, track_ema20=True)
+            return
         if event.timeframe == BarTimeframe.M5:
             self._update_htf_ema(self._m5_ema, event)
             return
@@ -290,7 +304,7 @@ class FeatureEngine(BaseEngine):
             self._update_htf_ema(self._h1_ema, event, track_ema50=True, track_sma200=True)
             return
         if event.timeframe != BarTimeframe.M1:
-            return  # S1, D1 and other bars not processed here
+            return  # S1 and other bars not processed here
         state = self._get_or_create(event.symbol)
         self._update_state(state, event)
         snapshot = self._build_snapshot(state, event)
@@ -596,6 +610,8 @@ class FeatureEngine(BaseEngine):
             ema21_1h=self._h1_ema[bar.symbol].ema_21 if bar.symbol in self._h1_ema else None,
             ema50_1h=self._h1_ema[bar.symbol].ema_50 if bar.symbol in self._h1_ema else None,
             sma200_1h=self._h1_ema[bar.symbol].sma_200 if bar.symbol in self._h1_ema else None,
+            ema10_1d=self._d1_ema[bar.symbol].ema_10 if bar.symbol in self._d1_ema else None,
+            ema20_1d=self._d1_ema[bar.symbol].ema_20 if bar.symbol in self._d1_ema else None,
             ema_9_slope=ema_9_slope,
             ema_9_slope_direction=ema_9_slope_direction,
             ema_20_slope=ema_20_slope,
@@ -642,16 +658,27 @@ class FeatureEngine(BaseEngine):
         self,
         store: dict[str, _HTFEMAState],
         bar: BarEvent,
+        track_ema10: bool = False,
+        track_ema20: bool = False,
         track_ema50: bool = False,
         track_sma200: bool = False,
     ) -> None:
-        """Update EMA9/EMA21 (and optionally EMA50/SMA200) for a HTF bar."""
+        """Update EMA9/EMA21 (and optionally EMA10/EMA20/EMA50/SMA200) for a HTF bar."""
         sym = bar.symbol
         if sym not in store:
-            store[sym] = _HTFEMAState(track_ema50=track_ema50, track_sma200=track_sma200)
+            store[sym] = _HTFEMAState(
+                track_ema10=track_ema10,
+                track_ema20=track_ema20,
+                track_ema50=track_ema50,
+                track_sma200=track_sma200,
+            )
         s = store[sym]
         s.ema_9 = self._ema(bar.close, s.ema_9, 9)
         s.ema_21 = self._ema(bar.close, s.ema_21, 21)
+        if s._track_ema10:
+            s.ema_10 = self._ema(bar.close, s.ema_10, 10)
+        if s._track_ema20:
+            s.ema_20 = self._ema(bar.close, s.ema_20, 20)
         if s._track_ema50:
             s.ema_50 = self._ema(bar.close, s.ema_50, 50)
         if s._sma200_buf is not None:

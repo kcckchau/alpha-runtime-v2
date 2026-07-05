@@ -230,6 +230,9 @@ class ReplayCache:
     def _h1_bars_path(self, symbol: str, d: date, warmup_days: int) -> Path:
         return self._dir(symbol, d) / f"h1_bars_w{warmup_days}.parquet"
 
+    def _d1_bars_path(self, symbol: str, d: date) -> Path:
+        return self._dir(symbol, d) / "d1_bars.parquet"
+
     # ── bars (M1) ─────────────────────────────────────────────────────────────
 
     def bars_cached(self, symbol: str, d: date, warmup_days: int) -> bool:
@@ -265,6 +268,18 @@ class ReplayCache:
 
     def save_h1_bars(self, bars: list[BarEvent], symbol: str, d: date, warmup_days: int) -> None:
         _write_parquet([_serialize_bar(b) for b in bars], self._h1_bars_path(symbol, d, warmup_days))
+
+    # ── bars (D1) ─────────────────────────────────────────────────────────────
+
+    def d1_bars_cached(self, symbol: str, d: date) -> bool:
+        return self._d1_bars_path(symbol, d).exists()
+
+    def load_d1_bars(self, symbol: str, d: date) -> list[BarEvent]:
+        rows = _read_parquet(self._d1_bars_path(symbol, d))
+        return [_deserialize_bar(r) for r in rows]
+
+    def save_d1_bars(self, bars: list[BarEvent], symbol: str, d: date) -> None:
+        _write_parquet([_serialize_bar(b) for b in bars], self._d1_bars_path(symbol, d))
 
     # ── trades ────────────────────────────────────────────────────────────────
 
@@ -327,6 +342,8 @@ class ReplayResultSaver:
         "open", "high", "low", "close", "volume",
         "vwap", "ema9", "ema21", "ema20", "atr14",
         "ema9_5m", "ema21_5m",
+        "ema9_1h", "ema21_1h", "ema50_1h", "sma200_1h",
+        "ema10_1d", "ema20_1d",
         "session_phase", "is_above_vwap", "vwap_deviation_pct",
         "thesis_type", "thesis_state", "thesis_confidence", "thesis_changed",
         "setups_active_count",
@@ -374,6 +391,8 @@ class ReplayResultSaver:
                 "ema21_1h": _dec(snap.ema21_1h),
                 "ema50_1h": _dec(snap.ema50_1h),
                 "sma200_1h": _dec(snap.sma200_1h),
+                "ema10_1d": _dec(snap.ema10_1d),
+                "ema20_1d": _dec(snap.ema20_1d),
                 "atr14": _dec(snap.atr_14),
                 "session_phase": str(snap.session_phase),
                 "orb_high": _dec(snap.orb_high),
@@ -519,6 +538,8 @@ class ReplayResultSaver:
                 "ema21_1h": _dec(snap_final.ema21_1h),
                 "ema50_1h": _dec(snap_final.ema50_1h),
                 "sma200_1h": _dec(snap_final.sma200_1h),
+                "ema10_1d": _dec(snap_final.ema10_1d),
+                "ema20_1d": _dec(snap_final.ema20_1d),
                 "atr14": _dec(snap_final.atr_14),
                 "orb_high": _dec(snap_final.orb_high),
                 "orb_low": _dec(snap_final.orb_low),
@@ -580,6 +601,12 @@ class ReplayResultSaver:
                     "atr14": b.get("atr14"),
                     "ema9_5m": b.get("ema9_5m"),
                     "ema21_5m": b.get("ema21_5m"),
+                    "ema9_1h": b.get("ema9_1h"),
+                    "ema21_1h": b.get("ema21_1h"),
+                    "ema50_1h": b.get("ema50_1h"),
+                    "sma200_1h": b.get("sma200_1h"),
+                    "ema10_1d": b.get("ema10_1d"),
+                    "ema20_1d": b.get("ema20_1d"),
                     "session_phase": b.get("session_phase"),
                     "is_above_vwap": b.get("is_above_vwap"),
                     "vwap_deviation_pct": b.get("vwap_deviation_pct"),

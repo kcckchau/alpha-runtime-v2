@@ -58,6 +58,10 @@ class BarSnapshot(BaseModel):
     ema50_1h: Decimal | None = None           # 1h EMA50
     sma200_1h: Decimal | None = None          # 1h SMA200
 
+    # ── Trend indicators — 1D (carry-forward: updated on each D1 bar) ────────
+    ema10_1d: Decimal | None = None           # 1d EMA10
+    ema20_1d: Decimal | None = None           # 1d EMA20
+
     # ── Volatility ────────────────────────────────────────────────────────────
     atr_14: Decimal | None = None
 

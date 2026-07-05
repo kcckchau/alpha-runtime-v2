@@ -121,10 +121,11 @@ async def _load_from_databento(
     cache: ReplayCache | None = None,
     warmup_days: int = 5,
     no_cache: bool = False,
-) -> tuple[list[BarEvent], list[BarEvent]]:
-    """Download M1 and M5 bars from Databento for [warmup_start, session_date].
+) -> tuple[list[BarEvent], list[BarEvent], list[BarEvent], list[BarEvent]]:
+    """Download M1, M5, H1, and D1 bars from Databento for [warmup_start, session_date].
 
-    Returns (m1_bars, m5_bars). Both are cached separately.
+    Returns (m1_bars, m5_bars, h1_bars, d1_bars).
+    D1 bars are fetched from 60 days before warmup_start to warm EMA10/EMA20.
     """
     source: DatabentoHistoricalSource | None = None
 
@@ -196,7 +197,35 @@ async def _load_from_databento(
         if cache is not None and h1_bars:
             cache.save_h1_bars(h1_bars, symbol, session_date, warmup_days)
 
-    return m1_bars, m5_bars, h1_bars
+    # ── D1 bars ───────────────────────────────────────────────────────────────
+    # EMA20 on daily needs 20 trading days; fetch 60 calendar days back to be safe.
+    # D1 bars from the current session date are incomplete, so we end at session_date.
+    d1_start_utc = datetime(
+        warmup_start.year, warmup_start.month, warmup_start.day,
+        0, 0, 0, tzinfo=_UTC,
+    ) - timedelta(days=60)
+    d1_end_utc = datetime(
+        session_date.year, session_date.month, session_date.day,
+        0, 0, 0, tzinfo=_UTC,
+    )
+
+    if cache is not None and not no_cache and cache.d1_bars_cached(symbol, session_date):
+        print("  D1 bars: loading from cache…", end="", flush=True)
+        d1_bars = cache.load_d1_bars(symbol, session_date)
+        print(f" {len(d1_bars):,} bars")
+    else:
+        if source is None:
+            source = DatabentoHistoricalSource(registry, settings.databento)
+        print("  Fetching D1 bars from Databento…", end="", flush=True)
+        d1_bars = []
+        async for bar in source.fetch_bars(symbol, BarTimeframe.D1, d1_start_utc, d1_end_utc):
+            d1_bars.append(bar)
+        d1_bars.sort(key=lambda b: b.timestamp)
+        print(f" {len(d1_bars):,} bars")
+        if cache is not None and d1_bars:
+            cache.save_d1_bars(d1_bars, symbol, session_date)
+
+    return m1_bars, m5_bars, h1_bars, d1_bars
 
 
 async def _load_session_orderflow(
@@ -351,7 +380,7 @@ async def replay(
 
     if source == "databento":
         print("  Loading bars…")
-        all_bars, all_m5_bars, all_h1_bars = await _load_from_databento(
+        all_bars, all_m5_bars, all_h1_bars, all_d1_bars = await _load_from_databento(
             symbol, warmup_start, session_date, settings, registry,
             cache=cache, warmup_days=warmup_days, no_cache=no_cache,
         )
@@ -359,6 +388,7 @@ async def replay(
         all_bars = _load_from_parquet(symbol, warmup_start, session_date, settings)
         all_m5_bars = []
         all_h1_bars = []
+        all_d1_bars = []
 
     if not all_bars:
         print(f"{_RED}No bars returned for {symbol} {warmup_start}→{session_date}.{_RESET}")
@@ -379,8 +409,10 @@ async def replay(
     session_m5   = [b for b in all_m5_bars if b.timestamp >= session_date_utc_start]
     warmup_h1    = [b for b in all_h1_bars if b.timestamp < session_date_utc_start]
     session_h1   = [b for b in all_h1_bars if b.timestamp >= session_date_utc_start]
+    # D1 bars are always prior closed sessions — all go into warmup.
+    warmup_d1    = list(all_d1_bars)
 
-    print(f"  Warmup bars  : {len(warmup_bars)} M1 + {len(warmup_m5)} M5 + {len(warmup_h1)} H1")
+    print(f"  Warmup bars  : {len(warmup_bars)} M1 + {len(warmup_m5)} M5 + {len(warmup_h1)} H1 + {len(warmup_d1)} D1")
     print(f"  Session bars : {len(session_bars)} M1 + {len(session_m5)} M5 + {len(session_h1)} H1")
 
     if not session_bars:
@@ -404,16 +436,17 @@ async def replay(
                 session_date=session_date, cache=cache, no_cache=no_cache,
             )
 
-    # ── Feed warmup bars (M1 + M5 interleaved by timestamp) ──────────────────
-    # Priority within same timestamp: H1(0) → M5(1) → M1(2)
+    # ── Feed warmup bars (M1 + M5 + H1 + D1 interleaved by timestamp) ────────
+    # Priority within same timestamp: D1(-1) → H1(0) → M5(1) → M1(2)
     # HTF bars processed first so EMA values are ready before the M1 snapshot is built.
     warmup_all = sorted(
-        [(b.timestamp, 2, b) for b in warmup_bars] +
-        [(b.timestamp, 1, b) for b in warmup_m5] +
-        [(b.timestamp, 0, b) for b in warmup_h1],
+        [(b.timestamp, 3, b) for b in warmup_bars] +
+        [(b.timestamp, 2, b) for b in warmup_m5] +
+        [(b.timestamp, 1, b) for b in warmup_h1] +
+        [(b.timestamp, 0, b) for b in warmup_d1],
         key=lambda x: (x[0], x[1]),
     )
-    print(f"\n{_DIM}Feeding {len(warmup_all)} warmup bars (M1+M5+H1)…{_RESET}", end="", flush=True)
+    print(f"\n{_DIM}Feeding {len(warmup_all)} warmup bars (M1+M5+H1+D1)…{_RESET}", end="", flush=True)
     for _, _, bar in warmup_all:
         await bus.publish(bar)
         await bus.flush()
@@ -424,6 +457,7 @@ async def replay(
     # This mirrors live behaviour: tick events arrive intra-minute, bar arrives at close.
     # Interleave all timeframes. Priority for same-timestamp ties:
     #   trades(0) → quotes(1) → H1(2) → M5(3) → M1(4)
+    # D1 is not in the session stream (current day's D1 bar is incomplete until EOD).
     # HTF bars before M1 so EMAs are updated before the M1 snapshot is built.
     merged: list[tuple] = []
     for b in session_h1:
@@ -548,13 +582,15 @@ async def replay(
     snap = feature_engine.get_snapshot(symbol)
     if snap:
         print(f"\nFinal indicators:")
-        print(f"  VWAP  : {_fmt_dec(snap.vwap)}")
-        print(f"  EMA9  : {_fmt_dec(snap.ema_9)}")
-        print(f"  EMA20 : {_fmt_dec(snap.ema_20)}")
-        print(f"  EMA50 : {_fmt_dec(snap.ema_50)}")
-        print(f"  ATR14 : {_fmt_dec(snap.atr_14)}")
-        print(f"  ORB H : {_fmt_dec(snap.orb_high)}")
-        print(f"  ORB L : {_fmt_dec(snap.orb_low)}")
+        print(f"  VWAP     : {_fmt_dec(snap.vwap)}")
+        print(f"  EMA9     : {_fmt_dec(snap.ema_9)}")
+        print(f"  EMA20    : {_fmt_dec(snap.ema_20)}")
+        print(f"  EMA50    : {_fmt_dec(snap.ema_50)}")
+        print(f"  ATR14    : {_fmt_dec(snap.atr_14)}")
+        print(f"  ORB H    : {_fmt_dec(snap.orb_high)}")
+        print(f"  ORB L    : {_fmt_dec(snap.orb_low)}")
+        print(f"  EMA10 1d : {_fmt_dec(snap.ema10_1d)}")
+        print(f"  EMA20 1d : {_fmt_dec(snap.ema20_1d)}")
 
     if saver:
         thesis_final = thesis_engine.get_thesis(symbol)
