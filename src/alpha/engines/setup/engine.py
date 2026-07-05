@@ -111,6 +111,8 @@ class SetupEngine(BaseEngine):
         self._last_close_bar: dict[str, dict["SetupType", int]] = {}
         self._bar_counts: dict[str, int] = {}  # rolling bar count per symbol per session
         self._bar_count_session: dict[str, str] = {}
+        # ONL sweep state machine: symbol → {"sweep_low": Decimal, "bar_count": int} | None
+        self._onl_sweep_state: dict[str, dict | None] = {}
         # Double-bottom candidate tracking: symbol → (first_bottom_low, bar_count)
         self._dbl_first_bottom: dict[str, tuple[Decimal, int] | None] = {}
         self._setups_detected: int = 0
@@ -220,6 +222,7 @@ class SetupEngine(BaseEngine):
             self._bar_count_session[symbol] = session_key
             self._bar_counts[symbol] = 0
             self._last_close_bar.pop(symbol, None)
+            self._onl_sweep_state.pop(symbol, None)
             self._dbl_first_bottom.pop(symbol, None)
         self._bar_counts[symbol] = self._bar_counts.get(symbol, 0) + 1
 
@@ -938,16 +941,60 @@ class SetupEngine(BaseEngine):
     # ── ONL_SWEEP_RECLAIM_LONG ────────────────────────────────────────────────
 
     def _detect_onl_sweep_reclaim_long(self, snap: BarSnapshot, ms: MarketState) -> bool:
+        """
+        Stateful state machine — all mutations happen here; _reason is a pure read.
+
+        Phases:
+          1. Bar goes below ONL → start tracking sweep_low
+          2. Subsequent bars extend lower but within breakdown threshold → update sweep_low
+          3. Bar closes above ONL → fire if sweep depth ≤ threshold and strong close
+          4. Breakdown (extension > 0.5% from ONL, or > 8 bars below) → clear state
+        Handles both single-bar sweeps (phases 1+3 on same bar) and multi-bar sweeps.
+        """
+        symbol = snap.symbol
+        bar_count = self._bar_counts.get(symbol, 0)
+
+        ctx = self._context_engine.get_context(symbol) if self._context_engine else None
+        onl = ctx.onl if ctx else None
+
+        if onl is None:
+            return False
+
+        state = self._onl_sweep_state.get(symbol)
+
+        # Clear timed-out state (> 8 bars below ONL without reclaiming)
+        if state is not None and bar_count - state["bar_count"] > 8:
+            self._onl_sweep_state.pop(symbol, None)
+            state = None
+
+        if snap.bar.low < onl:
+            if state is None:
+                # Phase 1: first bar to go below ONL — start tracking
+                self._onl_sweep_state[symbol] = {"sweep_low": snap.bar.low, "bar_count": bar_count}
+                state = self._onl_sweep_state[symbol]
+            elif snap.bar.low < state["sweep_low"]:
+                # Check total extension from ONL; > 0.5% = confirmed breakdown, clear
+                if float(onl - snap.bar.low) / float(onl) > 0.005:
+                    self._onl_sweep_state.pop(symbol, None)
+                    return False
+                # Still within tolerance — update sweep_low
+                self._onl_sweep_state[symbol] = {**state, "sweep_low": snap.bar.low}
+                state = self._onl_sweep_state[symbol]
+
+        # Detection check (pure read — see _reason)
         return self._reason_onl_sweep_reclaim_long(snap, ms) is None
 
     def _reason_onl_sweep_reclaim_long(self, snap: BarSnapshot, ms: MarketState) -> str | None:
         """
-        Bar swept below ONL (low < onl) and closed back above ONL in the same bar.
-        Sweep depth ≤ 0.5% — a genuine wick, not an extended breakdown.
-        Strong close: bar_close_position_pct ≥ 0.5 — buyers absorbed the sweep.
+        Pure read — no state mutations.  Called both from _detect and _detector_reason.
 
-        Requires ContextEngine for ONL; silently skips when context is unavailable.
-        5M21 / VWAP reclaim are confirmation score signals — not hard gates here.
+        Fires when:
+          - Active sweep state exists (price went below ONL on a prior or current bar)
+          - This bar closes above ONL (reclaim)
+          - Sweep depth ≤ min(30 pts, 2× ATR_14); fallback 0.15%
+          - Strong close: bar_close_position_pct ≥ 0.5
+
+        5M21 / VWAP reclaim are confirmation score signals — not hard gates.
         """
         if self._context_engine is None:
             return "no_context_engine"
@@ -955,15 +1002,25 @@ class SetupEngine(BaseEngine):
         if ctx is None or ctx.onl is None:
             return "no_onl"
         onl = ctx.onl
-        if snap.bar.low >= onl:
-            return "low_not_below_onl"
+
+        state = self._onl_sweep_state.get(snap.symbol)
+        if state is None:
+            return "no_active_sweep_below_onl"
+
         if snap.bar.close <= onl:
             return "close_not_above_onl"
-        sweep_depth_pct = float(onl - snap.bar.low) / float(onl)
-        if sweep_depth_pct > 0.005:
-            return "sweep_too_deep_gt_0.5pct"
+
+        sweep_pts = onl - state["sweep_low"]
+        max_sweep = (
+            min(Decimal("30"), snap.atr_14 * Decimal("2"))
+            if snap.atr_14 else onl * Decimal("0.0015")
+        )
+        if sweep_pts > max_sweep:
+            return "sweep_too_deep"
+
         if snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.5:
             return "close_in_lower_half"
+
         return None
 
     def _advance_onl_sweep_reclaim_long(
@@ -1031,30 +1088,32 @@ class SetupEngine(BaseEngine):
         is_second = self._reason_double_bottom_reclaim_long(snap, ms) is None
 
         if not is_second:
-            # Update first-bottom candidate
+            # Update first-bottom candidate.
+            # First bottom does NOT require a strong close — panic sellers and exhaustion
+            # candles can both be valid first legs.  Only the SECOND bottom needs to close
+            # in the upper half (showing buyers won the zone).
             if snap.is_new_lod:
+                first = self._dbl_first_bottom.get(symbol)
                 close_pos = snap.bar_close_position_pct
-                close_in_upper = close_pos is None or close_pos >= 0.5
-                if close_in_upper:
-                    first = self._dbl_first_bottom.get(symbol)
-                    # Only update when clearly lower than prior candidate
+                weak_close = close_pos is not None and close_pos < 0.3
+                if weak_close and first is not None and snap.bar.low < first[0] * Decimal("0.997"):
+                    # Aggressive extension on a very weak close → breakdown, clear candidate
+                    self._dbl_first_bottom.pop(symbol, None)
+                else:
+                    # Store / update first-bottom candidate regardless of close position
                     if first is None or snap.bar.low < first[0] * Decimal("0.9997"):
                         self._dbl_first_bottom[symbol] = (snap.bar.low, bar_count)
-                else:
-                    # Weak close on new low — likely breakdown; clear candidate
-                    first = self._dbl_first_bottom.get(symbol)
-                    if first is not None and snap.bar.low < first[0] * Decimal("0.997"):
-                        self._dbl_first_bottom.pop(symbol, None)
 
         return is_second
 
     def _reason_double_bottom_reclaim_long(self, snap: BarSnapshot, ms: MarketState) -> str | None:
         """
         Pure read of double-bottom state — no mutations.
-        Conditions (v0):
-          - First bottom tracked: a prior new-session-low bar that closed in the upper half
-          - Second bottom: low within 0.5% of first bottom, ≥ 3 bars later, ≤ 60 bars later
-          - Second low does not materially extend (low ≥ first_bottom * 0.997)
+        Conditions (v0.2):
+          - First bottom tracked (any close quality — first leg can be a panic sell)
+          - Second bottom: low within min(40 pts, 2.5× ATR_14); fallback 0.15%
+          - ≥ 3 bars and ≤ 60 bars since first bottom
+          - Second low does not materially extend (low ≥ first_bottom − max_extension)
           - Strong close on second bottom (bar_close_position_pct ≥ 0.5)
           - Close above first bottom's low (buyers won the zone)
         5M21 / VWAP reclaim are confirmation score signals — not hard gates.
@@ -1074,13 +1133,23 @@ class SetupEngine(BaseEngine):
         if bars_since_first > 60:
             return "first_bottom_too_stale"
 
-        low_pct_diff = abs(float(snap.bar.low - first_low)) / float(first_low)
-        if low_pct_diff > 0.005:
+        # ATR-based proximity: low must be within min(40 pts, 2.5× ATR_14) of first_low
+        tolerance = (
+            min(Decimal("40"), snap.atr_14 * Decimal("2.5"))
+            if snap.atr_14 else first_low * Decimal("0.0015")
+        )
+        if abs(snap.bar.low - first_low) > tolerance:
             return "low_not_near_first_bottom_zone"
 
-        if snap.bar.low < first_low * Decimal("0.997"):
+        # Second low must not materially extend below first bottom
+        max_extension = (
+            min(Decimal("20"), snap.atr_14)
+            if snap.atr_14 else first_low * Decimal("0.001")
+        )
+        if snap.bar.low < first_low - max_extension:
             return "second_low_extends_materially_below_first"
 
+        # Second bottom must close strongly (upper half) — this is where buyers won
         if snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.5:
             return "second_bottom_close_in_lower_half"
 
