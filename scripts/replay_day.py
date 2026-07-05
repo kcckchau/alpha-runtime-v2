@@ -413,12 +413,19 @@ async def replay(
         22, 0, 0, tzinfo=_UTC,
     ) - timedelta(days=1)   # 18:00 ET prior day = session open
 
+    # Cap at 18:00 ET on session_date (= 22:00 UTC) — the next CME session starts
+    # there and would trigger ContextEngine.rollover(), resetting rth_open/ONH/ONL.
+    session_date_utc_end = datetime(
+        session_date.year, session_date.month, session_date.day,
+        22, 0, 0, tzinfo=_UTC,
+    )   # 18:00 ET session_date = exclusive upper bound
+
     warmup_bars  = [b for b in all_bars    if b.timestamp < session_date_utc_start]
-    session_bars = [b for b in all_bars    if b.timestamp >= session_date_utc_start]
+    session_bars = [b for b in all_bars    if session_date_utc_start <= b.timestamp < session_date_utc_end]
     warmup_m5    = [b for b in all_m5_bars if b.timestamp < session_date_utc_start]
-    session_m5   = [b for b in all_m5_bars if b.timestamp >= session_date_utc_start]
+    session_m5   = [b for b in all_m5_bars if session_date_utc_start <= b.timestamp < session_date_utc_end]
     warmup_h1    = [b for b in all_h1_bars if b.timestamp < session_date_utc_start]
-    session_h1   = [b for b in all_h1_bars if b.timestamp >= session_date_utc_start]
+    session_h1   = [b for b in all_h1_bars if session_date_utc_start <= b.timestamp < session_date_utc_end]
     # D1 bars are always prior closed sessions — all go into warmup.
     warmup_d1    = list(all_d1_bars)
 
