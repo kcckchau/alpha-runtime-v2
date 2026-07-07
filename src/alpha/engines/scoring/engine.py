@@ -112,6 +112,9 @@ _SHORT_ADD_ONS: list[tuple[str, int, str]] = [
     ("rvol_above_1_0",        1, "RVOL ≥ 1.0"),
     ("rvol_above_1_3",        1, "RVOL ≥ 1.3"),   # stacks with rvol_above_1_0 for +2 total
     ("tight_risk_width",      1, "risk width ≤ 1× ATR"),
+    # Flow bonuses (require BarFlowContext; skipped when flow=None)
+    ("flow_net_selling",      1, "net sell delta on confirmation bar"),
+    ("flow_large_sellers",    1, "≥2 large sell trades on confirmation bar"),
 ]
 
 _SHORT_PENALTIES: list[tuple[str, int, str]] = [
@@ -120,6 +123,9 @@ _SHORT_PENALTIES: list[tuple[str, int, str]] = [
     ("live_bias_bullish",    -2, "live bias bullish (contra-trend short)"),
     ("chasing_extension",    -1, "price extended >0.50% below VWAP"),
     ("market_not_bearish",   -1, "market regime not bearish"),
+    # Flow penalties (require BarFlowContext; skipped when flow=None)
+    ("flow_absorption_at_low", -1, "buyers absorbed at low — sellers failed to hold"),
+    ("flow_v_reversal_snap",   -1, "down-move snapped back (V-reversal), sellers couldn't hold"),
 ]
 
 # Hard grade caps per setup type.
@@ -132,14 +138,17 @@ _SHORT_GRADE_CAPS: dict[SetupType, SetupGrade] = {
 _LONG_BASE: int = 3
 
 _LONG_ADD_ONS: list[tuple[str, int, str]] = [
-    ("trend_aligned_bullish", 1, "trend aligned bullish above VWAP"),
-    ("price_above_vwap",      1, "price above VWAP"),
-    ("price_above_ema20",     1, "price above EMA20"),
-    ("live_bias_bullish",     1, "live bias bullish"),
-    ("rvol_above_1_0",        1, "RVOL ≥ 1.0"),
-    ("rvol_above_1_5",        1, "RVOL ≥ 1.5"),   # stacks with rvol_above_1_0 for +2 total
-    ("orb_confirmed",         1, "ORB volume confirmed"),
-    ("tight_risk_width",      1, "risk width ≤ 1× ATR"),
+    ("trend_aligned_bullish",    1, "trend aligned bullish above VWAP"),
+    ("price_above_vwap",         1, "price above VWAP"),
+    ("price_above_ema20",        1, "price above EMA20"),
+    ("live_bias_bullish",        1, "live bias bullish"),
+    ("rvol_above_1_0",           1, "RVOL ≥ 1.0"),
+    ("rvol_above_1_5",           1, "RVOL ≥ 1.5"),   # stacks with rvol_above_1_0 for +2 total
+    ("orb_confirmed",            1, "ORB volume confirmed"),
+    ("tight_risk_width",         1, "risk width ≤ 1× ATR"),
+    # Flow bonuses (require BarFlowContext; skipped when flow=None)
+    ("flow_absorption",          1, "absorption at sweep low confirmed"),
+    ("flow_genuine_sweep",       2, "genuine sweep reversal: large buyers absorbed sellers"),
 ]
 
 _LONG_PENALTIES: list[tuple[str, int, str]] = [
@@ -147,7 +156,12 @@ _LONG_PENALTIES: list[tuple[str, int, str]] = [
     ("trend_down",           -1, "market trending down"),
     ("chasing_extension_up", -1, "price extended >0.50% above VWAP"),
     ("market_not_bullish",   -1, "market regime not bullish"),
+    # Flow penalties (require BarFlowContext; skipped when flow=None)
+    ("flow_v_reversal",      -2, "V-reversal: sweep not genuine, no absorption"),
 ]
+
+# Grade cap when V-reversal detected on confirmation bar — max B regardless of other conditions.
+_LONG_V_REVERSAL_CAP = SetupGrade.B
 
 
 class ScoringEngine(BaseEngine):
@@ -268,6 +282,7 @@ class ScoringEngine(BaseEngine):
             "rvol_above_1_0":      rvol is not None and rvol >= 1.0,
             "rvol_above_1_3":      rvol is not None and rvol >= 1.3,
             "tight_risk_width":    self._is_tight_risk(setup, cs),
+            **self._short_flow_checks(cs),
         }
 
         for name, pts, label in _SHORT_ADD_ONS:
@@ -281,6 +296,7 @@ class ScoringEngine(BaseEngine):
             "live_bias_bullish":  bullish_bias,
             "chasing_extension":  snap.vwap_deviation_pct < -0.50,
             "market_not_bearish": not bearish_bias,
+            **self._short_flow_checks(cs),
         }
         for name, pts, label in _SHORT_PENALTIES:
             if pen_checks.get(name, False):
@@ -326,6 +342,7 @@ class ScoringEngine(BaseEngine):
             "rvol_above_1_5":        rvol is not None and rvol >= 1.5,
             "orb_confirmed":         ms.orb_volume_confirmed,
             "tight_risk_width":      self._is_tight_risk(setup, cs),
+            **self._long_flow_checks(cs),
         }
         for name, pts, label in _LONG_ADD_ONS:
             if checks.get(name, False):
@@ -337,6 +354,7 @@ class ScoringEngine(BaseEngine):
             "trend_down":           ms.trend == TrendState.TRENDING_DOWN,
             "chasing_extension_up": snap.vwap_deviation_pct > 0.50,
             "market_not_bullish":   not bullish_bias,
+            **self._long_flow_checks(cs),
         }
         for name, pts, label in _LONG_PENALTIES:
             if pen_checks.get(name, False):
@@ -349,9 +367,38 @@ class ScoringEngine(BaseEngine):
         if bearish_bias:
             grade = _apply_cap(grade, SetupGrade.A)
 
+        # Flow cap: V-reversal → max B regardless of other conditions
+        if checks.get("flow_v_reversal", False):
+            grade = _apply_cap(grade, _LONG_V_REVERSAL_CAP)
+
         return score, grade, reasons, penalties
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _long_flow_checks(cs: BarSnapshot) -> dict[str, bool]:
+        """Flow-based checks for long setups. All False when flow data unavailable."""
+        flow = cs.flow
+        if flow is None:
+            return {}
+        return {
+            "flow_absorption":    flow.absorption.detected,
+            "flow_genuine_sweep": flow.is_genuine_sweep_reversal,
+            "flow_v_reversal":    flow.is_v_reversal,
+        }
+
+    @staticmethod
+    def _short_flow_checks(cs: BarSnapshot) -> dict[str, bool]:
+        """Flow-based checks for short setups. All False when flow data unavailable."""
+        flow = cs.flow
+        if flow is None:
+            return {}
+        return {
+            "flow_net_selling":      flow.delta < 0 and flow.has_trade_data,
+            "flow_large_sellers":    flow.large_sell_count >= 2,
+            "flow_absorption_at_low": flow.absorption.detected,
+            "flow_v_reversal_snap":  flow.is_v_reversal,
+        }
 
     @staticmethod
     def _is_tight_risk(setup: Setup, snap: BarSnapshot) -> bool:
