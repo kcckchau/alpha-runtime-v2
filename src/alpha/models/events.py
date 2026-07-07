@@ -25,6 +25,7 @@ from alpha.models.enums import (
     SetupType,
     TakerSide,
 )
+from alpha.models.flow import BarFlowContext
 
 
 # ── Metadata ─────────────────────────────────────────────────────────────────
@@ -157,6 +158,28 @@ class ThesisEvent(BaseEvent):
     session_phase: str | None = None
 
 
+class BarBundleEvent(BaseEvent):
+    """
+    Emitted by BarFlowAggregator when a 1m bar is sealed with its flow context.
+
+    This is the primary input for the sequential pipeline:
+      BarBundleEvent → FeatureEngine → MarketState → Thesis → Setup
+
+    flow: None when trade/quote data is unavailable (e.g. historical bars without full-signals cache).
+    """
+
+    event_type: Literal[EventType.BAR_BUNDLE] = EventType.BAR_BUNDLE
+    timeframe: BarTimeframe
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: int
+    vwap: Decimal | None = None
+    trade_count: int | None = None
+    flow: BarFlowContext | None = None   # None = flow data not available for this bar
+
+
 class OrderUpdateEvent(BaseEvent):
     """Emitted by OrderEngine on any order lifecycle change."""
 
@@ -184,6 +207,7 @@ class SystemEvent(BaseEvent):
 
 AnyEvent = Annotated[
     BarEvent
+    | BarBundleEvent
     | TradeEvent
     | QuoteEvent
     | OrderBookEvent
