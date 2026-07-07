@@ -365,6 +365,10 @@ class BootstrapEngine(BaseEngine):
             pipeline.set_feature_engine(self._feature)
         if self._market_state is not None:
             pipeline.set_market_state_engine(self._market_state)
+        if self._thesis is not None:
+            pipeline.set_thesis_engine(self._thesis)
+        if self._setup is not None:
+            pipeline.set_setup_engine(self._setup)
         pipeline.attach()
         self._pipeline = pipeline
 

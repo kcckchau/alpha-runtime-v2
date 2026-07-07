@@ -45,7 +45,7 @@ from alpha.models.enums import (
     SetupState,
     SetupType,
 )
-from alpha.models.events import AnyEvent, BarEvent, SetupEvent
+from alpha.models.events import AnyEvent, BarBundleEvent, BarEvent, SetupEvent
 from alpha.models.market_state import MarketState
 from alpha.models.setup import SessionSetupContext, Setup, SetupHistoryEntry
 from alpha.models.snapshot import BarSnapshot
@@ -141,6 +141,7 @@ class SetupEngine(BaseEngine):
 
     async def _on_start(self) -> None:
         self._event_bus.subscribe(EventType.BAR, self._handle_bar)
+        self._pipeline_mode: bool = False  # set True by BarPipeline; skips M1 in _handle_bar
 
     async def _on_stop(self) -> None:
         pass
@@ -203,6 +204,38 @@ class SetupEngine(BaseEngine):
     def prev_session_setup_context(self, symbol: str) -> SessionSetupContext | None:
         return self._prev_session_contexts.get(symbol)
 
+    # ── Public pipeline API ───────────────────────────────────────────────────
+
+    async def process_bar(
+        self,
+        snap: BarSnapshot,
+        market_state: MarketState,
+        thesis,                     # ActiveThesis | None — loosely typed to avoid circular import
+        bundle: BarBundleEvent,
+    ) -> list:
+        """
+        Stage 4 of the sequential pipeline.
+
+        Called by BarPipeline with snapshot, market state, and thesis already computed.
+        Returns list of active Setup objects after scanning and updating.
+        """
+        symbol = bundle.symbol
+        bar = bundle.to_bar_event()
+        self._roll_session_if_needed(symbol, bar.timestamp)
+        session_key = self._session_keys.get(symbol, "")
+
+        if self._bar_count_session.get(symbol) != session_key:
+            self._bar_count_session[symbol] = session_key
+            self._bar_counts[symbol] = 0
+            self._last_close_bar.pop(symbol, None)
+            self._onl_sweep_state.pop(symbol, None)
+            self._dbl_first_bottom.pop(symbol, None)
+        self._bar_counts[symbol] = self._bar_counts.get(symbol, 0) + 1
+
+        await self._scan_for_setups(symbol, snap, market_state, bar)
+        await self._update_active_setups(symbol, snap, market_state, bar)
+        return self.active_setups(symbol)
+
     # ── Handler ───────────────────────────────────────────────────────────────
 
     async def _handle_bar(self, event: AnyEvent) -> None:
@@ -210,6 +243,8 @@ class SetupEngine(BaseEngine):
             return
         if event.timeframe != BarTimeframe.M1:
             return  # S1 and other sub-minute bars are for push WS only
+        if self._pipeline_mode:
+            return  # BarPipeline owns M1 processing
 
         symbol = event.symbol
         # Roll session BEFORE reading session_key so the bar counter compares

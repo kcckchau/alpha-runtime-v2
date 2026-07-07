@@ -36,8 +36,11 @@ from alpha.models.events import BarBundleEvent
 if TYPE_CHECKING:
     from alpha.engines.feature.engine import FeatureEngine
     from alpha.engines.market_state.engine import MarketStateEngine
+    from alpha.engines.setup.engine import SetupEngine
+    from alpha.engines.thesis.engine import ThesisEngine
     from alpha.models.market_state import MarketState
     from alpha.models.snapshot import BarSnapshot
+    from alpha.models.thesis import ActiveThesis
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +60,8 @@ class BarPipeline:
         self._bus = event_bus
         self._feature: FeatureEngine | None = None
         self._market_state: MarketStateEngine | None = None
-        # ThesisEngine and SetupEngine will be added in subsequent migrations
+        self._thesis: ThesisEngine | None = None
+        self._setup: SetupEngine | None = None
 
     # ── Registration ──────────────────────────────────────────────────────────
 
@@ -70,6 +74,16 @@ class BarPipeline:
         self._market_state = engine
         engine._pipeline_mode = True
         logger.info("BarPipeline: MarketStateEngine registered (pipeline_mode=True)")
+
+    def set_thesis_engine(self, engine: "ThesisEngine") -> None:
+        self._thesis = engine
+        engine._pipeline_mode = True
+        logger.info("BarPipeline: ThesisEngine registered (pipeline_mode=True)")
+
+    def set_setup_engine(self, engine: "SetupEngine") -> None:
+        self._setup = engine
+        engine._pipeline_mode = True
+        logger.info("BarPipeline: SetupEngine registered (pipeline_mode=True)")
 
     def attach(self) -> None:
         """Subscribe to the EventBus. Call after all engines are registered."""
@@ -100,18 +114,20 @@ class BarPipeline:
         if self._market_state is not None:
             market_state = await self._market_state.process_bar(snap, bundle)
 
-        # ── Stage 3: ThesisEngine (not yet migrated) ──────────────────────────
-        # ThesisEngine still consumes BAR via EventBus subscription.
-        # It calls feature_engine.get_snapshot() which is now guaranteed current.
-        # Migration: add thesis.process_bar(snap, market_state, bundle) here.
+        # ── Stage 3: ThesisEngine ─────────────────────────────────────────────
+        thesis: ActiveThesis | None = None
+        if self._thesis is not None and market_state is not None:
+            thesis = await self._thesis.process_bar(snap, market_state, bundle)
 
-        # ── Stage 4: SetupEngine (not yet migrated) ───────────────────────────
-        # Same as above.
-        # Migration: add setup.process_bar(snap, market_state, thesis, bundle) here.
+        # ── Stage 4: SetupEngine ──────────────────────────────────────────────
+        if self._setup is not None and market_state is not None:
+            await self._setup.process_bar(snap, market_state, thesis, bundle)
 
-        # ── Publish BarEvent for engines not yet migrated ────────────────────
-        # ThesisEngine and SetupEngine still subscribe to BAR. Publish a bare
-        # BarEvent derived from the bundle so they continue to receive it.
-        # This is removed once all stages are migrated to process_bar().
-        bar_event = bundle.to_bar_event()
-        await self._bus.publish(bar_event)
+        # ── Publish BarEvent for any engines not yet migrated ────────────────
+        # If any stage above is None (engine not registered), publish BarEvent
+        # so those engines still receive it via their BAR subscription.
+        # Once all four stages are registered, this publish becomes unnecessary
+        # and can be removed.
+        if self._thesis is None or self._setup is None or market_state is None:
+            bar_event = bundle.to_bar_event()
+            await self._bus.publish(bar_event)
