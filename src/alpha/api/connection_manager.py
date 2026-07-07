@@ -17,7 +17,7 @@ from decimal import Decimal
 from fastapi import WebSocket
 
 from alpha.models.enums import BarTimeframe, EventType
-from alpha.models.events import AnyEvent, BarEvent, QuoteEvent
+from alpha.models.events import AnyEvent, BarEvent, QuoteEvent, SetupEvent, ThesisEvent
 
 logger = logging.getLogger(__name__)
 
@@ -85,13 +85,15 @@ class ConnectionManager:
     # ── EventBus subscription ─────────────────────────────────────────────────
 
     def subscribe_to_event_bus(self, event_bus: object) -> None:
-        """Subscribe to the EventBus for bar and quote events."""
+        """Subscribe to the EventBus for bar, quote, setup, and thesis events."""
         from alpha.core.event_bus import EventBus
         if not isinstance(event_bus, EventBus):
             return
         event_bus.subscribe(EventType.BAR, self._on_bar)
         event_bus.subscribe(EventType.QUOTE, self._on_quote, drop_if_full=True)
-        logger.info("ConnectionManager: subscribed to EventBus (BAR + QUOTE)")
+        event_bus.subscribe(EventType.SETUP, self._on_setup)
+        event_bus.subscribe(EventType.THESIS, self._on_thesis)
+        logger.info("ConnectionManager: subscribed to EventBus (BAR + QUOTE + SETUP + THESIS)")
 
     # ── EventBus handlers ─────────────────────────────────────────────────────
 
@@ -126,6 +128,42 @@ class ConnectionManager:
             "ask_size": event.ask_size,
             "last_price": _decimal_str(event.last_price),
             "last_size": event.last_size,
+        }
+        await self._broadcast(event.symbol, payload)
+
+    async def _on_setup(self, event: AnyEvent) -> None:
+        if not isinstance(event, SetupEvent):
+            return
+        payload = {
+            "type": "setup",
+            "symbol": event.symbol,
+            "timestamp": event.timestamp.isoformat(),
+            "setup_id": str(event.setup_id),
+            "setup_type": str(event.setup_type),
+            "setup_state": str(event.setup_state),
+            "prev_state": str(event.prev_state) if event.prev_state else None,
+        }
+        await self._broadcast(event.symbol, payload)
+
+    async def _on_thesis(self, event: AnyEvent) -> None:
+        if not isinstance(event, ThesisEvent):
+            return
+        payload = {
+            "type": "thesis",
+            "symbol": event.symbol,
+            "timestamp": event.timestamp.isoformat(),
+            "thesis_id": str(event.thesis_id),
+            "thesis_type": str(event.thesis_type),
+            "thesis_state": str(event.thesis_state),
+            "confidence": event.confidence,
+            "bars_alive": event.bars_alive,
+            "entry": str(event.entry) if event.entry else None,
+            "stop": str(event.stop) if event.stop else None,
+            "target": str(event.target) if event.target else None,
+            "risk_ratio": event.risk_ratio,
+            "evidence_positive": event.evidence_positive,
+            "evidence_negative": event.evidence_negative,
+            "invalidation_reason": event.invalidation_reason,
         }
         await self._broadcast(event.symbol, payload)
 

@@ -41,7 +41,8 @@ from alpha.core.engine import BaseEngine
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.instruments import resolve_symbol
-from alpha.models.enums import AssetClass, BarTimeframe, EngineState, RuntimeMode
+from alpha.models.enums import AssetClass, BarTimeframe, EngineState, EventType, RuntimeMode, SetupState
+from alpha.models.events import AnyEvent, SetupEvent
 from alpha.models.symbol import Symbol
 from alpha.runtime_status import write_snapshot
 from alpha.timeframe_context import build_symbol_context
@@ -108,6 +109,13 @@ class BootstrapEngine(BaseEngine):
         self._flow_aggregators: list = []   # one BarFlowAggregator per symbol
         self._pipeline: object | None = None  # BarPipeline
 
+        # Terminal setup cache: symbol → {setup_id_str → (setup_dict, bar_count_at_terminal)}
+        # Keeps FAILED/INVALIDATED/EXPIRED setups visible in status.json for _TERMINAL_TTL_BARS bars.
+        self._terminal_setups: dict[str, dict[str, tuple[dict, int]]] = {}
+        self._terminal_setup_bar_count: int = 0  # incremented on each M1 bar
+        _TERMINAL_TTL_BARS = 10
+        self._terminal_ttl = _TERMINAL_TTL_BARS
+
     @property
     def name(self) -> str:
         return "BootstrapEngine"
@@ -158,6 +166,7 @@ class BootstrapEngine(BaseEngine):
             await engine.start()
 
         self._write_runtime_snapshot()
+        self._event_bus.subscribe(EventType.SETUP, self._on_setup_event)
         self._status_task = asyncio.create_task(self._status_loop())
 
         if mode in {RuntimeMode.LIVE, RuntimeMode.PAPER}:
@@ -696,6 +705,7 @@ class BootstrapEngine(BaseEngine):
             "contexts": self._startup_context,
             "market_states": self._serialize_market_states(),
             "setups": self._serialize_setups(),
+            "thesis": self._serialize_thesis(),
             "setup_contexts": self._serialize_setup_contexts(),
             "prev_setup_contexts": self._serialize_prev_setup_contexts(),
             "orders": self._serialize_orders(),
@@ -801,14 +811,92 @@ class BootstrapEngine(BaseEngine):
                 states[symbol] = state.model_dump(mode="json")
         return states
 
+    async def _on_setup_event(self, event: AnyEvent) -> None:
+        """Cache terminal setups so they stay visible in status.json for _terminal_ttl bars."""
+        if not isinstance(event, SetupEvent):
+            return
+        terminal_states = {SetupState.FAILED, SetupState.INVALIDATED, SetupState.EXPIRED}
+        sym = event.symbol
+        sid = str(event.setup_id)
+        if event.setup_state in terminal_states:
+            if sym not in self._terminal_setups:
+                self._terminal_setups[sym] = {}
+            # Build a minimal dict for the terminal entry
+            self._terminal_setups[sym][sid] = (
+                {
+                    "setup_id": sid,
+                    "symbol": sym,
+                    "setup_type": str(event.setup_type),
+                    "setup_state": str(event.setup_state),
+                    "timestamp": event.timestamp.isoformat(),
+                    "_terminal": True,
+                },
+                self._terminal_setup_bar_count,
+            )
+        else:
+            # Non-terminal transition — remove from terminal cache if present
+            if sym in self._terminal_setups:
+                self._terminal_setups[sym].pop(sid, None)
+
     def _serialize_setups(self) -> list[dict[str, Any]]:
         if self._setup is None:
             return []
         setups: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+
+        # Active (FORMING / CONFIRMED / TRIGGERED)
         for symbol in self._settings.runtime.symbols:
             for setup in self._setup.active_setups(symbol):
-                setups.append(setup.model_dump(mode="json"))
+                d = setup.model_dump(mode="json")
+                setups.append(d)
+                seen_ids.add(str(setup.setup_id))
+
+        # Terminal with TTL — keep for _terminal_ttl bars after transition
+        self._terminal_setup_bar_count = getattr(self._setup, "_bar_counts", {}).get(
+            self._settings.runtime.symbols[0] if self._settings.runtime.symbols else "", 0
+        )
+        for sym, cache in self._terminal_setups.items():
+            expired_ids = []
+            for sid, (setup_dict, bar_at_terminal) in cache.items():
+                age = self._terminal_setup_bar_count - bar_at_terminal
+                if age > self._terminal_ttl:
+                    expired_ids.append(sid)
+                elif sid not in seen_ids:
+                    setups.append(setup_dict)
+            for sid in expired_ids:
+                cache.pop(sid, None)
+
         return setups
+
+    def _serialize_thesis(self) -> dict[str, Any]:
+        if self._thesis is None:
+            return {}
+        result: dict[str, Any] = {}
+        for symbol in self._settings.runtime.symbols:
+            active = self._thesis.get_thesis(symbol)
+            if active is None:
+                continue
+            dominant = active.dominant
+            result[symbol] = {
+                "thesis_id": str(dominant.thesis_id),
+                "thesis_type": str(dominant.thesis_type),
+                "state": str(dominant.state),
+                "confidence": dominant.confidence,
+                "bars_alive": dominant.bars_alive,
+                "entry": str(dominant.entry) if dominant.entry else None,
+                "stop": str(dominant.stop) if dominant.stop else None,
+                "target": str(dominant.target) if dominant.target else None,
+                "risk_ratio": float(dominant.risk_ratio) if dominant.risk_ratio else None,
+                "evidence_positive": dominant.evidence_positive,
+                "evidence_negative": dominant.evidence_negative,
+                "invalidation_reason": dominant.invalidation_reason,
+                "flip": {
+                    "thesis_type": str(active.flip.thesis_type),
+                    "state": str(active.flip.state),
+                    "confidence": active.flip.confidence,
+                } if active.flip else None,
+            }
+        return result
 
     def _serialize_orders(self) -> list[dict[str, Any]]:
         if self._order is None:
