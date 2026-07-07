@@ -253,7 +253,7 @@ class ScoringEngine(BaseEngine):
         Returns the same list with scored setups updated in-place.
         """
         for setup in setups:
-            if setup.setup_state != SetupState.CONFIRMED:
+            if setup.state != SetupState.CONFIRMED:
                 continue
             if setup.grade is not None:
                 continue   # already scored in a prior bar
