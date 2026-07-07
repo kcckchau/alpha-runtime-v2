@@ -173,13 +173,54 @@ class ConnectionManager:
             return
         ms = event.market_state
         thesis = event.thesis
-        # Lightweight summary — UI uses this to detect stale panels and trigger refresh.
+        fc = event.flow_context
+
+        flow_payload = None
+        if fc is not None:
+            split = None
+            if fc.split is not None:
+                split = {
+                    "sweep_volume": fc.split.sweep_volume,
+                    "sweep_delta": fc.split.sweep_delta,
+                    "recovery_volume": fc.split.recovery_volume,
+                    "recovery_delta": fc.split.recovery_delta,
+                    "recovery_ratio": round(fc.split.recovery_ratio, 2) if fc.split.recovery_ratio is not None else None,
+                }
+            flow_payload = {
+                "available": True,
+                "total_volume": fc.total_volume,
+                "buy_volume": fc.buy_volume,
+                "sell_volume": fc.sell_volume,
+                "delta": fc.delta,
+                "delta_pct": round(fc.delta_pct, 1) if fc.delta_pct is not None else None,
+                "large_buy_count": fc.large_buy_count,
+                "large_sell_count": fc.large_sell_count,
+                "large_trade_threshold": fc.large_trade_threshold,
+                "bid_ask_imbalance": round(fc.bid_ask_imbalance, 3) if fc.bid_ask_imbalance is not None else None,
+                "twap_bid_size": round(fc.twap_bid_size, 1) if fc.twap_bid_size is not None else None,
+                "twap_ask_size": round(fc.twap_ask_size, 1) if fc.twap_ask_size is not None else None,
+                "trade_count": fc.trade_count,
+                "trade_velocity": round(fc.trade_velocity, 2) if fc.trade_velocity is not None else None,
+                "avg_trade_size": round(fc.avg_trade_size, 1) if fc.avg_trade_size is not None else None,
+                "is_genuine_sweep_reversal": fc.is_genuine_sweep_reversal,
+                "is_v_reversal": fc.is_v_reversal,
+                "absorption": {
+                    "detected": fc.absorption.detected,
+                    "confidence": round(fc.absorption.confidence, 2),
+                    "sell_volume_at_low": fc.absorption.sell_volume_at_low,
+                },
+                "split": split,
+                "has_trade_data": fc.has_trade_data,
+                "has_quote_data": fc.has_quote_data,
+            }
+
         payload = {
             "type": "pipeline_complete",
             "symbol": event.symbol,
             "timestamp": event.timestamp.isoformat(),
             "pipeline_ts": event.pipeline_ts.isoformat(),
-            "flow_available": event.flow_context is not None,
+            "flow_available": fc is not None,
+            "flow": flow_payload,
             "market_state_ts": ms.timestamp.isoformat() if ms and hasattr(ms, "timestamp") else None,
             "thesis_type": str(thesis.dominant.thesis_type) if thesis else None,
             "active_setup_count": len(event.setups),

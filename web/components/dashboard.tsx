@@ -2443,8 +2443,8 @@ export function Dashboard() {
             .then((d) => d && setMarketStates((prev) => ({ ...prev, [selectedSymbol]: d }))).catch(() => {});
           fetchJson<SymbolContext>(`/runtime/context/${selectedSymbol}`)
             .then((d) => d && setContexts((prev) => ({ ...prev, [selectedSymbol]: d }))).catch(() => {});
-          fetchJson<FlowData>(`/runtime/flow/${selectedSymbol}`)
-            .then((d) => d && setFlow(d)).catch(() => {});
+          // Flow data is embedded in pipeline_complete — set it directly from msg.flow
+          if (msg.flow) setFlow(msg.flow as FlowData);
           // One-time bar history refresh after bootstrap: fills the gap between the
           // initial REST fetch (now-3min) and bars stored during the bootstrap period.
           if (!barsRefreshedRef.current) {
