@@ -919,8 +919,8 @@ class BootstrapEngine(BaseEngine):
                 reward = abs(float(d.target - d.entry))
                 risk_ratio = round(reward / risk, 2) if risk > 0 else None
             # Split evidence into positive/negative by weight sign
-            ev_pos = [e.description for e in d.evidence if e.weight >= 0]
-            ev_neg = [e.description for e in d.evidence if e.weight < 0]
+            ev_pos = [e.text for e in d.evidence if e.weight >= 0]
+            ev_neg = [e.text for e in d.evidence if e.weight < 0]
             result[symbol] = {
                 "thesis_id": str(d.thesis_id),
                 "thesis_type": str(d.thesis_type),
