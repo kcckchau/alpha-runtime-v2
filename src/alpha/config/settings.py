@@ -206,6 +206,15 @@ class APISettings(BaseSettings):
     reload: bool = False
 
 
+class TelegramSettings(BaseSettings):
+    bot_token: str = ""
+    chat_id: str = ""
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.bot_token and self.chat_id)
+
+
 class AlphaSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=_REPO_ROOT / ".env",
@@ -225,3 +234,4 @@ class AlphaSettings(BaseSettings):
     risk: RiskSettings = Field(default_factory=RiskSettings)
     replay: ReplaySettings = Field(default_factory=ReplaySettings)
     api: APISettings = Field(default_factory=APISettings)
+    telegram: TelegramSettings = Field(default_factory=TelegramSettings)

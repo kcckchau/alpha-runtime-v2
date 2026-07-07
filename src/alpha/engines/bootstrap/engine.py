@@ -109,6 +109,9 @@ class BootstrapEngine(BaseEngine):
         self._flow_aggregators: list = []   # one BarFlowAggregator per symbol
         self._pipeline: object | None = None  # BarPipeline
 
+        # Notifications
+        self._telegram_notifier: object | None = None
+
         # Terminal setup cache: symbol → {setup_id_str → (setup_dict, bar_count_at_terminal)}
         # Keeps FAILED/INVALIDATED/EXPIRED setups visible in status.json for _TERMINAL_TTL_BARS bars.
         self._terminal_setups: dict[str, dict[str, tuple[dict, int]]] = {}
@@ -172,6 +175,10 @@ class BootstrapEngine(BaseEngine):
         self._event_bus.subscribe(EventType.SETUP, self._on_setup_event)
         self._event_bus.subscribe(EventType.PIPELINE_OUTPUT, self._on_pipeline_output)
         self._status_task = asyncio.create_task(self._status_loop())
+        if self._telegram_notifier is not None:
+            from alpha.notifications.telegram import TelegramNotifier
+            if isinstance(self._telegram_notifier, TelegramNotifier):
+                await self._telegram_notifier.start()
 
         if mode in {RuntimeMode.LIVE, RuntimeMode.PAPER}:
             if self._live is not None:
@@ -205,6 +212,10 @@ class BootstrapEngine(BaseEngine):
                 await self._status_task
             except asyncio.CancelledError:
                 pass
+        if self._telegram_notifier is not None:
+            from alpha.notifications.telegram import TelegramNotifier
+            if isinstance(self._telegram_notifier, TelegramNotifier):
+                await self._telegram_notifier.stop()
         for engine in reversed(self._engines):
             await engine.stop()
         # Disconnect IBKR after engines stop (subscriptions are already cancelled
@@ -297,6 +308,7 @@ class BootstrapEngine(BaseEngine):
         self._wire_databento()
         self._wire_pipeline()
         self._position_monitor = self._wire_position_monitor()
+        self._wire_notifications()
 
         self._engines = [
             self._storage,
@@ -439,6 +451,13 @@ class BootstrapEngine(BaseEngine):
         )
         logger.info("PositionMonitor wired | symbols=%s", symbols)
         return monitor
+
+    def _wire_notifications(self) -> None:
+        """Create TelegramNotifier if configured."""
+        from alpha.notifications.telegram import TelegramNotifier
+        self._telegram_notifier = TelegramNotifier(
+            self._settings.telegram, self._event_bus
+        )
 
     async def _run_catchup(self) -> None:
         """Load recent history before connecting the live feed."""
