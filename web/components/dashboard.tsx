@@ -199,6 +199,16 @@ type SetupSessionContext = {
   bar_market_states?: Record<string, MarketStateData>;
 };
 
+type PipelineDebug = {
+  pipeline_ts: string;        // when BarPipeline finished processing this bar
+  bar_ts: string;             // bar close timestamp (M1)
+  market_state_ts: string | null;
+  thesis_type: string | null;
+  flow_available: boolean;
+  active_setup_count: number;
+  scored_setup_count: number;
+};
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 function normalizeApiBaseUrl(rawUrl: string): string {
@@ -703,17 +713,29 @@ function SetupItem({ setup, past }: { setup: SetupRow; past?: boolean }) {
   );
 }
 
-function SetupsPanel({ setups }: { setups: SetupRow[] }) {
+function SetupsPanel({
+  setups,
+  thesis,
+}: {
+  setups: SetupRow[];
+  thesis: ThesisData | null;
+}) {
   const active = setups.filter((s) => !["failed", "invalidated", "expired"].includes(s.state));
+  const confirmed = active.filter((s) => s.state === "confirmed");
   const past = setups
     .filter((s) => ["failed", "invalidated", "expired"].includes(s.state))
     .slice(0, 3);
 
+  // "Why no trade?" — only shown when thesis is active but no confirmed setup exists
+  const thesisActive = thesis?.dominant && !["invalidated", "expired"].includes(thesis.dominant.state);
+  const showWhyNoTrade = thesisActive && confirmed.length === 0;
+
   return (
     <div style={S.panel}>
       <div style={S.panelHd}>
-        <span style={S.panelLbl}>Active Setups</span>
-        {active.length > 0 && <Pill color="green">{active.length}</Pill>}
+        <span style={S.panelLbl}>Setup</span>
+        {confirmed.length > 0 && <Pill color="green">{confirmed.length} confirmed</Pill>}
+        {active.length > 0 && confirmed.length === 0 && <Pill color="amber">{active.length} forming</Pill>}
       </div>
       <div style={{ padding: 8 }}>
         {active.length === 0 ? (
@@ -723,13 +745,87 @@ function SetupsPanel({ setups }: { setups: SetupRow[] }) {
         ) : (
           active.map((s) => <SetupItem key={s.setup_id} setup={s} />)
         )}
+
+        {/* "Why no trade?" — visible when thesis is watching/building but no confirmed setup */}
+        {showWhyNoTrade && (
+          <div style={{
+            marginTop: 6,
+            padding: "7px 9px",
+            borderRadius: 5,
+            background: "rgba(251,191,36,0.06)",
+            border: "0.5px solid rgba(251,191,36,0.2)",
+          }}>
+            <div style={{ ...S.mono, fontSize: 9, color: "#fbbf24", letterSpacing: "0.08em", marginBottom: 4 }}>
+              WHY NO TRADE?
+            </div>
+            <div style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.5)", lineHeight: 1.5 }}>
+              {thesis?.dominant?.state === "watching"
+                ? "Thesis watching — no confirmation signal yet"
+                : thesis?.dominant?.state === "building"
+                ? "Thesis building — waiting for setup confirmation"
+                : "Thesis not ready for entry"}
+              {active.length > 0 && (
+                <span style={{ display: "block", marginTop: 2 }}>
+                  {active.length} setup{active.length > 1 ? "s" : ""} forming, none confirmed yet
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
         {past.length > 0 && (
           <>
             <div style={{ height: 0.5, background: "rgba(255,255,255,0.06)", margin: "6px 0" }} />
-            <span style={{ ...S.panelLbl, display: "block", marginBottom: 6 }}>Past</span>
+            <span style={{ ...S.panelLbl, display: "block", marginBottom: 6 }}>Past (TTL)</span>
             {past.map((s) => <SetupItem key={s.setup_id} setup={s} past />)}
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Freshness / debug card ────────────────────────────────────────────────────
+
+function FreshnessCard({ debug }: { debug: PipelineDebug | null }) {
+  function fmtTs(iso: string | null): string {
+    if (!iso) return "—";
+    try {
+      const d = new Date(iso);
+      return `${String(d.getUTCHours()).padStart(2,"0")}:${String(d.getUTCMinutes()).padStart(2,"0")}:${String(d.getUTCSeconds()).padStart(2,"0")}.${String(d.getUTCMilliseconds()).padStart(3,"0")}`;
+    } catch { return "—"; }
+  }
+
+  const rows: Array<{ label: string; value: string; dim?: boolean; color?: string }> = debug
+    ? [
+        { label: "Last M1 bar",    value: fmtTs(debug.bar_ts) },
+        { label: "Pipeline seal",  value: fmtTs(debug.pipeline_ts) },
+        { label: "MarketState ts", value: fmtTs(debug.market_state_ts) },
+        { label: "Flow data",      value: debug.flow_available ? "yes" : "no", color: debug.flow_available ? "#22c55e" : "#ef4444" },
+        { label: "Active setups",  value: String(debug.active_setup_count) },
+        { label: "Scored setups",  value: String(debug.scored_setup_count) },
+      ]
+    : [{ label: "Waiting for pipeline…", value: "", dim: true }];
+
+  return (
+    <div style={{ ...S.panel, borderColor: "rgba(255,255,255,0.05)" }}>
+      <div style={S.panelHd}>
+        <span style={S.panelLbl}>Data Freshness</span>
+        <span style={{ ...S.mono, fontSize: 9, color: debug ? "#22c55e" : "rgba(255,255,255,0.25)" }}>
+          {debug ? "live" : "waiting"}
+        </span>
+      </div>
+      <div style={{ padding: "6px 10px", display: "flex", flexDirection: "column", gap: 3 }}>
+        {rows.map(({ label, value, dim, color }) => (
+          <div key={label} style={{ display: "flex", justifyContent: "space-between", gap: 4 }}>
+            <span style={{ ...S.mono, fontSize: 9, color: dim ? "rgba(255,255,255,0.2)" : "rgba(255,255,255,0.35)" }}>
+              {label}
+            </span>
+            <span style={{ ...S.mono, fontSize: 9, color: color ?? (dim ? "rgba(255,255,255,0.15)" : "rgba(255,255,255,0.7)") }}>
+              {value}
+            </span>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -1877,6 +1973,7 @@ export function Dashboard() {
   const [replayEpoch, setReplayEpoch] = useState(0);   // incremented to trigger chart fitContent
   const flashRef = useRef<Set<string>>(new Set());
   const [flashSetupId, setFlashSetupId] = useState<string | null>(null);
+  const [pipelineDebug, setPipelineDebug] = useState<PipelineDebug | null>(null);
 
   // ET clock — ticks every second
   useEffect(() => {
@@ -2144,6 +2241,41 @@ export function Dashboard() {
             vwap: msg.vwap ?? null,
           };
           setBars((prev) => mergeLiveBar(prev, barRow, selectedTimeframe));
+        }
+
+        if (msg.type === "pipeline_complete") {
+          // One authoritative packet per M1 bar — update debug state and
+          // trigger targeted re-fetch of all panels from fresh REST data.
+          setPipelineDebug({
+            pipeline_ts: msg.pipeline_ts,
+            bar_ts: msg.timestamp,
+            market_state_ts: msg.market_state_ts ?? null,
+            thesis_type: msg.thesis_type ?? null,
+            flow_available: !!msg.flow_available,
+            active_setup_count: Number(msg.active_setup_count ?? 0),
+            scored_setup_count: Number(msg.scored_setup_count ?? 0),
+          });
+          // Re-fetch all panels in parallel — each is fast and uses fresh data
+          fetchJson<ThesisData>(`/runtime/thesis/${selectedSymbol}`)
+            .then((d) => d && setThesis(d)).catch(() => {});
+          fetchJson<SetupRow[]>(`/runtime/setups/${selectedSymbol}`)
+            .then((d) => d && setSetups(d)).catch(() => {});
+          fetchJson<MarketStateData>(`/runtime/market-state/${selectedSymbol}`)
+            .then((d) => d && setMarketStates((prev) => ({ ...prev, [selectedSymbol]: d }))).catch(() => {});
+          fetchJson<SymbolContext>(`/runtime/context/${selectedSymbol}`)
+            .then((d) => d && setContexts((prev) => ({ ...prev, [selectedSymbol]: d }))).catch(() => {});
+        }
+
+        if (msg.type === "thesis") {
+          // Thesis state transition — re-fetch immediately rather than waiting for next poll
+          fetchJson<ThesisData>(`/runtime/thesis/${selectedSymbol}`)
+            .then((d) => d && setThesis(d)).catch(() => {});
+        }
+
+        if (msg.type === "setup") {
+          // Setup state transition — re-fetch immediately
+          fetchJson<SetupRow[]>(`/runtime/setups/${selectedSymbol}`)
+            .then((d) => d && setSetups(d)).catch(() => {});
         }
 
         if (msg.type === "quote" && msg.last_price != null) {
@@ -2867,7 +2999,28 @@ export function Dashboard() {
 
         {/* Sidebar */}
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {/* 1. THESIS — what the market may be doing */}
           {selectedDate === null && <ThesisPanel thesis={thesis} />}
+
+          {/* 2. SETUP — what is actionable / confirmed */}
+          <SetupsPanel setups={setups} thesis={thesis} />
+
+          {/* 3. POSITION — placeholder until PositionMonitor is built */}
+          {selectedDate === null && (
+            <div style={{ ...S.panel, opacity: 0.5 }}>
+              <div style={S.panelHd}>
+                <span style={S.panelLbl}>Position</span>
+                <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.25)", fontStyle: "italic" }}>
+                  monitor pending
+                </span>
+              </div>
+              <div style={{ padding: "8px 12px", ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.25)" }}>
+                Flat
+              </div>
+            </div>
+          )}
+
+          {/* 4. Setup history for session */}
           <SetupHistoryPanel
             context={activeSetupCtx}
             selectedDate={selectedDate}
@@ -2875,10 +3028,14 @@ export function Dashboard() {
             onSelectSetup={setSelectedSetupId}
             flashSetupId={flashSetupId}
           />
-          <SetupsPanel setups={setups} />
+
+          {/* 5. Market microstructure */}
           <FeaturesPanel context={currentContext} isHistorical={!!selectedDate} />
           <MarketStatePanel marketState={displayMarketState} isHistorical={!!selectedDate} />
           <RiskPanel risk={riskState} />
+
+          {/* 6. Data freshness — always last, for debugging stale state */}
+          {selectedDate === null && <FreshnessCard debug={pipelineDebug} />}
         </div>
       </div>
 

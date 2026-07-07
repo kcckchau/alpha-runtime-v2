@@ -201,6 +201,14 @@ function buildVwapData(bars: BarRow[], cache: Map<string, number>, is24h: boolea
       statePreLast = { cumTPV, cumVol, prevTime, session: prevTime !== null ? cmeSessionId(prevTime) : null };
     }
 
+    // Use backend-computed VWAP when available — ensures chart VWAP matches thesis VWAP.
+    const backendVwap = b.vwap != null ? Number(b.vwap) : null;
+    if (backendVwap != null && isFinite(backendVwap) && backendVwap > 0) {
+      prevTime = t;
+      data.push({ time: t as Time, value: backendVwap });
+      continue;
+    }
+
     // Session reset: CME session boundary for 24h futures, gap > 1h for equities
     if (shouldResetVwap(prevTime, t, is24h)) {
       cumTPV = 0;
