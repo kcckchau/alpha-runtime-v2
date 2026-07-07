@@ -169,7 +169,7 @@ class BarFlowAggregator:
     def attach(self) -> None:
         """Subscribe to the EventBus. Call once during engine startup."""
         self._bus.subscribe(EventType.TRADE, self._on_trade, symbol=self._symbol)
-        self._bus.subscribe(EventType.QUOTE, self._on_quote, symbol=self._symbol)
+        self._bus.subscribe(EventType.QUOTE, self._on_quote, symbol=self._symbol, drop_if_full=True)
         self._bus.subscribe(EventType.BAR, self._on_bar, symbol=self._symbol)
         logger.info("BarFlowAggregator attached for %s", self._symbol)
 
