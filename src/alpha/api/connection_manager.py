@@ -256,6 +256,10 @@ class ConnectionManager:
         }
         await self._broadcast(event.symbol, payload)
 
+    async def broadcast(self, symbol: str, payload: dict) -> None:  # type: ignore[type-arg]
+        """Public broadcast — for use by engines that need to push directly to WS clients."""
+        await self._broadcast(symbol, payload)
+
     # ── Broadcast ─────────────────────────────────────────────────────────────
 
     async def _broadcast(self, symbol: str, payload: dict) -> None:  # type: ignore[type-arg]

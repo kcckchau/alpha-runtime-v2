@@ -970,7 +970,7 @@ type FlowData = {
   has_quote_data?: boolean;
 };
 
-function FlowPanel({ flow }: { flow: FlowData | null }) {
+function FlowPanel({ flow, live }: { flow: FlowData | null; live?: boolean }) {
   if (!flow || !flow.available) {
     return (
       <div style={{ ...S.panel, borderColor: "rgba(255,255,255,0.05)" }}>
@@ -1001,9 +1001,12 @@ function FlowPanel({ flow }: { flow: FlowData | null }) {
     <div style={{ ...S.panel, borderColor: "rgba(255,255,255,0.05)" }}>
       <div style={S.panelHd}>
         <span style={S.panelLbl}>Order Flow</span>
-        {!flow.has_trade_data && (
-          <span style={{ ...S.mono, fontSize: 8, color: "#fbbf24" }}>no tape</span>
-        )}
+        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+          {live && <span style={{ ...S.mono, fontSize: 8, color: "#22c55e" }}>● LIVE</span>}
+          {!flow.has_trade_data && (
+            <span style={{ ...S.mono, fontSize: 8, color: "#fbbf24" }}>no tape</span>
+          )}
+        </div>
       </div>
       <div style={{ padding: "6px 10px", display: "flex", flexDirection: "column", gap: 6 }}>
 
@@ -2302,6 +2305,7 @@ export function Dashboard() {
   const [flashSetupId, setFlashSetupId] = useState<string | null>(null);
   const [pipelineDebug, setPipelineDebug] = useState<PipelineDebug | null>(null);
   const [flow, setFlow] = useState<FlowData | null>(null);
+  const [intrabarLive, setIntrabarLive] = useState(false);
   const [position, setPosition] = useState<PositionData | null>(null);
   const [sidebarTab, setSidebarTab] = useState<"signal" | "market">("signal");
   // Tracks whether we've done the one-time bar history re-fetch after bootstrap.
@@ -2621,6 +2625,19 @@ export function Dashboard() {
         if (msg.type === "position_signal") {
           setPosition(msg as PositionData);
           setSidebarTab("signal");
+        }
+
+        if (msg.type === "intrabar_flow") {
+          // Merge live 1s intrabar fields into flow — keep sealed-bar fields from pipeline_complete
+          setIntrabarLive(true);
+          setFlow((prev) => prev ? {
+            ...prev,
+            delta: msg.delta,
+            buy_volume: msg.buy_volume,
+            sell_volume: msg.sell_volume,
+            bid_ask_imbalance: msg.bid_ask_imbalance ?? prev.bid_ask_imbalance,
+            has_trade_data: (msg.trade_count ?? 0) > 0,
+          } : prev);
         }
 
         if (msg.type === "thesis") {
@@ -3002,6 +3019,7 @@ export function Dashboard() {
               setSelectedSymbol(e.target.value);
               setBackfillJob(null);
               setFlow(null);
+              setIntrabarLive(false);
               setPosition(null);
             }}
             style={{
@@ -3386,7 +3404,7 @@ export function Dashboard() {
               {selectedDate === null && <ThesisPanel thesis={thesis} />}
               <SetupsPanel setups={setups} thesis={thesis} />
               {selectedDate === null && <PositionPanel position={position} />}
-              {selectedDate === null && <FlowPanel flow={flow} />}
+              {selectedDate === null && <FlowPanel flow={flow} live={intrabarLive} />}
             </>
           )}
 

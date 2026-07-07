@@ -91,6 +91,7 @@ class PositionMonitor(BaseEngine):
         self._intrabar_engines = intrabar_engines
         self._min_grade = min_grade
         self._timeout_bars = timeout_bars
+        self._intrabar_broadcast: Any = None  # async callable(symbol, payload) injected at startup
 
         # symbol → {setup_id → Setup}
         self._pending_setups: dict[str, dict[UUID, Any]] = {}
@@ -102,6 +103,10 @@ class PositionMonitor(BaseEngine):
         self._latest_thesis_type: dict[str, str | None] = {}
         # setup_ids that recently exited — cleared on next pipeline output
         self._recently_exited: set[UUID] = set()
+
+    def set_intrabar_broadcast(self, fn: Any) -> None:
+        """Inject an async callable(symbol, payload) used to push intrabar state to WS clients."""
+        self._intrabar_broadcast = fn
 
     @property
     def name(self) -> str:
@@ -169,6 +174,33 @@ class PositionMonitor(BaseEngine):
             await self._check_exit(pos, price, event.timestamp)
         else:
             await self._check_entry(sym, price, event.timestamp)
+
+        await self._broadcast_intrabar(sym, event.timestamp)
+
+    async def _broadcast_intrabar(self, symbol: str, ts: datetime) -> None:
+        if self._intrabar_broadcast is None:
+            return
+        eng = self._intrabar_engines.get(symbol)
+        if eng is None:
+            return
+        s = eng.get_state()
+        bai = self._compute_bai(symbol)
+        payload = {
+            "type": "intrabar_flow",
+            "symbol": symbol,
+            "timestamp": ts.isoformat(),
+            "delta": s.delta,
+            "buy_volume": s.buy_volume,
+            "sell_volume": s.sell_volume,
+            "trade_count": s.trade_count,
+            "seconds_elapsed": s.seconds_elapsed,
+            "seconds_remaining": s.seconds_remaining,
+            "sweep_detected": s.sweep_detected,
+            "early_absorption": s.early_absorption,
+            "absorption_confidence": round(s.absorption_confidence, 2),
+            "bid_ask_imbalance": round(bai, 3) if bai is not None else None,
+        }
+        await self._intrabar_broadcast(symbol, payload)
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
