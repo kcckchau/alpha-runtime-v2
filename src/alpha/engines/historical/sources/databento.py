@@ -13,6 +13,7 @@ Key differences from IBKR:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -180,8 +181,14 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
                 logger.exception("Databento timeseries.get_range failed for %s", symbol)
             return
 
+        # Collect records in a thread to avoid blocking the event loop.
+        # `store` iterates synchronously over an HTTP response — doing it on
+        # the main thread would starve the live MBP-1 feed and trigger slow-client errors.
+        loop = asyncio.get_running_loop()
+        records: list = await loop.run_in_executor(None, list, store)
+
         now = datetime.now(tz=_UTC)
-        for record in store:
+        for record in records:
             ts = _to_datetime(record.ts_event)
             if ts < start or ts > end:
                 continue
@@ -237,8 +244,11 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
                 logger.exception("Databento trades fetch failed for %s", symbol)
             return
 
+        loop = asyncio.get_running_loop()
+        records = await loop.run_in_executor(None, list, store)
+
         now = datetime.now(tz=_UTC)
-        for record in store:
+        for record in records:
             ts = _to_datetime(record.ts_event)
             if ts < start or ts > end:
                 continue
@@ -292,8 +302,11 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
                 logger.exception("Databento quotes fetch failed for %s", symbol)
             return
 
+        loop = asyncio.get_running_loop()
+        records = await loop.run_in_executor(None, list, store)
+
         now = datetime.now(tz=_UTC)
-        for record in store:
+        for record in records:
             ts = _to_datetime(record.ts_event)
             if ts < start or ts > end:
                 continue
