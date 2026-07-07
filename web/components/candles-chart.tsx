@@ -631,7 +631,7 @@ export function CandlesChart({
             color,
             lineWidth: 1,
             priceLineVisible: false,
-            lastValueVisible: true,
+            lastValueVisible: false,
             crosshairMarkerVisible: false,
             title: `EMA${period}`,
           });

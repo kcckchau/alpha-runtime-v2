@@ -970,7 +970,51 @@ type FlowData = {
   has_quote_data?: boolean;
 };
 
-function FlowPanel({ flow, live }: { flow: FlowData | null; live?: boolean }) {
+function DeltaSparkline({ history }: { history: number[] }) {
+  if (history.length < 2) return null;
+  const w = 196, h = 36;
+  const min = Math.min(...history);
+  const max = Math.max(...history);
+  const range = max - min || 1;
+  const zero = max >= 0 && min <= 0 ? h - ((0 - min) / range) * h : (min >= 0 ? h : 0);
+
+  const pts = history.map((v, i) => {
+    const x = (i / (history.length - 1)) * w;
+    const y = h - ((v - min) / range) * h;
+    return `${x},${y}`;
+  }).join(" ");
+
+  const lastVal = history[history.length - 1];
+  const prevVal = history[history.length - 2];
+  const slope = lastVal - prevVal;
+  const lineColor = lastVal > 0 ? "#26a69a" : lastVal < 0 ? "#ef5350" : "rgba(255,255,255,0.3)";
+  const slopeLabel = slope > 0 ? "↑" : slope < 0 ? "↓" : "→";
+  const slopeColor = slope > 2 ? "#26a69a" : slope < -2 ? "#ef5350" : "rgba(255,255,255,0.4)";
+
+  return (
+    <div style={{ position: "relative" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+        <span style={{ ...S.mono, fontSize: 8, color: "rgba(255,255,255,0.3)" }}>Δ slope</span>
+        <span style={{ ...S.mono, fontSize: 8, color: slopeColor }}>{slopeLabel} {slope > 0 ? "+" : ""}{slope}</span>
+      </div>
+      <svg width={w} height={h} style={{ display: "block", overflow: "visible" }}>
+        {/* Zero line */}
+        <line x1={0} y1={zero} x2={w} y2={zero}
+          stroke="rgba(255,255,255,0.1)" strokeWidth={0.5} strokeDasharray="2,2" />
+        {/* Delta curve */}
+        <polyline points={pts} fill="none" stroke={lineColor} strokeWidth={1.2} />
+        {/* Last point dot */}
+        <circle
+          cx={(history.length - 1) / (history.length - 1) * w}
+          cy={h - ((lastVal - min) / range) * h}
+          r={2} fill={lineColor}
+        />
+      </svg>
+    </div>
+  );
+}
+
+function FlowPanel({ flow, live, deltaHistory }: { flow: FlowData | null; live?: boolean; deltaHistory?: number[] }) {
   if (!flow || !flow.available) {
     return (
       <div style={{ ...S.panel, borderColor: "rgba(255,255,255,0.05)" }}>
@@ -1035,6 +1079,11 @@ function FlowPanel({ flow, live }: { flow: FlowData | null; live?: boolean }) {
             )}
           </span>
         </div>
+
+        {/* Delta slope sparkline */}
+        {deltaHistory && deltaHistory.length >= 2 && (
+          <DeltaSparkline history={deltaHistory} />
+        )}
 
         {/* Bid/Ask imbalance */}
         {imbalancePct !== null && (
@@ -2306,6 +2355,7 @@ export function Dashboard() {
   const [pipelineDebug, setPipelineDebug] = useState<PipelineDebug | null>(null);
   const [flow, setFlow] = useState<FlowData | null>(null);
   const [intrabarLive, setIntrabarLive] = useState(false);
+  const deltaHistoryRef = useRef<number[]>([]);  // rolling 60s delta slope
   const [position, setPosition] = useState<PositionData | null>(null);
   const [sidebarTab, setSidebarTab] = useState<"signal" | "market">("signal");
   // Tracks whether we've done the one-time bar history re-fetch after bootstrap.
@@ -2609,6 +2659,7 @@ export function Dashboard() {
             .then((d) => d && setContexts((prev) => ({ ...prev, [selectedSymbol]: d }))).catch(() => {});
           // Flow data is embedded in pipeline_complete — set it directly from msg.flow
           if (msg.flow) setFlow(msg.flow as FlowData);
+          deltaHistoryRef.current = [];  // new bar — reset sparkline
           // One-time bar history refresh after bootstrap: fills the gap between the
           // initial REST fetch (now-3min) and bars stored during the bootstrap period.
           if (!barsRefreshedRef.current) {
@@ -2628,6 +2679,10 @@ export function Dashboard() {
         }
 
         if (msg.type === "intrabar_flow") {
+          // Accumulate delta history for sparkline (reset each bar via pipeline_complete)
+          const h = deltaHistoryRef.current;
+          h.push(msg.delta);
+          if (h.length > 60) h.shift();
           // Merge live 1s intrabar fields into flow — keep sealed-bar fields from pipeline_complete
           setIntrabarLive(true);
           setFlow((prev) => prev ? {
@@ -3021,6 +3076,7 @@ export function Dashboard() {
               setBackfillJob(null);
               setFlow(null);
               setIntrabarLive(false);
+              deltaHistoryRef.current = [];
               setPosition(null);
             }}
             style={{
@@ -3405,7 +3461,7 @@ export function Dashboard() {
               {selectedDate === null && <ThesisPanel thesis={thesis} />}
               <SetupsPanel setups={setups} thesis={thesis} />
               {selectedDate === null && <PositionPanel position={position} />}
-              {selectedDate === null && <FlowPanel flow={flow} live={intrabarLive} />}
+              {selectedDate === null && <FlowPanel flow={flow} live={intrabarLive} deltaHistory={deltaHistoryRef.current} />}
             </>
           )}
 
