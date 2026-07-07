@@ -127,7 +127,7 @@ class IntrabarFlowEngine:
 
     # ── EventBus handlers ─────────────────────────────────────────────────────
 
-    def _on_bar(self, event: BarEvent) -> None:
+    async def _on_bar(self, event: BarEvent) -> None:
         if event.symbol != self._symbol:
             return
 
@@ -137,7 +137,7 @@ class IntrabarFlowEngine:
             # 1m bar closed — update prior_bar_low for next bar sweep detection
             self._prior_bar_low = event.low
 
-    def _on_trade(self, event: TradeEvent) -> None:
+    async def _on_trade(self, event: TradeEvent) -> None:
         s = self._state
         size = event.size
         side = event.taker_side

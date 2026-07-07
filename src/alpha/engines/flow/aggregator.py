@@ -196,19 +196,19 @@ class BarFlowAggregator:
 
     # ── EventBus handlers ─────────────────────────────────────────────────────
 
-    def _on_trade(self, event: TradeEvent) -> None:
+    async def _on_trade(self, event: TradeEvent) -> None:
         w = self._window_for(event.timestamp)
         if w is None:
             return  # pre-window or between bars — discard
         w.add_trade(event)
 
-    def _on_quote(self, event: QuoteEvent) -> None:
+    async def _on_quote(self, event: QuoteEvent) -> None:
         w = self._window_for(event.timestamp)
         if w is None:
             return
         w.add_quote(event)
 
-    def _on_bar(self, event: BarEvent) -> None:
+    async def _on_bar(self, event: BarEvent) -> None:
         if event.symbol != self._symbol:
             return
         # Ignore BarEvents re-published by BarPipeline as backward-compat fallback.
@@ -225,9 +225,9 @@ class BarFlowAggregator:
 
         elif event.timeframe == BarTimeframe.M1:
             # Seal current window, open next window, emit BarBundleEvent
-            self._seal_and_emit(event)
+            await self._seal_and_emit(event)
 
-    def _seal_and_emit(self, bar: BarEvent) -> None:
+    async def _seal_and_emit(self, bar: BarEvent) -> None:
         """Seal the current window and emit a BarBundleEvent."""
         w = self._window
 
@@ -261,7 +261,7 @@ class BarFlowAggregator:
         next_open = bar.timestamp + timedelta(minutes=1)
         self._open_window(next_open, timeframe_seconds=60)
 
-        self._bus.publish(bundle)
+        await self._bus.publish(bundle)
 
     def _build_flow_context(self, w: _Window, bar: BarEvent) -> BarFlowContext:
         total_vol = w.total_volume()
