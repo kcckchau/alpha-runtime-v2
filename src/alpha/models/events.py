@@ -224,11 +224,43 @@ class SystemEvent(BaseEvent):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class PipelineOutputEvent(BaseEvent):
+    """
+    Single authoritative output published once per M1 bar after all five pipeline
+    stages have run.  Every downstream consumer — status.json, WebSocket, Parquet
+    writer, PositionMonitor — should read from this event rather than querying
+    individual engine internals.
+
+    Fields:
+      pipeline_ts   — wall-clock time when BarPipeline finished processing
+      bar_snapshot  — FeatureEngine output (VWAP, ATR, slopes, …)
+      flow_context  — BarFlowAggregator output (delta, absorption, V-reversal)
+      market_state  — MarketStateEngine output
+      thesis        — ThesisEngine output (dominant + flip)
+      setups        — all active setups after SetupEngine ran
+      scored_setups — subset: CONFIRMED and already graded by ScoringEngine
+    """
+
+    model_config = {"frozen": True, "arbitrary_types_allowed": True}
+
+    event_type: Literal[EventType.PIPELINE_OUTPUT] = EventType.PIPELINE_OUTPUT
+    pipeline_ts: datetime           # when BarPipeline finished; for UI staleness detection
+
+    # Stage outputs (None when that stage is not yet wired or returned nothing)
+    bar_snapshot: Any               # BarSnapshot — circular import avoided via Any
+    flow_context: BarFlowContext | None
+    market_state: Any | None        # MarketState
+    thesis: Any | None              # ActiveThesis (plain dataclass — arbitrary_types)
+    setups: list[Any]               # list[Setup]
+    scored_setups: list[Any]        # list[Setup] with grade set
+
+
 # ── Discriminated union ───────────────────────────────────────────────────────
 
 AnyEvent = Annotated[
     BarEvent
     | BarBundleEvent
+    | PipelineOutputEvent
     | TradeEvent
     | QuoteEvent
     | OrderBookEvent

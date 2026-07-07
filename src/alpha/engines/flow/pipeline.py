@@ -29,10 +29,11 @@ Migration approach:
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from alpha.models.enums import BarTimeframe, EventType
-from alpha.models.events import BarBundleEvent
+from alpha.models.events import BarBundleEvent, PipelineOutputEvent
 
 if TYPE_CHECKING:
     from alpha.engines.feature.engine import FeatureEngine
@@ -136,6 +137,22 @@ class BarPipeline:
         # ── Stage 5: ScoringEngine ────────────────────────────────────────────
         if self._scoring is not None and setups:
             self._scoring.process_bar(snap, market_state, setups)
+
+        # ── Publish PipelineOutput ────────────────────────────────────────────
+        scored_setups = [s for s in setups if s.grade is not None]
+        output = PipelineOutputEvent(
+            symbol=sym,
+            timestamp=bundle.timestamp,
+            pipeline_ts=datetime.now(timezone.utc),
+            bar_snapshot=snap,
+            flow_context=bundle.flow,
+            market_state=market_state,
+            thesis=thesis,
+            setups=setups,
+            scored_setups=scored_setups,
+            metadata=bundle.metadata,
+        )
+        await self._bus.publish(output)
 
         # ── Publish BarEvent for any engines not yet migrated ────────────────
         # If any stage above is None (engine not registered), publish BarEvent

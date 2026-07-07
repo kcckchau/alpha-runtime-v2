@@ -116,6 +116,9 @@ class BootstrapEngine(BaseEngine):
         _TERMINAL_TTL_BARS = 10
         self._terminal_ttl = _TERMINAL_TTL_BARS
 
+        # Last PipelineOutput per symbol — authoritative snapshot for status.json
+        self._last_pipeline_output: dict[str, object] = {}  # symbol → PipelineOutputEvent
+
     @property
     def name(self) -> str:
         return "BootstrapEngine"
@@ -167,6 +170,7 @@ class BootstrapEngine(BaseEngine):
 
         self._write_runtime_snapshot()
         self._event_bus.subscribe(EventType.SETUP, self._on_setup_event)
+        self._event_bus.subscribe(EventType.PIPELINE_OUTPUT, self._on_pipeline_output)
         self._status_task = asyncio.create_task(self._status_loop())
 
         if mode in {RuntimeMode.LIVE, RuntimeMode.PAPER}:
@@ -712,7 +716,29 @@ class BootstrapEngine(BaseEngine):
             "prev_setup_contexts": self._serialize_prev_setup_contexts(),
             "orders": self._serialize_orders(),
             "risk": self._serialize_risk(),
+            "pipeline": self._serialize_pipeline_debug(),
         }
+
+    def _serialize_pipeline_debug(self) -> dict[str, Any]:
+        """Per-symbol pipeline timestamps for UI staleness detection."""
+        result: dict[str, Any] = {}
+        for sym, out in self._last_pipeline_output.items():
+            from alpha.models.events import PipelineOutputEvent
+            if not isinstance(out, PipelineOutputEvent):
+                continue
+            ms = out.market_state
+            thesis = out.thesis
+            result[sym] = {
+                "pipeline_ts": out.pipeline_ts.isoformat(),
+                "bar_ts": out.timestamp.isoformat(),
+                "snapshot_ts": out.bar_snapshot.timestamp.isoformat() if out.bar_snapshot and hasattr(out.bar_snapshot, "timestamp") else None,
+                "market_state_ts": ms.timestamp.isoformat() if ms and hasattr(ms, "timestamp") else None,
+                "thesis_type": str(thesis.dominant.thesis_type) if thesis else None,
+                "flow_available": out.flow_context is not None,
+                "active_setup_count": len(out.setups),
+                "scored_setup_count": len(out.scored_setups),
+            }
+        return result
 
     def _serialize_engine(self, engine: BaseEngine) -> dict[str, Any]:
         details = self._engine_details(engine)
@@ -812,6 +838,13 @@ class BootstrapEngine(BaseEngine):
             if state is not None:
                 states[symbol] = state.model_dump(mode="json")
         return states
+
+    async def _on_pipeline_output(self, event: AnyEvent) -> None:
+        """Cache the latest PipelineOutputEvent per symbol for status.json."""
+        from alpha.models.events import PipelineOutputEvent
+        if not isinstance(event, PipelineOutputEvent):
+            return
+        self._last_pipeline_output[event.symbol] = event
 
     async def _on_setup_event(self, event: AnyEvent) -> None:
         """Cache terminal setups so they stay visible in status.json for _terminal_ttl bars."""

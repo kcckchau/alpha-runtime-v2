@@ -17,7 +17,7 @@ from decimal import Decimal
 from fastapi import WebSocket
 
 from alpha.models.enums import BarTimeframe, EventType
-from alpha.models.events import AnyEvent, BarEvent, QuoteEvent, SetupEvent, ThesisEvent
+from alpha.models.events import AnyEvent, BarEvent, PipelineOutputEvent, QuoteEvent, SetupEvent, ThesisEvent
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,8 @@ class ConnectionManager:
         event_bus.subscribe(EventType.QUOTE, self._on_quote, drop_if_full=True)
         event_bus.subscribe(EventType.SETUP, self._on_setup)
         event_bus.subscribe(EventType.THESIS, self._on_thesis)
-        logger.info("ConnectionManager: subscribed to EventBus (BAR + QUOTE + SETUP + THESIS)")
+        event_bus.subscribe(EventType.PIPELINE_OUTPUT, self._on_pipeline_output)
+        logger.info("ConnectionManager: subscribed to EventBus (BAR + QUOTE + SETUP + THESIS + PIPELINE_OUTPUT)")
 
     # ── EventBus handlers ─────────────────────────────────────────────────────
 
@@ -164,6 +165,25 @@ class ConnectionManager:
             "evidence_positive": event.evidence_positive,
             "evidence_negative": event.evidence_negative,
             "invalidation_reason": event.invalidation_reason,
+        }
+        await self._broadcast(event.symbol, payload)
+
+    async def _on_pipeline_output(self, event: AnyEvent) -> None:
+        if not isinstance(event, PipelineOutputEvent):
+            return
+        ms = event.market_state
+        thesis = event.thesis
+        # Lightweight summary — UI uses this to detect stale panels and trigger refresh.
+        payload = {
+            "type": "pipeline_complete",
+            "symbol": event.symbol,
+            "timestamp": event.timestamp.isoformat(),
+            "pipeline_ts": event.pipeline_ts.isoformat(),
+            "flow_available": event.flow_context is not None,
+            "market_state_ts": ms.timestamp.isoformat() if ms and hasattr(ms, "timestamp") else None,
+            "thesis_type": str(thesis.dominant.thesis_type) if thesis else None,
+            "active_setup_count": len(event.setups),
+            "scored_setup_count": len(event.scored_setups),
         }
         await self._broadcast(event.symbol, payload)
 

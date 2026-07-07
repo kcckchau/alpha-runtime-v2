@@ -63,7 +63,8 @@ class BarTimeframe(StrEnum):
 
 class EventType(StrEnum):
     BAR = "bar"
-    BAR_BUNDLE = "bar_bundle"   # BAR + sealed BarFlowContext from BarFlowAggregator
+    BAR_BUNDLE = "bar_bundle"           # BAR + sealed BarFlowContext from BarFlowAggregator
+    PIPELINE_OUTPUT = "pipeline_output" # single authoritative output per M1 bar
     TRADE = "trade"
     QUOTE = "quote"
     ORDER_BOOK = "order_book"
