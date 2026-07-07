@@ -692,7 +692,7 @@ function SetupItem({ setup, past }: { setup: SetupRow; past?: boolean }) {
             background: `${stateCol}18`, color: stateCol,
           }}
         >
-          {setup.state.toUpperCase()}
+          {(setup.state ?? "").toUpperCase()}
         </span>
         <span style={{ fontSize: 9, color: "rgba(255,255,255,0.4)", ...S.mono }}>{time}</span>
       </div>
@@ -1974,6 +1974,10 @@ export function Dashboard() {
   const flashRef = useRef<Set<string>>(new Set());
   const [flashSetupId, setFlashSetupId] = useState<string | null>(null);
   const [pipelineDebug, setPipelineDebug] = useState<PipelineDebug | null>(null);
+  // Tracks whether we've done the one-time bar history re-fetch after bootstrap.
+  // Bootstrap fills a gap (up to ~20 min) in Parquet that the initial load missed;
+  // the first pipeline_complete event signals bars are ready.
+  const barsRefreshedRef = useRef(false);
 
   // ET clock — ticks every second
   useEffect(() => {
@@ -2220,6 +2224,11 @@ export function Dashboard() {
       `${websocketBaseUrl()}/runtime/ws/live?symbol=${encodeURIComponent(selectedSymbol)}`
     );
 
+    liveWs.onopen = () => {
+      // Reset so the first pipeline_complete after this connection triggers a bar refresh.
+      barsRefreshedRef.current = false;
+    };
+
     liveWs.onmessage = (ev) => {
       if (isHistorical) return;
       try {
@@ -2264,6 +2273,17 @@ export function Dashboard() {
             .then((d) => d && setMarketStates((prev) => ({ ...prev, [selectedSymbol]: d }))).catch(() => {});
           fetchJson<SymbolContext>(`/runtime/context/${selectedSymbol}`)
             .then((d) => d && setContexts((prev) => ({ ...prev, [selectedSymbol]: d }))).catch(() => {});
+          // One-time bar history refresh after bootstrap: fills the gap between the
+          // initial REST fetch (now-3min) and bars stored during the bootstrap period.
+          if (!barsRefreshedRef.current) {
+            barsRefreshedRef.current = true;
+            const start = historyStartDate(selectedSymbol, selectedTimeframe);
+            fetchJson<BarHistoryRow[]>(
+              `/runtime/bars/history?symbol=${selectedSymbol}&timeframe=${selectedTimeframe}&start=${start}&end=${todayDate()}`
+            ).then((d) => {
+              if (d && d.length > 0) setBars((prev) => mergeHistoryWithLiveTail(d, null, prev, selectedTimeframe));
+            }).catch(() => {});
+          }
         }
 
         if (msg.type === "thesis") {
