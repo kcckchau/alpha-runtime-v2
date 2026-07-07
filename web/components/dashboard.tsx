@@ -2886,6 +2886,7 @@ export function Dashboard() {
     if (currentContext?.levels) {
       for (const [label, value] of Object.entries(currentContext.levels)) {
         if (!value) continue;
+        if (label.startsWith("ema")) continue;
         overlays.push({
           label: label.replaceAll("_", " "),
           price: Number(value),
