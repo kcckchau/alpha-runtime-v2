@@ -184,6 +184,13 @@ class BootstrapEngine(BaseEngine):
             await self._run_catchup()
             if self._storage is not None:
                 await self._storage.flush()
+            # Immediately fill the tail gap (now-3m → now-1m) that the
+            # 3-minute ingestion-lag buffer left behind.  Without this, the
+            # status loop would fill it 30 seconds later (tick 30), leaving
+            # the chart visually missing 2-3 bars at startup.
+            await self._run_tail_catchup()
+            if self._storage is not None:
+                await self._storage.flush()
             logger.info("Catch-up complete — live feed remains active")
         elif mode == RuntimeMode.HISTORICAL_BACKFILL:
             await self._run_backfill()
