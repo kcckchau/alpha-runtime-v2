@@ -151,7 +151,7 @@ class BootstrapEngine(BaseEngine):
             self._settings.runtime.mode,
             self._settings.runtime.symbols,
         )
-
+        self._cleanup_stale_tmp_files()
         self._configure_clock()
         self._populate_registry()
         await self._event_bus.start()
@@ -218,6 +218,20 @@ class BootstrapEngine(BaseEngine):
         self._write_runtime_snapshot()
 
     # ── Private ───────────────────────────────────────────────────────────────
+
+    def _cleanup_stale_tmp_files(self) -> None:
+        """Remove temp files left behind by previous crashed runs."""
+        from alpha.runtime_status import snapshot_path
+        runtime_dir = snapshot_path(self._settings).parent
+        removed = 0
+        for p in runtime_dir.glob("tmp*"):
+            try:
+                p.unlink()
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            logger.info("Cleaned up %d stale temp file(s) from previous run", removed)
 
     def _configure_clock(self) -> None:
         mode = self._settings.runtime.mode
