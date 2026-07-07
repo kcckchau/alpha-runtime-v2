@@ -2303,6 +2303,7 @@ export function Dashboard() {
   const [pipelineDebug, setPipelineDebug] = useState<PipelineDebug | null>(null);
   const [flow, setFlow] = useState<FlowData | null>(null);
   const [position, setPosition] = useState<PositionData | null>(null);
+  const [sidebarTab, setSidebarTab] = useState<"signal" | "market">("signal");
   // Tracks whether we've done the one-time bar history re-fetch after bootstrap.
   // Bootstrap fills a gap (up to ~20 min) in Parquet that the initial load missed;
   // the first pipeline_complete event signals bars are ready.
@@ -2619,6 +2620,7 @@ export function Dashboard() {
 
         if (msg.type === "position_signal") {
           setPosition(msg as PositionData);
+          setSidebarTab("signal");
         }
 
         if (msg.type === "thesis") {
@@ -3356,47 +3358,54 @@ export function Dashboard() {
 
         {/* Sidebar */}
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {/* 1. THESIS — what the market may be doing */}
-          {selectedDate === null && <ThesisPanel thesis={thesis} />}
 
-          {/* 2. SETUP — what is actionable / confirmed */}
-          <SetupsPanel setups={setups} thesis={thesis} />
+          {/* Tab bar */}
+          <div style={{ display: "flex", gap: 2 }}>
+            {(["signal", "market"] as const).map((tab) => (
+              <button
+                key={tab}
+                onClick={() => setSidebarTab(tab)}
+                style={{
+                  flex: 1, ...S.mono, fontSize: 10, fontWeight: 600,
+                  padding: "5px 0", borderRadius: 4, cursor: "pointer",
+                  border: "0.5px solid rgba(255,255,255,0.08)",
+                  background: sidebarTab === tab ? "rgba(255,255,255,0.08)" : "transparent",
+                  color: sidebarTab === tab ? "rgba(255,255,255,0.88)" : "rgba(255,255,255,0.35)",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.05em",
+                }}
+              >
+                {tab === "signal" ? (position ? "⬤ Signal" : "Signal") : "Market"}
+              </button>
+            ))}
+          </div>
 
-          {/* 3. POSITION — placeholder until PositionMonitor is built */}
-          {selectedDate === null && (
-            <div style={{ ...S.panel, opacity: 0.5 }}>
-              <div style={S.panelHd}>
-                <span style={S.panelLbl}>Position</span>
-                <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.25)", fontStyle: "italic" }}>
-                  monitor pending
-                </span>
-              </div>
-              <div style={{ padding: "8px 12px", ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.25)" }}>
-                Flat
-              </div>
-            </div>
+          {/* Signal tab — live trading view */}
+          {sidebarTab === "signal" && (
+            <>
+              {selectedDate === null && <ThesisPanel thesis={thesis} />}
+              <SetupsPanel setups={setups} thesis={thesis} />
+              {selectedDate === null && <PositionPanel position={position} />}
+              {selectedDate === null && <FlowPanel flow={flow} />}
+            </>
           )}
 
-          {/* 4. Setup history for session */}
-          <SetupHistoryPanel
-            context={activeSetupCtx}
-            selectedDate={selectedDate}
-            selectedSetupId={selectedSetupId}
-            onSelectSetup={setSelectedSetupId}
-            flashSetupId={flashSetupId}
-          />
-
-          {/* 5. Order flow — last sealed bar's buy/sell pressure and imbalance */}
-          {selectedDate === null && <PositionPanel position={position} />}
-          {selectedDate === null && <FlowPanel flow={flow} />}
-
-          {/* 6. Market microstructure */}
-          <FeaturesPanel context={currentContext} isHistorical={!!selectedDate} />
-          <MarketStatePanel marketState={displayMarketState} isHistorical={!!selectedDate} />
-          <RiskPanel risk={riskState} />
-
-          {/* 6. Data freshness — always last, for debugging stale state */}
-          {selectedDate === null && <FreshnessCard debug={pipelineDebug} />}
+          {/* Market tab — reference / analysis */}
+          {sidebarTab === "market" && (
+            <>
+              <SetupHistoryPanel
+                context={activeSetupCtx}
+                selectedDate={selectedDate}
+                selectedSetupId={selectedSetupId}
+                onSelectSetup={setSelectedSetupId}
+                flashSetupId={flashSetupId}
+              />
+              <FeaturesPanel context={currentContext} isHistorical={!!selectedDate} />
+              <MarketStatePanel marketState={displayMarketState} isHistorical={!!selectedDate} />
+              <RiskPanel risk={riskState} />
+              {selectedDate === null && <FreshnessCard debug={pipelineDebug} />}
+            </>
+          )}
         </div>
       </div>
 
