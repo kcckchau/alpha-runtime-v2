@@ -377,7 +377,7 @@ class BootstrapEngine(BaseEngine):
                 start=m1_start,
                 end=end,
                 emit=True,
-                persist_direct=False,
+                persist_direct=True,
             )
             minute5_bars = await self._load_or_fetch_bars(
                 symbol=symbol,
@@ -385,7 +385,7 @@ class BootstrapEngine(BaseEngine):
                 start=m5_start,
                 end=end,
                 emit=True,
-                persist_direct=False,
+                persist_direct=True,
             )
             hourly_bars = await self._load_or_fetch_bars(
                 symbol=symbol,
@@ -434,7 +434,7 @@ class BootstrapEngine(BaseEngine):
                     start=start,
                     end=end,
                     emit=True,
-                    persist_direct=False,
+                    persist_direct=True,
                 )
             except Exception:
                 logger.exception("Tail catch-up failed for %s", symbol)

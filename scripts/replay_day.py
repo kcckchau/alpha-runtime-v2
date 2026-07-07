@@ -273,15 +273,19 @@ async def _load_session_orderflow(
     else:
         if not trades:  # source may already be created above; create if not
             source = DatabentoHistoricalSource(registry, settings.databento)
-        print("  Fetching mbp-1 quotes from Databento (debouncing price changes)…", end="", flush=True)
+        print("  Fetching mbp-1 quotes from Databento (debouncing price changes)…", flush=True)
         last_bid: object = None
         last_ask: object = None
+        _raw_count = 0
         async for q in source.fetch_quotes(symbol, session_start, session_end):
+            _raw_count += 1
+            if _raw_count % 1_000_000 == 0:
+                print(f"    …{_raw_count // 1_000_000}M raw records streamed ({len(quotes):,} kept after debounce)", flush=True)
             if q.bid_price != last_bid or q.ask_price != last_ask:
                 quotes.append(q)
                 last_bid = q.bid_price
                 last_ask = q.ask_price
-        print(f" {len(quotes):,} records (after debounce)")
+        print(f"  Quotes done: {_raw_count:,} raw → {len(quotes):,} kept (after debounce)")
         if cache is not None and session_date is not None and quotes:
             cache.save_quotes(quotes, symbol, session_date)
             print(f"  Quotes cached ({len(quotes):,} records)")
