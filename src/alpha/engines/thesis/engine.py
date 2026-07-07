@@ -119,6 +119,7 @@ class ThesisEngine(BaseEngine):
 
         # Latest QuoteEvent per symbol — used for bid/ask imbalance in tick flow
         self._latest_quotes: dict[str, QuoteEvent] = {}
+        self._pipeline_mode: bool = False  # set True by BarPipeline before engine.start()
 
     @property
     def name(self) -> str:
@@ -139,7 +140,6 @@ class ThesisEngine(BaseEngine):
         self._event_bus.subscribe(EventType.BAR, self._handle_bar)
         self._event_bus.subscribe(EventType.TRADE, self._handle_trade)
         self._event_bus.subscribe(EventType.QUOTE, self._handle_quote, drop_if_full=True)
-        self._pipeline_mode: bool = False  # set True by BarPipeline; skips M1 in _handle_bar
         logger.info("ThesisEngine started — shadow narrative mode active")
 
     async def _on_stop(self) -> None:

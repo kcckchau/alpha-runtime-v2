@@ -99,6 +99,7 @@ class MarketStateEngine(BaseEngine):
         self._trend_bars: dict[str, int] = {}
         self._trend_bars_session: dict[str, str] = {}
         self._last_trend: dict[str, TrendState] = {}
+        self._pipeline_mode: bool = False  # set True by BarPipeline before engine.start()
 
     @property
     def name(self) -> str:
@@ -117,7 +118,6 @@ class MarketStateEngine(BaseEngine):
 
     async def _on_start(self) -> None:
         self._event_bus.subscribe(EventType.BAR, self._handle_bar)
-        self._pipeline_mode: bool = False  # set True by BarPipeline; skips M1 in _handle_bar
 
     async def _on_stop(self) -> None:
         pass

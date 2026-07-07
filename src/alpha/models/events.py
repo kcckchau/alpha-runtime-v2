@@ -67,6 +67,7 @@ class BarEvent(BaseEvent):
     vwap: Decimal | None = None
     trade_count: int | None = None
     is_partial: bool = False           # in-progress real-time bar
+    is_pipeline_fallback: bool = False # True = re-published by BarPipeline; aggregator must ignore
 
 
 class TradeEvent(BaseEvent):
@@ -180,7 +181,9 @@ class BarBundleEvent(BaseEvent):
     flow: BarFlowContext | None = None   # None = flow data not available for this bar
 
     def to_bar_event(self) -> "BarEvent":
-        """Return a BarEvent with the same OHLCV fields (no flow context)."""
+        """Return a BarEvent with the same OHLCV fields (no flow context).
+        is_pipeline_fallback=True so BarFlowAggregator ignores it and avoids
+        re-sealing the already-closed window."""
         return BarEvent(
             event_type=EventType.BAR,
             symbol=self.symbol,
@@ -193,6 +196,7 @@ class BarBundleEvent(BaseEvent):
             volume=self.volume,
             vwap=self.vwap,
             trade_count=self.trade_count,
+            is_pipeline_fallback=True,
             metadata=self.metadata,
         )
 

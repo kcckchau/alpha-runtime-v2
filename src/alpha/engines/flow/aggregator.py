@@ -211,6 +211,11 @@ class BarFlowAggregator:
     def _on_bar(self, event: BarEvent) -> None:
         if event.symbol != self._symbol:
             return
+        # Ignore BarEvents re-published by BarPipeline as backward-compat fallback.
+        # Those are derived from a bundle we already sealed — processing them again
+        # would open a duplicate window and emit a second BarBundleEvent.
+        if event.is_pipeline_fallback:
+            return
 
         if event.timeframe == BarTimeframe.S1:
             # Feed into current window for split-bar delta tracking

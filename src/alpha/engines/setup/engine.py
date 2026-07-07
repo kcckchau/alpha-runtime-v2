@@ -117,6 +117,7 @@ class SetupEngine(BaseEngine):
         self._dbl_first_bottom: dict[str, tuple[Decimal, int] | None] = {}
         self._setups_detected: int = 0
         self._setups_triggered: int = 0
+        self._pipeline_mode: bool = False  # set True by BarPipeline before engine.start()
 
     @property
     def name(self) -> str:
@@ -141,7 +142,6 @@ class SetupEngine(BaseEngine):
 
     async def _on_start(self) -> None:
         self._event_bus.subscribe(EventType.BAR, self._handle_bar)
-        self._pipeline_mode: bool = False  # set True by BarPipeline; skips M1 in _handle_bar
 
     async def _on_stop(self) -> None:
         pass

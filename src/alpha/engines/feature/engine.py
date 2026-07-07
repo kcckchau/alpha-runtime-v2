@@ -242,6 +242,7 @@ class FeatureEngine(BaseEngine):
         self._m5_ema: dict[str, _HTFEMAState] = {}
         self._h1_ema: dict[str, _HTFEMAState] = {}
         self._d1_ema: dict[str, _HTFEMAState] = {}
+        self._pipeline_mode: bool = False  # set True by BarPipeline before engine.start()
 
     @property
     def name(self) -> str:
@@ -259,7 +260,6 @@ class FeatureEngine(BaseEngine):
     async def _on_start(self) -> None:
         self._event_bus.subscribe(EventType.BAR, self._handle_bar)
         self._event_bus.subscribe(EventType.QUOTE, self._handle_quote, drop_if_full=True)
-        self._pipeline_mode: bool = False  # set True by BarPipeline to skip M1 in _handle_bar
 
     async def _on_stop(self) -> None:
         pass
