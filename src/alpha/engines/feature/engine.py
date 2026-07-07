@@ -29,7 +29,7 @@ from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.models.enums import AssetClass, BarTimeframe, EventType, HealthStatus, ORBState, SessionPhase
-from alpha.models.events import AnyEvent, BarEvent, QuoteEvent
+from alpha.models.events import AnyEvent, BarBundleEvent, BarEvent, QuoteEvent
 from alpha.models.snapshot import BarSnapshot
 
 logger = logging.getLogger(__name__)
@@ -259,6 +259,7 @@ class FeatureEngine(BaseEngine):
     async def _on_start(self) -> None:
         self._event_bus.subscribe(EventType.BAR, self._handle_bar)
         self._event_bus.subscribe(EventType.QUOTE, self._handle_quote, drop_if_full=True)
+        self._pipeline_mode: bool = False  # set True by BarPipeline to skip M1 in _handle_bar
 
     async def _on_stop(self) -> None:
         pass
@@ -317,6 +318,28 @@ class FeatureEngine(BaseEngine):
         if state.intraday_low is None or p < state.intraday_low:
             state.intraday_low = p
 
+    # ── Public pipeline API ───────────────────────────────────────────────────
+
+    def process_bar(self, bundle: BarBundleEvent) -> BarSnapshot | None:
+        """
+        Process a sealed 1m BarBundle and return the updated BarSnapshot.
+
+        Called by BarPipeline as Stage 1 of the sequential pipeline.
+        Guarantees the snapshot is current before any downstream engine runs.
+        Returns None for non-M1 bundles (should not happen but safe to guard).
+        """
+        if bundle.timeframe != BarTimeframe.M1:
+            return None
+        bar = bundle.to_bar_event()
+        state = self._get_or_create(bar.symbol)
+        self._update_state(state, bar)
+        snapshot = self._build_snapshot(state, bar)
+        if bundle.flow is not None:
+            snapshot = snapshot.model_copy(update={"flow": bundle.flow})
+        self._snapshots[bar.symbol] = snapshot
+        self._snapshots_emitted += 1
+        return snapshot
+
     # ── Handlers ──────────────────────────────────────────────────────────────
 
     async def _handle_bar(self, event: AnyEvent) -> None:
@@ -333,6 +356,8 @@ class FeatureEngine(BaseEngine):
             return
         if event.timeframe != BarTimeframe.M1:
             return  # S1 and other bars not processed here
+        if self._pipeline_mode:
+            return  # BarPipeline owns M1 processing; avoid double-update
         state = self._get_or_create(event.symbol)
         self._update_state(state, event)
         snapshot = self._build_snapshot(state, event)

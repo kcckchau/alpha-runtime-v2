@@ -104,6 +104,10 @@ class BootstrapEngine(BaseEngine):
         self._startup_context: dict[str, dict[str, Any]] = {}
         self._ibkr_conn: object | None = None  # IBKRConnection, kept for clean shutdown
 
+        # Flow pipeline (not BaseEngines — no lifecycle management needed)
+        self._flow_aggregators: list = []   # one BarFlowAggregator per symbol
+        self._pipeline: object | None = None  # BarPipeline
+
     @property
     def name(self) -> str:
         return "BootstrapEngine"
@@ -257,6 +261,7 @@ class BootstrapEngine(BaseEngine):
 
         self._wire_ibkr()
         self._wire_databento()
+        self._wire_pipeline()
 
         self._engines = [
             self._storage,
@@ -330,6 +335,43 @@ class BootstrapEngine(BaseEngine):
             )
 
         logger.info("Databento adapters registered (dataset=%s)", self._settings.databento.dataset)
+
+    def _wire_pipeline(self) -> None:
+        """
+        Wire BarFlowAggregator (one per symbol) and BarPipeline into the EventBus.
+
+        BarFlowAggregator subscribes to TRADE + QUOTE + BAR and emits BAR_BUNDLE.
+        BarPipeline subscribes to BAR_BUNDLE and calls engines in explicit order.
+        """
+        from alpha.engines.flow.aggregator import BarFlowAggregator
+        from alpha.engines.flow.pipeline import BarPipeline
+
+        symbols = self._settings.runtime.symbols
+        large_trade_threshold = getattr(
+            self._settings.runtime, "large_trade_threshold", 10
+        )
+
+        for ticker in symbols:
+            agg = BarFlowAggregator(
+                symbol=ticker,
+                event_bus=self._event_bus,
+                large_trade_threshold=large_trade_threshold,
+            )
+            agg.attach()
+            self._flow_aggregators.append(agg)
+
+        pipeline = BarPipeline(self._event_bus)
+        if self._feature is not None:
+            pipeline.set_feature_engine(self._feature)
+        if self._market_state is not None:
+            pipeline.set_market_state_engine(self._market_state)
+        pipeline.attach()
+        self._pipeline = pipeline
+
+        logger.info(
+            "BarPipeline wired | symbols=%s | aggregators=%d",
+            symbols, len(self._flow_aggregators),
+        )
 
     async def _run_catchup(self) -> None:
         """Load recent history before connecting the live feed."""

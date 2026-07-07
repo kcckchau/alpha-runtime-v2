@@ -179,6 +179,23 @@ class BarBundleEvent(BaseEvent):
     trade_count: int | None = None
     flow: BarFlowContext | None = None   # None = flow data not available for this bar
 
+    def to_bar_event(self) -> "BarEvent":
+        """Return a BarEvent with the same OHLCV fields (no flow context)."""
+        return BarEvent(
+            event_type=EventType.BAR,
+            symbol=self.symbol,
+            timestamp=self.timestamp,
+            timeframe=self.timeframe,
+            open=self.open,
+            high=self.high,
+            low=self.low,
+            close=self.close,
+            volume=self.volume,
+            vwap=self.vwap,
+            trade_count=self.trade_count,
+            metadata=self.metadata,
+        )
+
 
 class OrderUpdateEvent(BaseEvent):
     """Emitted by OrderEngine on any order lifecycle change."""
