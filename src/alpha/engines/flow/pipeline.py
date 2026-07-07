@@ -6,10 +6,11 @@ Sequential coordinator for the 1-minute bar processing pipeline.
 Subscribes to BAR_BUNDLE (emitted by BarFlowAggregator) and calls each
 engine stage in explicit dependency order:
 
-  Stage 1  FeatureEngine.process_bar(bundle)      → BarSnapshot
-  Stage 2  MarketStateEngine.process_bar(snap, bundle)  → MarketState
-  Stage 3  ThesisEngine.process_bar(...)           → (pending migration)
-  Stage 4  SetupEngine.process_bar(...)            → (pending migration)
+  Stage 1  FeatureEngine.process_bar(bundle)                    → BarSnapshot
+  Stage 2  MarketStateEngine.process_bar(snap, bundle)          → MarketState
+  Stage 3  ThesisEngine.process_bar(snap, ms, bundle)           → ActiveThesis | None
+  Stage 4  SetupEngine.process_bar(snap, ms, thesis, bundle)    → list[Setup]
+  Stage 5  ScoringEngine.process_bar(snap, ms, setups)          → list[Setup] (scored)
 
 This eliminates the EventBus subscription-order fragility: FeatureEngine is
 guaranteed to finish before MarketState reads the snapshot, regardless of
@@ -36,9 +37,11 @@ from alpha.models.events import BarBundleEvent
 if TYPE_CHECKING:
     from alpha.engines.feature.engine import FeatureEngine
     from alpha.engines.market_state.engine import MarketStateEngine
+    from alpha.engines.scoring.engine import ScoringEngine
     from alpha.engines.setup.engine import SetupEngine
     from alpha.engines.thesis.engine import ThesisEngine
     from alpha.models.market_state import MarketState
+    from alpha.models.setup import Setup
     from alpha.models.snapshot import BarSnapshot
     from alpha.models.thesis import ActiveThesis
 
@@ -62,6 +65,7 @@ class BarPipeline:
         self._market_state: MarketStateEngine | None = None
         self._thesis: ThesisEngine | None = None
         self._setup: SetupEngine | None = None
+        self._scoring: ScoringEngine | None = None
 
     # ── Registration ──────────────────────────────────────────────────────────
 
@@ -84,6 +88,11 @@ class BarPipeline:
         self._setup = engine
         engine._pipeline_mode = True
         logger.info("BarPipeline: SetupEngine registered (pipeline_mode=True)")
+
+    def set_scoring_engine(self, engine: "ScoringEngine") -> None:
+        self._scoring = engine
+        engine._pipeline_mode = True
+        logger.info("BarPipeline: ScoringEngine registered (pipeline_mode=True)")
 
     def attach(self) -> None:
         """Subscribe to the EventBus. Call after all engines are registered."""
@@ -120,13 +129,18 @@ class BarPipeline:
             thesis = await self._thesis.process_bar(snap, market_state, bundle)
 
         # ── Stage 4: SetupEngine ──────────────────────────────────────────────
+        setups: list[Setup] = []
         if self._setup is not None and market_state is not None:
-            await self._setup.process_bar(snap, market_state, thesis, bundle)
+            setups = await self._setup.process_bar(snap, market_state, thesis, bundle)
+
+        # ── Stage 5: ScoringEngine ────────────────────────────────────────────
+        if self._scoring is not None and setups:
+            self._scoring.process_bar(snap, market_state, setups)
 
         # ── Publish BarEvent for any engines not yet migrated ────────────────
         # If any stage above is None (engine not registered), publish BarEvent
         # so those engines still receive it via their BAR subscription.
-        # Once all four stages are registered, this publish becomes unnecessary
+        # Once all five stages are registered, this publish becomes unnecessary
         # and can be removed.
         if self._thesis is None or self._setup is None or market_state is None:
             bar_event = bundle.to_bar_event()

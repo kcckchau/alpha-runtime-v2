@@ -181,6 +181,7 @@ class ScoringEngine(BaseEngine):
         self._setup_engine: object | None = None
         self._feature_engine: object | None = None
         self._scored_total: int = 0
+        self._pipeline_mode: bool = False
 
     @property
     def name(self) -> str:
@@ -212,6 +213,8 @@ class ScoringEngine(BaseEngine):
     # ── Handler ───────────────────────────────────────────────────────────────
 
     async def _handle_setup(self, event: AnyEvent) -> None:
+        if self._pipeline_mode:
+            return
         if not isinstance(event, SetupEvent):
             return
         # Score only at CONFIRMED — entry/stop are set and confirmation bar is available.
@@ -233,6 +236,38 @@ class ScoringEngine(BaseEngine):
         )
         self._scored_total += 1
         self._apply_score(event.symbol, event.setup_id, score, grade, reasons, penalties)
+
+    # ── Pipeline stage ────────────────────────────────────────────────────────
+
+    def process_bar(
+        self,
+        confirm_snap: "BarSnapshot",
+        market_state: object,
+        setups: list["Setup"],
+    ) -> list["Setup"]:
+        """
+        Stage 5 of the sequential pipeline.
+
+        Scores any CONFIRMED setups that have not yet been graded.
+        `confirm_snap` is the current bar's BarSnapshot (the confirmation bar).
+        Returns the same list with scored setups updated in-place.
+        """
+        for setup in setups:
+            if setup.setup_state != SetupState.CONFIRMED:
+                continue
+            if setup.grade is not None:
+                continue   # already scored in a prior bar
+
+            score, grade, reasons, penalties = self._compute(setup, confirm_snap)
+
+            logger.info(
+                "Score [pipeline]: %s %s → %d (%s) reasons=%s penalties=%s",
+                setup.symbol, setup.setup_type, score, grade, reasons, penalties,
+            )
+            self._scored_total += 1
+            self._apply_score(setup.symbol, setup.setup_id, score, grade, reasons, penalties)
+
+        return setups
 
     # ── Scoring ───────────────────────────────────────────────────────────────
 

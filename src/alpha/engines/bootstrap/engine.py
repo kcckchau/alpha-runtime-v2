@@ -378,6 +378,8 @@ class BootstrapEngine(BaseEngine):
             pipeline.set_thesis_engine(self._thesis)
         if self._setup is not None:
             pipeline.set_setup_engine(self._setup)
+        if self._scoring is not None:
+            pipeline.set_scoring_engine(self._scoring)
         pipeline.attach()
         self._pipeline = pipeline
 
