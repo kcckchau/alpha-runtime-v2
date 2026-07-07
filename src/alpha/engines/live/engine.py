@@ -133,6 +133,7 @@ class LiveIngestionEngine(BaseEngine):
             return
 
         await adapter.subscribe_bars(symbols, BarTimeframe.M1, self._on_bar)
+        await adapter.subscribe_bars(symbols, BarTimeframe.S1, self._on_bar)
         await adapter.subscribe_trades(symbols, self._on_trade)
         await adapter.subscribe_quotes(symbols, self._on_quote)
 
