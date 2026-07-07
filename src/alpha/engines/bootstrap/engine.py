@@ -296,6 +296,7 @@ class BootstrapEngine(BaseEngine):
         self._wire_ibkr()
         self._wire_databento()
         self._wire_pipeline()
+        self._position_monitor = self._wire_position_monitor()
 
         self._engines = [
             self._storage,
@@ -308,6 +309,7 @@ class BootstrapEngine(BaseEngine):
             self._scoring,
             self._risk,
             self._order,
+            self._position_monitor,
         ]
 
     def _wire_ibkr(self) -> None:
@@ -412,6 +414,31 @@ class BootstrapEngine(BaseEngine):
             "BarPipeline wired | symbols=%s | aggregators=%d",
             symbols, len(self._flow_aggregators),
         )
+
+    def _wire_position_monitor(self) -> "PositionMonitor":  # type: ignore[name-defined]
+        """Wire IntrabarFlowEngine (one per symbol) and PositionMonitor."""
+        from alpha.engines.flow.intrabar import IntrabarFlowEngine
+        from alpha.engines.position.engine import PositionMonitor
+
+        symbols = self._settings.runtime.symbols
+        large_trade_threshold = getattr(self._settings.runtime, "large_trade_threshold", 10)
+
+        intrabar_engines: dict[str, IntrabarFlowEngine] = {}
+        for ticker in symbols:
+            eng = IntrabarFlowEngine(
+                symbol=ticker,
+                event_bus=self._event_bus,
+                large_trade_threshold=large_trade_threshold,
+            )
+            eng.attach()
+            intrabar_engines[ticker] = eng
+
+        monitor = PositionMonitor(
+            event_bus=self._event_bus,
+            intrabar_engines=intrabar_engines,
+        )
+        logger.info("PositionMonitor wired | symbols=%s", symbols)
+        return monitor
 
     async def _run_catchup(self) -> None:
         """Load recent history before connecting the live feed."""

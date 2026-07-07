@@ -21,6 +21,7 @@ from alpha.models.enums import (
     OrderSide,
     OrderStatus,
     ORBState,
+    SetupGrade,
     SetupState,
     SetupType,
     TakerSide,
@@ -255,6 +256,41 @@ class PipelineOutputEvent(BaseEvent):
     scored_setups: list[Any]        # list[Setup] with grade set
 
 
+class PositionSignalEvent(BaseEvent):
+    """
+    Shadow-mode position signal emitted by PositionMonitor.
+    Published every S1 bar while a shadow position is active (WOULD_HOLD),
+    on entry confirmation (WOULD_ENTER), and on exit (WOULD_EXIT).
+    """
+
+    model_config = {"frozen": True}
+
+    event_type: Literal[EventType.POSITION_SIGNAL] = EventType.POSITION_SIGNAL
+    signal_type: str          # "would_enter" | "would_exit" | "would_hold"
+    setup_id: UUID
+    setup_type: SetupType
+    direction: OrderSide
+    entry_price: Decimal
+    stop: Decimal
+    target: Decimal
+    current_price: Decimal
+    grade: SetupGrade
+
+    # Entry confirmation values (set on WOULD_ENTER)
+    intrabar_delta: int | None = None
+    bid_ask_imbalance: float | None = None
+
+    # Exit values (set on WOULD_EXIT)
+    exit_reason: str | None = None    # "stop_hit" | "target_hit" | "thesis_invalidated" | "timeout"
+    pnl_pts: Decimal | None = None
+    bars_held: int | None = None
+
+    # Hold tracking (set on WOULD_HOLD)
+    bars_held_so_far: int | None = None
+    mfe: Decimal | None = None        # max favorable excursion in points
+    mae: Decimal | None = None        # max adverse excursion in points
+
+
 # ── Discriminated union ───────────────────────────────────────────────────────
 
 AnyEvent = Annotated[
@@ -268,6 +304,7 @@ AnyEvent = Annotated[
     | SetupEvent
     | ThesisEvent
     | OrderUpdateEvent
-    | SystemEvent,
+    | SystemEvent
+    | PositionSignalEvent,
     Field(discriminator="event_type"),
 ]

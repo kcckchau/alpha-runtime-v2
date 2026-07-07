@@ -74,6 +74,7 @@ class EventType(StrEnum):
     ORDER_UPDATE = "order_update"
     EXECUTION = "execution"
     SYSTEM = "system"
+    POSITION_SIGNAL = "position_signal"
 
 
 class SessionPhase(StrEnum):

@@ -17,7 +17,7 @@ from decimal import Decimal
 from fastapi import WebSocket
 
 from alpha.models.enums import BarTimeframe, EventType
-from alpha.models.events import AnyEvent, BarEvent, PipelineOutputEvent, QuoteEvent, SetupEvent, ThesisEvent
+from alpha.models.events import AnyEvent, BarEvent, PipelineOutputEvent, PositionSignalEvent, QuoteEvent, SetupEvent, ThesisEvent
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,8 @@ class ConnectionManager:
         event_bus.subscribe(EventType.SETUP, self._on_setup)
         event_bus.subscribe(EventType.THESIS, self._on_thesis)
         event_bus.subscribe(EventType.PIPELINE_OUTPUT, self._on_pipeline_output)
-        logger.info("ConnectionManager: subscribed to EventBus (BAR + QUOTE + SETUP + THESIS + PIPELINE_OUTPUT)")
+        event_bus.subscribe(EventType.POSITION_SIGNAL, self._on_position_signal)
+        logger.info("ConnectionManager: subscribed to EventBus (BAR + QUOTE + SETUP + THESIS + PIPELINE_OUTPUT + POSITION_SIGNAL)")
 
     # ── EventBus handlers ─────────────────────────────────────────────────────
 
@@ -225,6 +226,33 @@ class ConnectionManager:
             "thesis_type": str(thesis.dominant.thesis_type) if thesis else None,
             "active_setup_count": len(event.setups),
             "scored_setup_count": len(event.scored_setups),
+        }
+        await self._broadcast(event.symbol, payload)
+
+    async def _on_position_signal(self, event: AnyEvent) -> None:
+        if not isinstance(event, PositionSignalEvent):
+            return
+        payload = {
+            "type": "position_signal",
+            "symbol": event.symbol,
+            "timestamp": event.timestamp.isoformat(),
+            "signal_type": event.signal_type,
+            "setup_id": str(event.setup_id),
+            "setup_type": str(event.setup_type),
+            "direction": str(event.direction),
+            "entry_price": str(event.entry_price),
+            "stop": str(event.stop),
+            "target": str(event.target),
+            "current_price": str(event.current_price),
+            "grade": str(event.grade),
+            "intrabar_delta": event.intrabar_delta,
+            "bid_ask_imbalance": event.bid_ask_imbalance,
+            "exit_reason": event.exit_reason,
+            "pnl_pts": str(event.pnl_pts) if event.pnl_pts is not None else None,
+            "bars_held": event.bars_held,
+            "bars_held_so_far": event.bars_held_so_far,
+            "mfe": str(event.mfe) if event.mfe is not None else None,
+            "mae": str(event.mae) if event.mae is not None else None,
         }
         await self._broadcast(event.symbol, payload)
 

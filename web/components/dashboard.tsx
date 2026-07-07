@@ -787,6 +787,164 @@ function SetupsPanel({
 
 // ─── Flow panel ───────────────────────────────────────────────────────────────
 
+type PositionData = {
+  signal_type: "would_enter" | "would_hold" | "would_exit";
+  setup_type: string;
+  direction: "buy" | "sell";
+  entry_price: string;
+  stop: string;
+  target: string;
+  current_price: string;
+  grade: string;
+  // Entry
+  intrabar_delta?: number | null;
+  bid_ask_imbalance?: number | null;
+  // Exit
+  exit_reason?: string | null;
+  pnl_pts?: string | null;
+  bars_held?: number | null;
+  // Hold
+  bars_held_so_far?: number | null;
+  mfe?: string | null;
+  mae?: string | null;
+};
+
+function PositionPanel({ position }: { position: PositionData | null }) {
+  if (!position) return null;
+
+  const isLong = position.direction === "buy";
+  const entryPrice = parseFloat(position.entry_price);
+  const currentPrice = parseFloat(position.current_price);
+  const stop = parseFloat(position.stop);
+  const target = parseFloat(position.target);
+  const unrealized = isLong ? currentPrice - entryPrice : entryPrice - currentPrice;
+  const distToStop = isLong ? currentPrice - stop : stop - currentPrice;
+  const distToTarget = isLong ? target - currentPrice : currentPrice - target;
+  const rr = Math.abs(target - entryPrice) / Math.abs(stop - entryPrice);
+
+  const dirColor = isLong ? "#26a69a" : "#ef5350";
+  const pnlColor = unrealized >= 0 ? "#26a69a" : "#ef5350";
+
+  const signalLabel =
+    position.signal_type === "would_enter" ? "ENTRY SIGNAL"
+    : position.signal_type === "would_exit" ? "EXITED"
+    : "IN TRADE";
+
+  const signalColor =
+    position.signal_type === "would_enter" ? "#f0b429"
+    : position.signal_type === "would_exit" ? "rgba(255,255,255,0.4)"
+    : "#26a69a";
+
+  return (
+    <div style={{ ...S.panel, borderColor: signalColor + "55" }}>
+      <div style={S.panelHd}>
+        <span style={S.panelLbl}>Shadow Position</span>
+        <span style={{ ...S.mono, fontSize: 10, color: signalColor, fontWeight: 700 }}>{signalLabel}</span>
+      </div>
+
+      {/* Direction + setup type */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+        <span style={{ ...S.mono, fontSize: 11, color: dirColor, fontWeight: 700 }}>
+          {isLong ? "▲ LONG" : "▼ SHORT"}
+        </span>
+        <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.5)" }}>
+          {position.setup_type.replace(/_/g, " ")}
+        </span>
+        <span style={{
+          fontSize: 9, fontWeight: 700, padding: "1px 5px",
+          borderRadius: 3, background: "rgba(255,255,255,0.1)",
+          color: "rgba(255,255,255,0.8)", marginLeft: "auto"
+        }}>{position.grade}</span>
+      </div>
+
+      {/* Price levels */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4, marginBottom: 6 }}>
+        {[
+          { label: "Entry", value: entryPrice.toFixed(2), color: "rgba(255,255,255,0.7)" },
+          { label: "Stop", value: stop.toFixed(2), color: "#ef5350" },
+          { label: "Target", value: target.toFixed(2), color: "#26a69a" },
+        ].map(({ label, value, color }) => (
+          <div key={label} style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)", marginBottom: 1 }}>{label}</div>
+            <div style={{ ...S.mono, fontSize: 11, color }}>{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Exit result */}
+      {position.signal_type === "would_exit" && (
+        <div style={{ padding: "4px 8px", borderRadius: 4, background: "rgba(255,255,255,0.06)", marginBottom: 6, textAlign: "center" }}>
+          <span style={{ fontSize: 9, color: "rgba(255,255,255,0.5)" }}>
+            {(position.exit_reason ?? "").replace(/_/g, " ").toUpperCase()} ·{" "}
+          </span>
+          <span style={{ ...S.mono, fontSize: 12, color: parseFloat(position.pnl_pts ?? "0") >= 0 ? "#26a69a" : "#ef5350", fontWeight: 700 }}>
+            {parseFloat(position.pnl_pts ?? "0") >= 0 ? "+" : ""}{parseFloat(position.pnl_pts ?? "0").toFixed(2)} pts
+          </span>
+          {position.bars_held != null && (
+            <span style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}> · {position.bars_held}s held</span>
+          )}
+        </div>
+      )}
+
+      {/* In-trade metrics */}
+      {position.signal_type === "would_hold" && (
+        <>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+            <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)" }}>Unrealized</span>
+            <span style={{ ...S.mono, fontSize: 11, color: pnlColor, fontWeight: 700 }}>
+              {unrealized >= 0 ? "+" : ""}{unrealized.toFixed(2)} pts
+            </span>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 4, marginBottom: 4 }}>
+            {[
+              { label: "→ Stop", value: distToStop.toFixed(1), color: "#ef5350" },
+              { label: "→ Tgt", value: distToTarget.toFixed(1), color: "#26a69a" },
+              { label: "MFE", value: position.mfe ? parseFloat(position.mfe).toFixed(1) : "—", color: "#26a69a" },
+              { label: "MAE", value: position.mae ? parseFloat(position.mae).toFixed(1) : "—", color: "#ef5350" },
+            ].map(({ label, value, color }) => (
+              <div key={label} style={{ textAlign: "center" }}>
+                <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}>{label}</div>
+                <div style={{ ...S.mono, fontSize: 10, color }}>{value}</div>
+              </div>
+            ))}
+          </div>
+          {position.bars_held_so_far != null && (
+            <div style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", textAlign: "right" }}>
+              {position.bars_held_so_far}s elapsed
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Entry confirmation signals */}
+      {position.signal_type === "would_enter" && (
+        <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+          <div style={{ flex: 1, textAlign: "center" }}>
+            <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}>R:R</div>
+            <div style={{ ...S.mono, fontSize: 11, color: "rgba(255,255,255,0.8)" }}>{rr.toFixed(2)}</div>
+          </div>
+          {position.intrabar_delta != null && (
+            <div style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}>Δ Delta</div>
+              <div style={{ ...S.mono, fontSize: 11, color: position.intrabar_delta > 0 ? "#26a69a" : "#ef5350" }}>
+                {position.intrabar_delta > 0 ? "+" : ""}{position.intrabar_delta}
+              </div>
+            </div>
+          )}
+          {position.bid_ask_imbalance != null && (
+            <div style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}>BAI</div>
+              <div style={{ ...S.mono, fontSize: 11, color: position.bid_ask_imbalance > 0.5 ? "#26a69a" : "#ef5350" }}>
+                {position.bid_ask_imbalance.toFixed(3)}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 type FlowData = {
   available: boolean;
   bar_ts?: string;
@@ -2144,6 +2302,7 @@ export function Dashboard() {
   const [flashSetupId, setFlashSetupId] = useState<string | null>(null);
   const [pipelineDebug, setPipelineDebug] = useState<PipelineDebug | null>(null);
   const [flow, setFlow] = useState<FlowData | null>(null);
+  const [position, setPosition] = useState<PositionData | null>(null);
   // Tracks whether we've done the one-time bar history re-fetch after bootstrap.
   // Bootstrap fills a gap (up to ~20 min) in Parquet that the initial load missed;
   // the first pipeline_complete event signals bars are ready.
@@ -2456,6 +2615,10 @@ export function Dashboard() {
               if (d && d.length > 0) setBars((prev) => mergeHistoryWithLiveTail(d, null, prev, selectedTimeframe));
             }).catch(() => {});
           }
+        }
+
+        if (msg.type === "position_signal") {
+          setPosition(msg as PositionData);
         }
 
         if (msg.type === "thesis") {
@@ -2837,6 +3000,7 @@ export function Dashboard() {
               setSelectedSymbol(e.target.value);
               setBackfillJob(null);
               setFlow(null);
+              setPosition(null);
             }}
             style={{
               background: "rgba(255,255,255,0.06)",
@@ -3223,6 +3387,7 @@ export function Dashboard() {
           />
 
           {/* 5. Order flow — last sealed bar's buy/sell pressure and imbalance */}
+          {selectedDate === null && <PositionPanel position={position} />}
           {selectedDate === null && <FlowPanel flow={flow} />}
 
           {/* 6. Market microstructure */}
