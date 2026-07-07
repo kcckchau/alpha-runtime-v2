@@ -633,11 +633,11 @@ export function CandlesChart({
             priceLineVisible: false,
             lastValueVisible: false,
             crosshairMarkerVisible: false,
-            title: `EMA${period}`,
+            title: "",
           });
           emaSeriesRef.current.set(period, series);
         }
-        emaSeriesRef.current.get(period)!.applyOptions({ lastValueVisible: false });
+        emaSeriesRef.current.get(period)!.applyOptions({ lastValueVisible: false, title: "" });
         const { data: emaData, statePreLast: ePre, stateLast: eLast } = buildEmaData(
           bars,
           period,
