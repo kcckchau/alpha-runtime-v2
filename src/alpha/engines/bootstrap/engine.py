@@ -876,20 +876,33 @@ class BootstrapEngine(BaseEngine):
             active = self._thesis.get_thesis(symbol)
             if active is None:
                 continue
-            dominant = active.dominant
+            d = active.dominant
+            # Derive risk_ratio from entry/stop/target if available
+            risk_ratio: float | None = None
+            if d.entry and d.stop and d.target:
+                risk = abs(float(d.entry - d.stop))
+                reward = abs(float(d.target - d.entry))
+                risk_ratio = round(reward / risk, 2) if risk > 0 else None
+            # Split evidence into positive/negative by weight sign
+            ev_pos = [e.description for e in d.evidence if e.weight >= 0]
+            ev_neg = [e.description for e in d.evidence if e.weight < 0]
             result[symbol] = {
-                "thesis_id": str(dominant.thesis_id),
-                "thesis_type": str(dominant.thesis_type),
-                "state": str(dominant.state),
-                "confidence": dominant.confidence,
-                "bars_alive": dominant.bars_alive,
-                "entry": str(dominant.entry) if dominant.entry else None,
-                "stop": str(dominant.stop) if dominant.stop else None,
-                "target": str(dominant.target) if dominant.target else None,
-                "risk_ratio": float(dominant.risk_ratio) if dominant.risk_ratio else None,
-                "evidence_positive": dominant.evidence_positive,
-                "evidence_negative": dominant.evidence_negative,
-                "invalidation_reason": dominant.invalidation_reason,
+                "thesis_id": str(d.thesis_id),
+                "thesis_type": str(d.thesis_type),
+                "state": str(d.state),
+                "confidence": d.confidence,
+                "bars_alive": d.bars_alive,
+                "entry": str(d.entry) if d.entry else None,
+                "stop": str(d.stop) if d.stop else None,
+                "target": str(d.target) if d.target else None,
+                "risk_ratio": risk_ratio,
+                "key_level": str(d.key_level) if d.key_level else None,
+                "sweep_low": str(d.sweep_low) if d.sweep_low else None,
+                "evidence_positive": ev_pos,
+                "evidence_negative": ev_neg,
+                "commit_conditions": d.commit_conditions,
+                "invalidation_conditions": d.invalidation_conditions,
+                "invalidation_reason": d.invalidation_reason,
                 "flip": {
                     "thesis_type": str(active.flip.thesis_type),
                     "state": str(active.flip.state),
