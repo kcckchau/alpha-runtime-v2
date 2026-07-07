@@ -785,6 +785,175 @@ function SetupsPanel({
   );
 }
 
+// ─── Flow panel ───────────────────────────────────────────────────────────────
+
+type FlowData = {
+  available: boolean;
+  bar_ts?: string;
+  total_volume?: number;
+  buy_volume?: number;
+  sell_volume?: number;
+  delta?: number;
+  delta_pct?: number | null;
+  large_buy_count?: number;
+  large_sell_count?: number;
+  large_trade_threshold?: number;
+  bid_ask_imbalance?: number | null;
+  twap_bid_size?: number | null;
+  twap_ask_size?: number | null;
+  trade_count?: number;
+  trade_velocity?: number | null;
+  avg_trade_size?: number | null;
+  is_genuine_sweep_reversal?: boolean;
+  is_v_reversal?: boolean;
+  absorption?: { detected: boolean; confidence: number; sell_volume_at_low: number };
+  split?: { sweep_volume: number; sweep_delta: number; recovery_volume: number; recovery_delta: number; recovery_ratio: number | null } | null;
+  has_trade_data?: boolean;
+  has_quote_data?: boolean;
+};
+
+function FlowPanel({ flow }: { flow: FlowData | null }) {
+  if (!flow || !flow.available) {
+    return (
+      <div style={{ ...S.panel, borderColor: "rgba(255,255,255,0.05)" }}>
+        <div style={S.panelHd}><span style={S.panelLbl}>Order Flow</span></div>
+        <div style={{ padding: "8px 10px", ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.2)" }}>
+          {flow ? "No flow data for this bar" : "Waiting…"}
+        </div>
+      </div>
+    );
+  }
+
+  const total = flow.total_volume ?? 0;
+  const buyVol = flow.buy_volume ?? 0;
+  const sellVol = flow.sell_volume ?? 0;
+  const buyPct = total > 0 ? (buyVol / total) * 100 : 50;
+  const sellPct = total > 0 ? (sellVol / total) * 100 : 50;
+  const delta = flow.delta ?? 0;
+  const deltaPct = flow.delta_pct ?? null;
+  const deltaColor = delta > 0 ? "#22c55e" : delta < 0 ? "#ef4444" : "rgba(255,255,255,0.4)";
+  const imbalance = flow.bid_ask_imbalance ?? null;
+  // bid_ask_imbalance = twap_bid / (bid+ask); >0.5 = bid-heavy (buyers); <0.5 = ask-heavy (sellers)
+  const imbalancePct = imbalance !== null ? Math.round(imbalance * 100) : null;
+  const imbalanceColor = imbalance !== null
+    ? imbalance > 0.55 ? "#22c55e" : imbalance < 0.45 ? "#ef4444" : "rgba(255,255,255,0.5)"
+    : "rgba(255,255,255,0.3)";
+
+  return (
+    <div style={{ ...S.panel, borderColor: "rgba(255,255,255,0.05)" }}>
+      <div style={S.panelHd}>
+        <span style={S.panelLbl}>Order Flow</span>
+        {!flow.has_trade_data && (
+          <span style={{ ...S.mono, fontSize: 8, color: "#fbbf24" }}>no tape</span>
+        )}
+      </div>
+      <div style={{ padding: "6px 10px", display: "flex", flexDirection: "column", gap: 6 }}>
+
+        {/* Buy / Sell volume bar */}
+        <div>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+            <span style={{ ...S.mono, fontSize: 9, color: "#22c55e" }}>B {buyVol.toLocaleString()}</span>
+            <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.3)" }}>vol {total.toLocaleString()}</span>
+            <span style={{ ...S.mono, fontSize: 9, color: "#ef4444" }}>{sellVol.toLocaleString()} S</span>
+          </div>
+          <div style={{ height: 6, borderRadius: 3, overflow: "hidden", display: "flex", background: "rgba(255,255,255,0.06)" }}>
+            <div style={{ width: `${buyPct}%`, background: "rgba(34,197,94,0.6)", transition: "width 0.3s" }} />
+            <div style={{ width: `${sellPct}%`, background: "rgba(239,68,68,0.6)", transition: "width 0.3s" }} />
+          </div>
+        </div>
+
+        {/* Delta */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.35)" }}>Delta</span>
+          <span style={{ ...S.mono, fontSize: 11, fontWeight: 600, color: deltaColor }}>
+            {delta > 0 ? "+" : ""}{delta.toLocaleString()}
+            {deltaPct !== null && (
+              <span style={{ fontSize: 9, fontWeight: 400, marginLeft: 4, color: "rgba(255,255,255,0.35)" }}>
+                ({deltaPct > 0 ? "+" : ""}{deltaPct}%)
+              </span>
+            )}
+          </span>
+        </div>
+
+        {/* Bid/Ask imbalance */}
+        {imbalancePct !== null && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+              <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.35)" }}>Quote pressure</span>
+              <span style={{ ...S.mono, fontSize: 9, color: imbalanceColor }}>
+                {imbalancePct > 50 ? `${imbalancePct}% bid` : `${100 - imbalancePct}% ask`}
+              </span>
+            </div>
+            <div style={{ height: 4, borderRadius: 2, overflow: "hidden", display: "flex", background: "rgba(255,255,255,0.06)" }}>
+              <div style={{ width: `${imbalancePct}%`, background: "rgba(34,197,94,0.5)", transition: "width 0.3s" }} />
+              <div style={{ width: `${100 - imbalancePct}%`, background: "rgba(239,68,68,0.5)", transition: "width 0.3s" }} />
+            </div>
+          </div>
+        )}
+
+        {/* Large trades */}
+        {((flow.large_buy_count ?? 0) > 0 || (flow.large_sell_count ?? 0) > 0) && (
+          <div style={{ display: "flex", justifyContent: "space-between" }}>
+            <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.35)" }}>
+              Large (≥{flow.large_trade_threshold})
+            </span>
+            <span style={{ ...S.mono, fontSize: 9 }}>
+              <span style={{ color: "#22c55e" }}>▲{flow.large_buy_count ?? 0}</span>
+              <span style={{ color: "rgba(255,255,255,0.2)", margin: "0 4px" }}>|</span>
+              <span style={{ color: "#ef4444" }}>▼{flow.large_sell_count ?? 0}</span>
+            </span>
+          </div>
+        )}
+
+        {/* Signals */}
+        {(flow.is_genuine_sweep_reversal || flow.is_v_reversal || flow.absorption?.detected) && (
+          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+            {flow.is_genuine_sweep_reversal && (
+              <span style={{ ...S.mono, fontSize: 8, padding: "1px 5px", borderRadius: 3, background: "rgba(34,197,94,0.15)", color: "#22c55e", border: "0.5px solid rgba(34,197,94,0.3)" }}>
+                SWEEP REVERSAL
+              </span>
+            )}
+            {flow.absorption?.detected && (
+              <span style={{ ...S.mono, fontSize: 8, padding: "1px 5px", borderRadius: 3, background: "rgba(96,165,250,0.15)", color: "#60a5fa", border: "0.5px solid rgba(96,165,250,0.3)" }}>
+                ABSORPTION {Math.round((flow.absorption.confidence ?? 0) * 100)}%
+              </span>
+            )}
+            {flow.is_v_reversal && !flow.is_genuine_sweep_reversal && (
+              <span style={{ ...S.mono, fontSize: 8, padding: "1px 5px", borderRadius: 3, background: "rgba(251,191,36,0.12)", color: "#fbbf24", border: "0.5px solid rgba(251,191,36,0.3)" }}>
+                V-SNAP
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Split bar */}
+        {flow.split && (
+          <div style={{ borderTop: "0.5px solid rgba(255,255,255,0.06)", paddingTop: 5 }}>
+            <div style={{ ...S.mono, fontSize: 8, color: "rgba(255,255,255,0.25)", marginBottom: 3 }}>Intrabar split</div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ ...S.mono, fontSize: 9, color: "#ef4444" }}>
+                Sweep Δ {flow.split.sweep_delta.toLocaleString()}
+              </span>
+              <span style={{ ...S.mono, fontSize: 9, color: "#22c55e" }}>
+                Recovery Δ +{flow.split.recovery_delta.toLocaleString()}
+                {flow.split.recovery_ratio !== null && (
+                  <span style={{ color: "rgba(255,255,255,0.35)", marginLeft: 4 }}>
+                    ({Math.round(flow.split.recovery_ratio * 100)}%)
+                  </span>
+                )}
+              </span>
+            </div>
+          </div>
+        )}
+
+        <div style={{ ...S.mono, fontSize: 8, color: "rgba(255,255,255,0.15)", marginTop: 1 }}>
+          {flow.trade_count ?? 0} trades · {flow.trade_velocity?.toFixed(1) ?? "—"}/s · avg {flow.avg_trade_size?.toFixed(1) ?? "—"} lots
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Freshness / debug card ────────────────────────────────────────────────────
 
 function FreshnessCard({ debug }: { debug: PipelineDebug | null }) {
@@ -1974,6 +2143,7 @@ export function Dashboard() {
   const flashRef = useRef<Set<string>>(new Set());
   const [flashSetupId, setFlashSetupId] = useState<string | null>(null);
   const [pipelineDebug, setPipelineDebug] = useState<PipelineDebug | null>(null);
+  const [flow, setFlow] = useState<FlowData | null>(null);
   // Tracks whether we've done the one-time bar history re-fetch after bootstrap.
   // Bootstrap fills a gap (up to ~20 min) in Parquet that the initial load missed;
   // the first pipeline_complete event signals bars are ready.
@@ -2273,6 +2443,8 @@ export function Dashboard() {
             .then((d) => d && setMarketStates((prev) => ({ ...prev, [selectedSymbol]: d }))).catch(() => {});
           fetchJson<SymbolContext>(`/runtime/context/${selectedSymbol}`)
             .then((d) => d && setContexts((prev) => ({ ...prev, [selectedSymbol]: d }))).catch(() => {});
+          fetchJson<FlowData>(`/runtime/flow/${selectedSymbol}`)
+            .then((d) => d && setFlow(d)).catch(() => {});
           // One-time bar history refresh after bootstrap: fills the gap between the
           // initial REST fetch (now-3min) and bars stored during the bootstrap period.
           if (!barsRefreshedRef.current) {
@@ -2664,6 +2836,7 @@ export function Dashboard() {
             onChange={(e) => {
               setSelectedSymbol(e.target.value);
               setBackfillJob(null);
+              setFlow(null);
             }}
             style={{
               background: "rgba(255,255,255,0.06)",
@@ -3049,7 +3222,10 @@ export function Dashboard() {
             flashSetupId={flashSetupId}
           />
 
-          {/* 5. Market microstructure */}
+          {/* 5. Order flow — last sealed bar's buy/sell pressure and imbalance */}
+          {selectedDate === null && <FlowPanel flow={flow} />}
+
+          {/* 6. Market microstructure */}
           <FeaturesPanel context={currentContext} isHistorical={!!selectedDate} />
           <MarketStatePanel marketState={displayMarketState} isHistorical={!!selectedDate} />
           <RiskPanel risk={riskState} />
