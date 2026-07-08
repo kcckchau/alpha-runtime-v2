@@ -802,6 +802,7 @@ class BootstrapEngine(BaseEngine):
             "orders": self._serialize_orders(),
             "risk": self._serialize_risk(),
             "pipeline": self._serialize_pipeline_debug(),
+            "feed_quality": self._serialize_feed_quality(),
         }
 
     def _serialize_pipeline_debug(self) -> dict[str, Any]:
@@ -824,6 +825,13 @@ class BootstrapEngine(BaseEngine):
                 "scored_setup_count": len(out.scored_setups),
             }
         return result
+
+    def _serialize_feed_quality(self) -> dict[str, Any]:
+        """Per-symbol data quality state from IngestionMonitor for the dashboard."""
+        from alpha.engines.live.monitor import IngestionMonitor
+        if not isinstance(self._ingestion_monitor, IngestionMonitor):
+            return {}
+        return self._ingestion_monitor.summary()
 
     def _serialize_engine(self, engine: BaseEngine) -> dict[str, Any]:
         details = self._engine_details(engine)

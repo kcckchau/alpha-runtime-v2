@@ -13,6 +13,14 @@ type EngineStatus = {
   details: Record<string, unknown>;
 };
 
+type FeedQualityEntry = {
+  quality: "clean" | "degraded" | "recovering" | "failed";
+  degraded_reason: string | null;
+  signals_allowed: boolean;
+  last_record_at: string | null;
+  last_bar_at: string | null;
+};
+
 type RuntimeStatus = {
   mode: string;
   symbols: string[];
@@ -20,6 +28,7 @@ type RuntimeStatus = {
   runtime_state: string;
   updated_at: string | null;
   runtime_available: boolean;
+  feed_quality: Record<string, FeedQualityEntry> | null;
 };
 
 type QuoteRow = {
@@ -3523,6 +3532,42 @@ export function Dashboard() {
               </div>
             ))}
           </div>
+
+          {/* ── Feed quality per symbol ── */}
+          {status?.feed_quality && Object.keys(status.feed_quality).length > 0 && (
+            <div style={{
+              borderTop: "0.5px solid rgba(255,255,255,0.06)",
+              paddingTop: 6, marginTop: 2,
+              display: "flex", flexWrap: "wrap", gap: 6, padding: "6px 12px",
+            }}>
+              <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.35)", marginRight: 4 }}>
+                Feed Quality
+              </span>
+              {Object.entries(status.feed_quality).map(([sym, fq]) => {
+                const color =
+                  fq.quality === "clean" ? "green"
+                  : fq.quality === "recovering" ? "amber"
+                  : "red";
+                return (
+                  <div
+                    key={sym}
+                    title={fq.degraded_reason ?? `${sym} — ${fq.quality}`}
+                    style={{ display: "flex", alignItems: "center", gap: 4 }}
+                  >
+                    <span style={{ ...S.mono, fontSize: 11, color: "rgba(255,255,255,0.6)" }}>
+                      {sym}
+                    </span>
+                    <Pill color={color}>{fq.quality}</Pill>
+                    {!fq.signals_allowed && (
+                      <span style={{ ...S.mono, fontSize: 10, color: "#ef4444" }}>
+                        signals blocked
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
     </div>
