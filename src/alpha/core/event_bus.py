@@ -99,14 +99,20 @@ class EventBus:
                 continue
             if sub.queue.full():
                 if sub.drop_if_full:
-                    # Subscriber only needs latest value — silently drop stale event.
-                    continue
-                logger.warning(
-                    "EventBus: queue full for subscription %s (%s/%s), applying backpressure",
-                    sub.subscription_id,
-                    event.event_type,
-                    event.symbol,
-                )
+                    # Subscriber only needs the latest value — evict the oldest stale event
+                    # so the incoming one can be enqueued. This preserves recency over ordering.
+                    try:
+                        sub.queue.get_nowait()
+                        sub.queue.task_done()
+                    except asyncio.QueueEmpty:
+                        pass
+                else:
+                    logger.warning(
+                        "EventBus: queue full for subscription %s (%s/%s), applying backpressure",
+                        sub.subscription_id,
+                        event.event_type,
+                        event.symbol,
+                    )
             await sub.queue.put(event)
 
     def subscribe(

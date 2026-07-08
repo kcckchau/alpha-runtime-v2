@@ -248,3 +248,10 @@ class VWAPEpisodeOutcome(StrEnum):
     RECLAIMED = "reclaimed"  # crossed from below to above
     BROKEN = "broken"        # crossed from above to below
     REJECTED = "rejected"    # cross_up quickly followed by cross_down (failed reclaim)
+
+
+class DataQualityState(StrEnum):
+    CLEAN      = "clean"       # feed healthy, signals allowed
+    DEGRADED   = "degraded"    # bar lag >250ms, silence >30s, or missed bar — signals blocked
+    RECOVERING = "recovering"  # first clean bar seen after DEGRADED, waiting for confirmation
+    FAILED     = "failed"      # silence >5min during RTH — signals blocked, needs investigation

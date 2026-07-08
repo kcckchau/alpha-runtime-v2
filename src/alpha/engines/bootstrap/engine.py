@@ -109,6 +109,10 @@ class BootstrapEngine(BaseEngine):
         self._flow_aggregators: list = []   # one BarFlowAggregator per symbol
         self._pipeline: object | None = None  # BarPipeline
 
+        # Ingestion quality monitor — shared between LiveIngestionEngine (writes)
+        # and PositionMonitor (kill switch reads)
+        self._ingestion_monitor: object | None = None  # IngestionMonitor
+
         # Notifications
         self._telegram_notifier: object | None = None
 
@@ -271,6 +275,7 @@ class BootstrapEngine(BaseEngine):
         from alpha.engines.feature.engine import FeatureEngine
         from alpha.engines.historical.engine import HistoricalDataEngine
         from alpha.engines.live.engine import LiveIngestionEngine
+        from alpha.engines.live.monitor import IngestionMonitor
         from alpha.engines.market_state.engine import MarketStateEngine
         from alpha.engines.order.engine import OrderEngine
         from alpha.engines.risk.engine import RiskEngine
@@ -279,12 +284,17 @@ class BootstrapEngine(BaseEngine):
         from alpha.engines.storage.engine import StorageEngine
         from alpha.engines.thesis.engine import ThesisEngine
 
+        self._ingestion_monitor = IngestionMonitor(
+            symbols=list(self._settings.runtime.symbols)
+        )
+
         self._storage = StorageEngine(self._settings, self._event_bus)
         self._historical = HistoricalDataEngine(
             self._settings, self._event_bus, self._registry, self._calendar
         )
         self._live = LiveIngestionEngine(
-            self._settings, self._event_bus, self._registry
+            self._settings, self._event_bus, self._registry,
+            ingestion_monitor=self._ingestion_monitor,
         )
         self._feature = FeatureEngine(
             self._settings, self._event_bus, self._registry, self._calendar, self._clock
@@ -445,9 +455,17 @@ class BootstrapEngine(BaseEngine):
             eng.attach()
             intrabar_engines[ticker] = eng
 
+        from alpha.engines.live.monitor import IngestionMonitor
+        ingestion_monitor = (
+            self._ingestion_monitor
+            if isinstance(self._ingestion_monitor, IngestionMonitor)
+            else None
+        )
+
         monitor = PositionMonitor(
             event_bus=self._event_bus,
             intrabar_engines=intrabar_engines,
+            ingestion_monitor=ingestion_monitor,
         )
         logger.info("PositionMonitor wired | symbols=%s", symbols)
         return monitor

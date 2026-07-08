@@ -19,6 +19,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from alpha.core.engine import BaseEngine
+from alpha.engines.live.monitor import IngestionMonitor
 from alpha.models.enums import EventType, BarTimeframe, OrderSide, SetupGrade, SetupType
 from alpha.models.events import AnyEvent, BarEvent, PipelineOutputEvent, QuoteEvent, ThesisEvent, PositionSignalEvent
 
@@ -85,12 +86,14 @@ class PositionMonitor(BaseEngine):
         intrabar_engines: dict[str, Any],   # symbol → IntrabarFlowEngine
         min_grade: SetupGrade = SetupGrade.A,
         timeout_bars: int = 120,            # S1 bars; 120 = 2 minutes
+        ingestion_monitor: IngestionMonitor | None = None,
     ) -> None:
         super().__init__()
         self._bus = event_bus
         self._intrabar_engines = intrabar_engines
         self._min_grade = min_grade
         self._timeout_bars = timeout_bars
+        self._ingestion_monitor = ingestion_monitor
         self._intrabar_broadcast: Any = None  # async callable(symbol, payload) injected at startup
 
         # symbol → {setup_id → Setup}
@@ -173,6 +176,18 @@ class PositionMonitor(BaseEngine):
         if pos is not None:
             await self._check_exit(pos, price, event.timestamp)
         else:
+            # Kill switch: block WOULD_ENTER when ingestion data quality is not CLEAN.
+            if (
+                self._ingestion_monitor is not None
+                and not self._ingestion_monitor.is_signal_allowed(sym)
+            ):
+                logger.debug(
+                    "PositionMonitor: entry blocked for %s — ingestion quality=%s (%s)",
+                    sym,
+                    self._ingestion_monitor.get_quality(sym),
+                    self._ingestion_monitor.get_degraded_reason(sym),
+                )
+                return
             await self._check_entry(sym, price, event.timestamp)
 
         await self._broadcast_intrabar(sym, event.timestamp)
