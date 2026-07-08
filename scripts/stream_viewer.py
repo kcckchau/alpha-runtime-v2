@@ -121,9 +121,18 @@ async def run_databento(settings, symbol: str, only: str | None) -> None:
     def to_dt(ts_ns: int) -> str:
         return datetime.fromtimestamp(ts_ns / 1e9, tz=_UTC).strftime("%H:%M:%S.%f")[:-3]
 
-    # Instrument id → ticker
+    # Resolve symbol → Databento continuous format (MNQ-09 → MNQ.c.0)
     id_map: dict[int, str] = {}
-    db_sym = f"{symbol}.c.0"
+    try:
+        from alpha.instruments import resolve_symbol
+        sym_def = resolve_symbol(symbol)
+        root = sym_def.root_symbol or sym_def.ticker
+        db_sym = f"{root}{settings.databento.continuous_suffix}"
+    except Exception:
+        root = symbol.split("-")[0]
+        db_sym = f"{root}{settings.databento.continuous_suffix}"
+
+    print(f"{DIM}  Resolving {symbol} → {CYAN}{db_sym}{RESET}\n")
 
     client = db.Live(key=settings.databento.api_key.get_secret_value())
 
