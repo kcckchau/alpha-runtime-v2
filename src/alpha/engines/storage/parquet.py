@@ -52,13 +52,27 @@ class ParquetStore:
         data_type: str,
         symbol: str,
         d: date,
+        dedup_key: str | None = None,
     ) -> Path:
+        """Write table to Parquet partition, appending to any existing data.
+
+        If dedup_key is provided, rows in the existing file whose dedup_key
+        value appears in the new table are removed before concatenation — i.e.
+        new rows win (upsert semantics). Use this for event types where the
+        same logical record may be written more than once (e.g. setups on restart).
+        """
         path = _partition_path(self._root, data_type, symbol, d)
         path.mkdir(parents=True, exist_ok=True)
         file_path = path / "data.parquet"
         if file_path.exists():
             try:
                 existing = pq.ParquetFile(file_path).read()
+                if dedup_key is not None and dedup_key in existing.schema.names and dedup_key in table.schema.names:
+                    # Remove existing rows whose dedup_key appears in the new table.
+                    new_keys = table.column(dedup_key)
+                    import pyarrow.compute as pc
+                    mask = pc.invert(pc.is_in(existing.column(dedup_key), value_set=new_keys))
+                    existing = existing.filter(mask)
                 # Use "permissive" so null-typed columns (e.g. optional string fields
                 # that happen to be None on the first write) merge cleanly with typed
                 # columns written in subsequent events.
