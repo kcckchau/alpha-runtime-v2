@@ -14,9 +14,10 @@ The engine supports runtime symbol add/remove without restart.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from alpha.config.settings import AlphaSettings
@@ -24,6 +25,7 @@ from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.engines.live.adapters.base import LiveFeedAdapter, TickHandlerT
+from alpha.engines.live.monitor import IngestionMonitor
 from alpha.models.enums import BarTimeframe, HealthStatus
 from alpha.models.events import BarEvent, OrderBookEvent, QuoteEvent, TradeEvent
 
@@ -70,11 +72,13 @@ class LiveIngestionEngine(BaseEngine):
         settings: AlphaSettings,
         event_bus: EventBus,
         registry: SymbolRegistry,
+        ingestion_monitor: IngestionMonitor | None = None,
     ) -> None:
         super().__init__()
         self._settings = settings
         self._event_bus = event_bus
         self._registry = registry
+        self._monitor = ingestion_monitor
         self._adapters: dict[str, LiveFeedAdapter] = {}
         self._bars_received: int = 0
         self._trades_received: int = 0
@@ -91,6 +95,7 @@ class LiveIngestionEngine(BaseEngine):
         # natively stream in-progress bars (e.g. Databento ohlcv-1m only delivers
         # completed bars). Keyed by symbol; reset on each new minute boundary.
         self._partial_accum: dict[str, _PartialAccum] = {}
+        self._health_task: asyncio.Task[None] | None = None
 
     @property
     def name(self) -> str:
@@ -100,6 +105,8 @@ class LiveIngestionEngine(BaseEngine):
 
     def register_adapter(self, adapter: LiveFeedAdapter) -> None:
         self._adapters[adapter.source_id] = adapter
+        if self._monitor is not None and hasattr(adapter, "set_skipped_records_handler"):
+            adapter.set_skipped_records_handler(self._monitor.on_skipped_records)
         logger.info("Registered live adapter: %s", adapter.source_id)
 
     @property
@@ -133,8 +140,12 @@ class LiveIngestionEngine(BaseEngine):
             return
 
         await adapter.subscribe_bars(symbols, BarTimeframe.M1, self._on_bar)
+        await adapter.subscribe_bars(symbols, BarTimeframe.S1, self._on_bar)
         await adapter.subscribe_trades(symbols, self._on_trade)
         await adapter.subscribe_quotes(symbols, self._on_quote)
+
+        if self._monitor is not None:
+            self._health_task = asyncio.create_task(self._health_check_loop())
 
         logger.info(
             "Live subscriptions active: %d symbols via %s",
@@ -142,6 +153,12 @@ class LiveIngestionEngine(BaseEngine):
         )
 
     async def _on_stop(self) -> None:
+        if self._health_task and not self._health_task.done():
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except asyncio.CancelledError:
+                pass
         for adapter in self._adapters.values():
             try:
                 await adapter.disconnect()
@@ -152,11 +169,24 @@ class LiveIngestionEngine(BaseEngine):
         connected = [
             sid for sid, a in self._adapters.items() if a.is_connected
         ]
+        queue_depths = self._event_bus.queue_depths()
+        any_backed_up = any(d["depth"] > d["maxsize"] * 0.5 for d in queue_depths)
+        if any_backed_up:
+            for d in queue_depths:
+                if d["depth"] > d["maxsize"] * 0.5:
+                    logger.warning(
+                        "EventBus queue backed up: %s/%s depth=%d/%d"
+                        " full_count=%d drop_count=%d",
+                        d["event_type"], d["symbol"],
+                        d["depth"], d["maxsize"],
+                        d["full_count"], d["drop_count"],
+                    )
         details = {
             "adapters_connected": connected,
             "bars_received": self._bars_received,
             "trades_received": self._trades_received,
             "quotes_received": self._quotes_received,
+            "queue_depths": queue_depths,
         }
         status = HealthStatus.HEALTHY if connected else HealthStatus.UNHEALTHY
         return EngineHealth(status, self.name, details)
@@ -202,6 +232,8 @@ class LiveIngestionEngine(BaseEngine):
             stale_partial = self._latest_partial_bars.get(sym)
             if stale_partial is not None and stale_partial.timestamp <= event.timestamp:
                 del self._latest_partial_bars[sym]
+            if self._monitor is not None:
+                self._monitor.on_bar_received(sym, event.timestamp, datetime.now(timezone.utc))
         # Only M1+ bars update the snapshot state used by the dashboard and REST API.
         # Sub-minute bars (S1) are published to the EventBus for the push WS only.
         _SNAPSHOT_TIMEFRAMES = {BarTimeframe.M1, BarTimeframe.M5, BarTimeframe.H1, BarTimeframe.D1}
@@ -211,6 +243,8 @@ class LiveIngestionEngine(BaseEngine):
 
     async def _on_trade(self, event: TradeEvent) -> None:
         self._trades_received += 1
+        if self._monitor is not None:
+            self._monitor.on_record_received(event.symbol)
         await self._event_bus.publish(event)
         self._update_partial_bar(event)
 
@@ -291,6 +325,8 @@ class LiveIngestionEngine(BaseEngine):
     async def _on_quote(self, event: QuoteEvent) -> None:
         self._quotes_received += 1
         self._latest_quotes[event.symbol] = event
+        if self._monitor is not None:
+            self._monitor.on_record_received(event.symbol)
         # Only publish to the EventBus when bid or ask price changes.
         # mbp-1 also fires on size-only changes (hundreds/sec for MNQ) which
         # would overflow subscriber queues. Downstream engines only care about price.
@@ -305,3 +341,10 @@ class LiveIngestionEngine(BaseEngine):
 
     async def _on_order_book(self, event: OrderBookEvent) -> None:
         await self._event_bus.publish(event)
+
+    async def _health_check_loop(self) -> None:
+        """Runs every second to detect RTH silence. Stopped in _on_stop."""
+        while True:
+            if self._monitor is not None:
+                self._monitor.check_health()
+            await asyncio.sleep(1.0)

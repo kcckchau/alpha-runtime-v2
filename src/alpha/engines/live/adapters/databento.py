@@ -44,8 +44,11 @@ from typing import TYPE_CHECKING
 import databento as db
 import databento_dbn as dbn
 
+from collections.abc import Callable
+
 from alpha.config.settings import DatabentoSettings
 from alpha.core.registry import SymbolRegistry
+from alpha.engines.live.ingress_observer import IngressObserver
 from alpha.engines.live.adapters.base import (
     BarHandlerT,
     BookHandlerT,
@@ -144,6 +147,13 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
         self._db_to_ticker: dict[str, str] = {}
         # schema → set of db_syms — used to replay subscriptions on reconnect.
         self._sub_specs: dict[str, set[str]] = defaultdict(set)
+
+        self._observer = IngressObserver()
+        self._skipped_records_handler: Callable[[], None] | None = None
+
+    def set_skipped_records_handler(self, fn: Callable[[], None]) -> None:
+        """Register a callback invoked when Databento reports SKIPPED_RECORDS."""
+        self._skipped_records_handler = fn
 
     @property
     def source_id(self) -> DataSourceId:
@@ -360,6 +370,8 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                         return
                     if not self._loop.is_running():
                         return
+                    arrival_ns = time.time_ns()
+                    self._observer.observe(record, arrival_ns)
                     try:
                         self._dispatch(record)
                     except Exception:
@@ -441,7 +453,13 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
         elif rtype_int == _RTYPE_SYMBOL_MAPPING:
             self._handle_symbol_mapping(record)
         elif rtype_int == _RTYPE_SYSTEM:
-            logger.debug("Databento system: %s", getattr(record, "msg", ""))
+            msg = getattr(record, "msg", "") or ""
+            if "SKIPPED" in msg.upper():
+                logger.warning("Databento SKIPPED_RECORDS: %s", msg)
+                if self._skipped_records_handler is not None:
+                    self._skipped_records_handler()
+            else:
+                logger.debug("Databento system: %s", msg)
         elif rtype_int == _RTYPE_ERROR:
             logger.error("Databento error: %s", getattr(record, "err", record))
 

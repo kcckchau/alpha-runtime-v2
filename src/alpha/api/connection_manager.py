@@ -17,7 +17,7 @@ from decimal import Decimal
 from fastapi import WebSocket
 
 from alpha.models.enums import BarTimeframe, EventType
-from alpha.models.events import AnyEvent, BarEvent, QuoteEvent
+from alpha.models.events import AnyEvent, BarEvent, PipelineOutputEvent, PositionSignalEvent, QuoteEvent, SetupEvent, ThesisEvent
 
 logger = logging.getLogger(__name__)
 
@@ -85,13 +85,17 @@ class ConnectionManager:
     # ── EventBus subscription ─────────────────────────────────────────────────
 
     def subscribe_to_event_bus(self, event_bus: object) -> None:
-        """Subscribe to the EventBus for bar and quote events."""
+        """Subscribe to the EventBus for bar, quote, setup, and thesis events."""
         from alpha.core.event_bus import EventBus
         if not isinstance(event_bus, EventBus):
             return
         event_bus.subscribe(EventType.BAR, self._on_bar)
         event_bus.subscribe(EventType.QUOTE, self._on_quote, drop_if_full=True)
-        logger.info("ConnectionManager: subscribed to EventBus (BAR + QUOTE)")
+        event_bus.subscribe(EventType.SETUP, self._on_setup)
+        event_bus.subscribe(EventType.THESIS, self._on_thesis)
+        event_bus.subscribe(EventType.PIPELINE_OUTPUT, self._on_pipeline_output)
+        event_bus.subscribe(EventType.POSITION_SIGNAL, self._on_position_signal)
+        logger.info("ConnectionManager: subscribed to EventBus (BAR + QUOTE + SETUP + THESIS + PIPELINE_OUTPUT + POSITION_SIGNAL)")
 
     # ── EventBus handlers ─────────────────────────────────────────────────────
 
@@ -128,6 +132,133 @@ class ConnectionManager:
             "last_size": event.last_size,
         }
         await self._broadcast(event.symbol, payload)
+
+    async def _on_setup(self, event: AnyEvent) -> None:
+        if not isinstance(event, SetupEvent):
+            return
+        payload = {
+            "type": "setup",
+            "symbol": event.symbol,
+            "timestamp": event.timestamp.isoformat(),
+            "setup_id": str(event.setup_id),
+            "setup_type": str(event.setup_type),
+            "setup_state": str(event.setup_state),
+            "prev_state": str(event.prev_state) if event.prev_state else None,
+        }
+        await self._broadcast(event.symbol, payload)
+
+    async def _on_thesis(self, event: AnyEvent) -> None:
+        if not isinstance(event, ThesisEvent):
+            return
+        payload = {
+            "type": "thesis",
+            "symbol": event.symbol,
+            "timestamp": event.timestamp.isoformat(),
+            "thesis_id": str(event.thesis_id),
+            "thesis_type": str(event.thesis_type),
+            "thesis_state": str(event.thesis_state),
+            "confidence": event.confidence,
+            "bars_alive": event.bars_alive,
+            "entry": str(event.entry) if event.entry else None,
+            "stop": str(event.stop) if event.stop else None,
+            "target": str(event.target) if event.target else None,
+            "risk_ratio": event.risk_ratio,
+            "evidence_positive": event.evidence_positive,
+            "evidence_negative": event.evidence_negative,
+            "invalidation_reason": event.invalidation_reason,
+        }
+        await self._broadcast(event.symbol, payload)
+
+    async def _on_pipeline_output(self, event: AnyEvent) -> None:
+        if not isinstance(event, PipelineOutputEvent):
+            return
+        ms = event.market_state
+        thesis = event.thesis
+        fc = event.flow_context
+
+        flow_payload = None
+        if fc is not None:
+            split = None
+            if fc.split is not None:
+                split = {
+                    "sweep_volume": fc.split.sweep_volume,
+                    "sweep_delta": fc.split.sweep_delta,
+                    "recovery_volume": fc.split.recovery_volume,
+                    "recovery_delta": fc.split.recovery_delta,
+                    "recovery_ratio": round(fc.split.recovery_ratio, 2) if fc.split.recovery_ratio is not None else None,
+                }
+            flow_payload = {
+                "available": True,
+                "total_volume": fc.total_volume,
+                "buy_volume": fc.buy_volume,
+                "sell_volume": fc.sell_volume,
+                "delta": fc.delta,
+                "delta_pct": round(fc.delta_pct, 1) if fc.delta_pct is not None else None,
+                "large_buy_count": fc.large_buy_count,
+                "large_sell_count": fc.large_sell_count,
+                "large_trade_threshold": fc.large_trade_threshold,
+                "bid_ask_imbalance": round(fc.bid_ask_imbalance, 3) if fc.bid_ask_imbalance is not None else None,
+                "twap_bid_size": round(fc.twap_bid_size, 1) if fc.twap_bid_size is not None else None,
+                "twap_ask_size": round(fc.twap_ask_size, 1) if fc.twap_ask_size is not None else None,
+                "trade_count": fc.trade_count,
+                "trade_velocity": round(fc.trade_velocity, 2) if fc.trade_velocity is not None else None,
+                "avg_trade_size": round(fc.avg_trade_size, 1) if fc.avg_trade_size is not None else None,
+                "is_genuine_sweep_reversal": fc.is_genuine_sweep_reversal,
+                "is_v_reversal": fc.is_v_reversal,
+                "absorption": {
+                    "detected": fc.absorption.detected,
+                    "confidence": round(fc.absorption.confidence, 2),
+                    "sell_volume_at_low": fc.absorption.sell_volume_at_low,
+                },
+                "split": split,
+                "has_trade_data": fc.has_trade_data,
+                "has_quote_data": fc.has_quote_data,
+            }
+
+        payload = {
+            "type": "pipeline_complete",
+            "symbol": event.symbol,
+            "timestamp": event.timestamp.isoformat(),
+            "pipeline_ts": event.pipeline_ts.isoformat(),
+            "flow_available": fc is not None,
+            "flow": flow_payload,
+            "market_state_ts": ms.timestamp.isoformat() if ms and hasattr(ms, "timestamp") else None,
+            "thesis_type": str(thesis.dominant.thesis_type) if thesis else None,
+            "active_setup_count": len(event.setups),
+            "scored_setup_count": len(event.scored_setups),
+        }
+        await self._broadcast(event.symbol, payload)
+
+    async def _on_position_signal(self, event: AnyEvent) -> None:
+        if not isinstance(event, PositionSignalEvent):
+            return
+        payload = {
+            "type": "position_signal",
+            "symbol": event.symbol,
+            "timestamp": event.timestamp.isoformat(),
+            "signal_type": event.signal_type,
+            "setup_id": str(event.setup_id),
+            "setup_type": str(event.setup_type),
+            "direction": str(event.direction),
+            "entry_price": str(event.entry_price),
+            "stop": str(event.stop),
+            "target": str(event.target),
+            "current_price": str(event.current_price),
+            "grade": str(event.grade),
+            "intrabar_delta": event.intrabar_delta,
+            "bid_ask_imbalance": event.bid_ask_imbalance,
+            "exit_reason": event.exit_reason,
+            "pnl_pts": str(event.pnl_pts) if event.pnl_pts is not None else None,
+            "bars_held": event.bars_held,
+            "bars_held_so_far": event.bars_held_so_far,
+            "mfe": str(event.mfe) if event.mfe is not None else None,
+            "mae": str(event.mae) if event.mae is not None else None,
+        }
+        await self._broadcast(event.symbol, payload)
+
+    async def broadcast(self, symbol: str, payload: dict) -> None:  # type: ignore[type-arg]
+        """Public broadcast — for use by engines that need to push directly to WS clients."""
+        await self._broadcast(symbol, payload)
 
     # ── Broadcast ─────────────────────────────────────────────────────────────
 

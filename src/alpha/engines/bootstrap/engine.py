@@ -41,7 +41,8 @@ from alpha.core.engine import BaseEngine
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.instruments import resolve_symbol
-from alpha.models.enums import AssetClass, BarTimeframe, EngineState, RuntimeMode
+from alpha.models.enums import AssetClass, BarTimeframe, EngineState, EventType, RuntimeMode, SetupState
+from alpha.models.events import AnyEvent, SetupEvent
 from alpha.models.symbol import Symbol
 from alpha.runtime_status import write_snapshot
 from alpha.timeframe_context import build_symbol_context
@@ -104,6 +105,27 @@ class BootstrapEngine(BaseEngine):
         self._startup_context: dict[str, dict[str, Any]] = {}
         self._ibkr_conn: object | None = None  # IBKRConnection, kept for clean shutdown
 
+        # Flow pipeline (not BaseEngines — no lifecycle management needed)
+        self._flow_aggregators: list = []   # one BarFlowAggregator per symbol
+        self._pipeline: object | None = None  # BarPipeline
+
+        # Ingestion quality monitor — shared between LiveIngestionEngine (writes)
+        # and PositionMonitor (kill switch reads)
+        self._ingestion_monitor: object | None = None  # IngestionMonitor
+
+        # Notifications
+        self._telegram_notifier: object | None = None
+
+        # Terminal setup cache: symbol → {setup_id_str → (setup_dict, bar_count_at_terminal)}
+        # Keeps FAILED/INVALIDATED/EXPIRED setups visible in status.json for _TERMINAL_TTL_BARS bars.
+        self._terminal_setups: dict[str, dict[str, tuple[dict, int]]] = {}
+        self._terminal_setup_bar_count: int = 0  # incremented on each M1 bar
+        _TERMINAL_TTL_BARS = 10
+        self._terminal_ttl = _TERMINAL_TTL_BARS
+
+        # Last PipelineOutput per symbol — authoritative snapshot for status.json
+        self._last_pipeline_output: dict[str, object] = {}  # symbol → PipelineOutputEvent
+
     @property
     def name(self) -> str:
         return "BootstrapEngine"
@@ -136,7 +158,7 @@ class BootstrapEngine(BaseEngine):
             self._settings.runtime.mode,
             self._settings.runtime.symbols,
         )
-
+        self._cleanup_stale_tmp_files()
         self._configure_clock()
         self._populate_registry()
         await self._event_bus.start()
@@ -154,7 +176,13 @@ class BootstrapEngine(BaseEngine):
             await engine.start()
 
         self._write_runtime_snapshot()
+        self._event_bus.subscribe(EventType.SETUP, self._on_setup_event)
+        self._event_bus.subscribe(EventType.PIPELINE_OUTPUT, self._on_pipeline_output)
         self._status_task = asyncio.create_task(self._status_loop())
+        if self._telegram_notifier is not None:
+            from alpha.notifications.telegram import TelegramNotifier
+            if isinstance(self._telegram_notifier, TelegramNotifier):
+                await self._telegram_notifier.start()
 
         if mode in {RuntimeMode.LIVE, RuntimeMode.PAPER}:
             if self._live is not None:
@@ -165,6 +193,13 @@ class BootstrapEngine(BaseEngine):
                 if self._feature is not None:
                     await self._live.subscribe_tick_trades(self._feature.record_trade)
             await self._run_catchup()
+            if self._storage is not None:
+                await self._storage.flush()
+            # Immediately fill the tail gap (now-3m → now-1m) that the
+            # 3-minute ingestion-lag buffer left behind.  Without this, the
+            # status loop would fill it 30 seconds later (tick 30), leaving
+            # the chart visually missing 2-3 bars at startup.
+            await self._run_tail_catchup()
             if self._storage is not None:
                 await self._storage.flush()
             logger.info("Catch-up complete — live feed remains active")
@@ -181,6 +216,10 @@ class BootstrapEngine(BaseEngine):
                 await self._status_task
             except asyncio.CancelledError:
                 pass
+        if self._telegram_notifier is not None:
+            from alpha.notifications.telegram import TelegramNotifier
+            if isinstance(self._telegram_notifier, TelegramNotifier):
+                await self._telegram_notifier.stop()
         for engine in reversed(self._engines):
             await engine.stop()
         # Disconnect IBKR after engines stop (subscriptions are already cancelled
@@ -194,6 +233,20 @@ class BootstrapEngine(BaseEngine):
         self._write_runtime_snapshot()
 
     # ── Private ───────────────────────────────────────────────────────────────
+
+    def _cleanup_stale_tmp_files(self) -> None:
+        """Remove temp files left behind by previous crashed runs."""
+        from alpha.runtime_status import snapshot_path
+        runtime_dir = snapshot_path(self._settings).parent
+        removed = 0
+        for p in runtime_dir.glob("tmp*"):
+            try:
+                p.unlink()
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            logger.info("Cleaned up %d stale temp file(s) from previous run", removed)
 
     def _configure_clock(self) -> None:
         mode = self._settings.runtime.mode
@@ -222,6 +275,7 @@ class BootstrapEngine(BaseEngine):
         from alpha.engines.feature.engine import FeatureEngine
         from alpha.engines.historical.engine import HistoricalDataEngine
         from alpha.engines.live.engine import LiveIngestionEngine
+        from alpha.engines.live.monitor import IngestionMonitor
         from alpha.engines.market_state.engine import MarketStateEngine
         from alpha.engines.order.engine import OrderEngine
         from alpha.engines.risk.engine import RiskEngine
@@ -230,12 +284,17 @@ class BootstrapEngine(BaseEngine):
         from alpha.engines.storage.engine import StorageEngine
         from alpha.engines.thesis.engine import ThesisEngine
 
+        self._ingestion_monitor = IngestionMonitor(
+            symbols=list(self._settings.runtime.symbols)
+        )
+
         self._storage = StorageEngine(self._settings, self._event_bus)
         self._historical = HistoricalDataEngine(
             self._settings, self._event_bus, self._registry, self._calendar
         )
         self._live = LiveIngestionEngine(
-            self._settings, self._event_bus, self._registry
+            self._settings, self._event_bus, self._registry,
+            ingestion_monitor=self._ingestion_monitor,
         )
         self._feature = FeatureEngine(
             self._settings, self._event_bus, self._registry, self._calendar, self._clock
@@ -257,6 +316,9 @@ class BootstrapEngine(BaseEngine):
 
         self._wire_ibkr()
         self._wire_databento()
+        self._wire_pipeline()
+        self._position_monitor = self._wire_position_monitor()
+        self._wire_notifications()
 
         self._engines = [
             self._storage,
@@ -269,6 +331,7 @@ class BootstrapEngine(BaseEngine):
             self._scoring,
             self._risk,
             self._order,
+            self._position_monitor,
         ]
 
     def _wire_ibkr(self) -> None:
@@ -330,6 +393,89 @@ class BootstrapEngine(BaseEngine):
             )
 
         logger.info("Databento adapters registered (dataset=%s)", self._settings.databento.dataset)
+
+    def _wire_pipeline(self) -> None:
+        """
+        Wire BarFlowAggregator (one per symbol) and BarPipeline into the EventBus.
+
+        BarFlowAggregator subscribes to TRADE + QUOTE + BAR and emits BAR_BUNDLE.
+        BarPipeline subscribes to BAR_BUNDLE and calls engines in explicit order.
+        """
+        from alpha.engines.flow.aggregator import BarFlowAggregator
+        from alpha.engines.flow.pipeline import BarPipeline
+
+        symbols = self._settings.runtime.symbols
+        large_trade_threshold = getattr(
+            self._settings.runtime, "large_trade_threshold", 10
+        )
+
+        for ticker in symbols:
+            agg = BarFlowAggregator(
+                symbol=ticker,
+                event_bus=self._event_bus,
+                large_trade_threshold=large_trade_threshold,
+            )
+            agg.attach()
+            self._flow_aggregators.append(agg)
+
+        pipeline = BarPipeline(self._event_bus)
+        if self._feature is not None:
+            pipeline.set_feature_engine(self._feature)
+        if self._market_state is not None:
+            pipeline.set_market_state_engine(self._market_state)
+        if self._thesis is not None:
+            pipeline.set_thesis_engine(self._thesis)
+        if self._setup is not None:
+            pipeline.set_setup_engine(self._setup)
+        if self._scoring is not None:
+            pipeline.set_scoring_engine(self._scoring)
+        pipeline.attach()
+        self._pipeline = pipeline
+
+        logger.info(
+            "BarPipeline wired | symbols=%s | aggregators=%d",
+            symbols, len(self._flow_aggregators),
+        )
+
+    def _wire_position_monitor(self) -> "PositionMonitor":  # type: ignore[name-defined]
+        """Wire IntrabarFlowEngine (one per symbol) and PositionMonitor."""
+        from alpha.engines.flow.intrabar import IntrabarFlowEngine
+        from alpha.engines.position.engine import PositionMonitor
+
+        symbols = self._settings.runtime.symbols
+        large_trade_threshold = getattr(self._settings.runtime, "large_trade_threshold", 10)
+
+        intrabar_engines: dict[str, IntrabarFlowEngine] = {}
+        for ticker in symbols:
+            eng = IntrabarFlowEngine(
+                symbol=ticker,
+                event_bus=self._event_bus,
+                large_trade_threshold=large_trade_threshold,
+            )
+            eng.attach()
+            intrabar_engines[ticker] = eng
+
+        from alpha.engines.live.monitor import IngestionMonitor
+        ingestion_monitor = (
+            self._ingestion_monitor
+            if isinstance(self._ingestion_monitor, IngestionMonitor)
+            else None
+        )
+
+        monitor = PositionMonitor(
+            event_bus=self._event_bus,
+            intrabar_engines=intrabar_engines,
+            ingestion_monitor=ingestion_monitor,
+        )
+        logger.info("PositionMonitor wired | symbols=%s", symbols)
+        return monitor
+
+    def _wire_notifications(self) -> None:
+        """Create TelegramNotifier if configured."""
+        from alpha.notifications.telegram import TelegramNotifier
+        self._telegram_notifier = TelegramNotifier(
+            self._settings.telegram, self._event_bus
+        )
 
     async def _run_catchup(self) -> None:
         """Load recent history before connecting the live feed."""
@@ -650,11 +796,42 @@ class BootstrapEngine(BaseEngine):
             "contexts": self._startup_context,
             "market_states": self._serialize_market_states(),
             "setups": self._serialize_setups(),
+            "thesis": self._serialize_thesis(),
             "setup_contexts": self._serialize_setup_contexts(),
             "prev_setup_contexts": self._serialize_prev_setup_contexts(),
             "orders": self._serialize_orders(),
             "risk": self._serialize_risk(),
+            "pipeline": self._serialize_pipeline_debug(),
+            "feed_quality": self._serialize_feed_quality(),
         }
+
+    def _serialize_pipeline_debug(self) -> dict[str, Any]:
+        """Per-symbol pipeline timestamps for UI staleness detection."""
+        result: dict[str, Any] = {}
+        for sym, out in self._last_pipeline_output.items():
+            from alpha.models.events import PipelineOutputEvent
+            if not isinstance(out, PipelineOutputEvent):
+                continue
+            ms = out.market_state
+            thesis = out.thesis
+            result[sym] = {
+                "pipeline_ts": out.pipeline_ts.isoformat(),
+                "bar_ts": out.timestamp.isoformat(),
+                "snapshot_ts": out.bar_snapshot.timestamp.isoformat() if out.bar_snapshot and hasattr(out.bar_snapshot, "timestamp") else None,
+                "market_state_ts": ms.timestamp.isoformat() if ms and hasattr(ms, "timestamp") else None,
+                "thesis_type": str(thesis.dominant.thesis_type) if thesis else None,
+                "flow_available": out.flow_context is not None,
+                "active_setup_count": len(out.setups),
+                "scored_setup_count": len(out.scored_setups),
+            }
+        return result
+
+    def _serialize_feed_quality(self) -> dict[str, Any]:
+        """Per-symbol data quality state from IngestionMonitor for the dashboard."""
+        from alpha.engines.live.monitor import IngestionMonitor
+        if not isinstance(self._ingestion_monitor, IngestionMonitor):
+            return {}
+        return self._ingestion_monitor.summary()
 
     def _serialize_engine(self, engine: BaseEngine) -> dict[str, Any]:
         details = self._engine_details(engine)
@@ -755,14 +932,112 @@ class BootstrapEngine(BaseEngine):
                 states[symbol] = state.model_dump(mode="json")
         return states
 
+    async def _on_pipeline_output(self, event: AnyEvent) -> None:
+        """Cache the latest PipelineOutputEvent per symbol for status.json."""
+        from alpha.models.events import PipelineOutputEvent
+        if not isinstance(event, PipelineOutputEvent):
+            return
+        self._last_pipeline_output[event.symbol] = event
+
+    async def _on_setup_event(self, event: AnyEvent) -> None:
+        """Cache terminal setups so they stay visible in status.json for _terminal_ttl bars."""
+        if not isinstance(event, SetupEvent):
+            return
+        terminal_states = {SetupState.FAILED, SetupState.INVALIDATED, SetupState.EXPIRED}
+        sym = event.symbol
+        sid = str(event.setup_id)
+        if event.setup_state in terminal_states:
+            if sym not in self._terminal_setups:
+                self._terminal_setups[sym] = {}
+            # Build a minimal dict for the terminal entry
+            self._terminal_setups[sym][sid] = (
+                {
+                    "setup_id": sid,
+                    "symbol": sym,
+                    "setup_type": str(event.setup_type),
+                    "setup_state": str(event.setup_state),
+                    "timestamp": event.timestamp.isoformat(),
+                    "_terminal": True,
+                },
+                self._terminal_setup_bar_count,
+            )
+        else:
+            # Non-terminal transition — remove from terminal cache if present
+            if sym in self._terminal_setups:
+                self._terminal_setups[sym].pop(sid, None)
+
     def _serialize_setups(self) -> list[dict[str, Any]]:
         if self._setup is None:
             return []
         setups: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+
+        # Active (FORMING / CONFIRMED / TRIGGERED)
         for symbol in self._settings.runtime.symbols:
             for setup in self._setup.active_setups(symbol):
-                setups.append(setup.model_dump(mode="json"))
+                d = setup.model_dump(mode="json")
+                setups.append(d)
+                seen_ids.add(str(setup.setup_id))
+
+        # Terminal with TTL — keep for _terminal_ttl bars after transition
+        self._terminal_setup_bar_count = getattr(self._setup, "_bar_counts", {}).get(
+            self._settings.runtime.symbols[0] if self._settings.runtime.symbols else "", 0
+        )
+        for sym, cache in self._terminal_setups.items():
+            expired_ids = []
+            for sid, (setup_dict, bar_at_terminal) in cache.items():
+                age = self._terminal_setup_bar_count - bar_at_terminal
+                if age > self._terminal_ttl:
+                    expired_ids.append(sid)
+                elif sid not in seen_ids:
+                    setups.append(setup_dict)
+            for sid in expired_ids:
+                cache.pop(sid, None)
+
         return setups
+
+    def _serialize_thesis(self) -> dict[str, Any]:
+        if self._thesis is None:
+            return {}
+        result: dict[str, Any] = {}
+        for symbol in self._settings.runtime.symbols:
+            active = self._thesis.get_thesis(symbol)
+            if active is None:
+                continue
+            d = active.dominant
+            # Derive risk_ratio from entry/stop/target if available
+            risk_ratio: float | None = None
+            if d.entry and d.stop and d.target:
+                risk = abs(float(d.entry - d.stop))
+                reward = abs(float(d.target - d.entry))
+                risk_ratio = round(reward / risk, 2) if risk > 0 else None
+            # Split evidence into positive/negative by weight sign
+            ev_pos = [e.text for e in d.evidence if e.weight >= 0]
+            ev_neg = [e.text for e in d.evidence if e.weight < 0]
+            result[symbol] = {
+                "thesis_id": str(d.thesis_id),
+                "thesis_type": str(d.thesis_type),
+                "state": str(d.state),
+                "confidence": d.confidence,
+                "bars_alive": d.bars_alive,
+                "entry": str(d.entry) if d.entry else None,
+                "stop": str(d.stop) if d.stop else None,
+                "target": str(d.target) if d.target else None,
+                "risk_ratio": risk_ratio,
+                "key_level": str(d.key_level) if d.key_level else None,
+                "sweep_low": str(d.sweep_low) if d.sweep_low else None,
+                "evidence_positive": ev_pos,
+                "evidence_negative": ev_neg,
+                "commit_conditions": d.commit_conditions,
+                "invalidation_conditions": d.invalidation_conditions,
+                "invalidation_reason": d.invalidation_reason,
+                "flip": {
+                    "thesis_type": str(active.flip.thesis_type),
+                    "state": str(active.flip.state),
+                    "confidence": active.flip.confidence,
+                } if active.flip else None,
+            }
+        return result
 
     def _serialize_orders(self) -> list[dict[str, Any]]:
         if self._order is None:

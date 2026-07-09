@@ -465,3 +465,63 @@ async def get_thesis(symbol: str) -> dict[str, Any]:
         "dominant": _serialize(active.dominant),
         "flip": _serialize(active.flip),
     }
+
+
+@router.get("/flow/{symbol}")
+async def get_flow(symbol: str) -> dict[str, Any]:
+    """Return the latest bar's flow context (delta, buy/sell volume, imbalance) for a symbol."""
+    from alpha.runtime_registry import get_bootstrap
+    bootstrap = get_bootstrap()
+    if bootstrap is None:
+        return {"symbol": symbol.upper(), "available": False}
+
+    last = bootstrap._last_pipeline_output.get(symbol.upper())  # type: ignore[attr-defined]
+    if last is None:
+        return {"symbol": symbol.upper(), "available": False}
+
+    fc = last.flow_context
+    if fc is None:
+        return {"symbol": symbol.upper(), "available": False, "bar_ts": last.timestamp.isoformat()}
+
+    def _pct(v: float | None) -> float | None:
+        return round(v, 1) if v is not None else None
+
+    split = None
+    if fc.split is not None:
+        split = {
+            "sweep_volume": fc.split.sweep_volume,
+            "sweep_delta": fc.split.sweep_delta,
+            "recovery_volume": fc.split.recovery_volume,
+            "recovery_delta": fc.split.recovery_delta,
+            "recovery_ratio": round(fc.split.recovery_ratio, 2) if fc.split.recovery_ratio is not None else None,
+        }
+
+    return {
+        "symbol": symbol.upper(),
+        "available": True,
+        "bar_ts": last.timestamp.isoformat(),
+        "total_volume": fc.total_volume,
+        "buy_volume": fc.buy_volume,
+        "sell_volume": fc.sell_volume,
+        "delta": fc.delta,
+        "delta_pct": _pct(fc.delta_pct),
+        "large_buy_count": fc.large_buy_count,
+        "large_sell_count": fc.large_sell_count,
+        "large_trade_threshold": fc.large_trade_threshold,
+        "bid_ask_imbalance": round(fc.bid_ask_imbalance, 3) if fc.bid_ask_imbalance is not None else None,
+        "twap_bid_size": round(fc.twap_bid_size, 1) if fc.twap_bid_size is not None else None,
+        "twap_ask_size": round(fc.twap_ask_size, 1) if fc.twap_ask_size is not None else None,
+        "trade_count": fc.trade_count,
+        "trade_velocity": round(fc.trade_velocity, 2) if fc.trade_velocity is not None else None,
+        "avg_trade_size": round(fc.avg_trade_size, 1) if fc.avg_trade_size is not None else None,
+        "is_genuine_sweep_reversal": fc.is_genuine_sweep_reversal,
+        "is_v_reversal": fc.is_v_reversal,
+        "absorption": {
+            "detected": fc.absorption.detected,
+            "confidence": round(fc.absorption.confidence, 2),
+            "sell_volume_at_low": fc.absorption.sell_volume_at_low,
+        },
+        "split": split,
+        "has_trade_data": fc.has_trade_data,
+        "has_quote_data": fc.has_quote_data,
+    }

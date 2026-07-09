@@ -34,7 +34,7 @@ from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.config.settings import AlphaSettings
 from alpha.models.enums import BarTimeframe, EventType, HealthStatus, ThesisState, ThesisType
-from alpha.models.events import AnyEvent, BarEvent, QuoteEvent, ThesisEvent, TradeEvent
+from alpha.models.events import AnyEvent, BarBundleEvent, BarEvent, QuoteEvent, ThesisEvent, TradeEvent
 from alpha.models.thesis import (
     ActiveThesis,
     EvidenceItem,
@@ -119,6 +119,7 @@ class ThesisEngine(BaseEngine):
 
         # Latest QuoteEvent per symbol — used for bid/ask imbalance in tick flow
         self._latest_quotes: dict[str, QuoteEvent] = {}
+        self._pipeline_mode: bool = False  # set True by BarPipeline before engine.start()
 
     @property
     def name(self) -> str:
@@ -160,6 +161,70 @@ class ThesisEngine(BaseEngine):
     def get_thesis(self, symbol: str) -> ActiveThesis | None:
         return self._active.get(symbol)
 
+    # ── Public pipeline API ───────────────────────────────────────────────────
+
+    async def process_bar(
+        self,
+        snap: BarSnapshot,
+        market_state,           # MarketState — typed loosely to avoid circular import
+        bundle: BarBundleEvent,
+    ) -> "ActiveThesis | None":
+        """
+        Stage 3 of the sequential pipeline.
+
+        Called by BarPipeline with snapshot and market state already computed.
+        Returns the current ActiveThesis (or None) after processing.
+        """
+        symbol = bundle.symbol
+        bar = bundle.to_bar_event()
+
+        if self._feature_engine is None:
+            return None
+
+        level = self._feature_engine.get_level_memory(symbol)
+        if level is None:
+            return None
+
+        self._bars_processed += 1
+        tick = self._compute_tick_flow(symbol, bar.timestamp)
+        self._update_session_baseline(symbol, bar.timestamp)
+
+        active = self._active.get(symbol)
+
+        if active is None or active.dominant.state in {
+            ThesisState.TRIGGERED,
+            ThesisState.EXPIRED,
+        }:
+            candidate = self._detect_thesis(symbol, snap, level, bar)
+            if candidate is not None:
+                flip = self._build_flip_candidate(candidate, snap, level)
+                self._active[symbol] = ActiveThesis(dominant=candidate, flip=flip)
+                self._thesis_created += 1
+                logger.info(
+                    "ThesisEngine: new thesis %s %s for %s",
+                    candidate.thesis_type, candidate.state, symbol,
+                )
+        else:
+            self._update_thesis(active, snap, level, tick, bar)
+
+            if active.dominant.state == ThesisState.INVALIDATED and active.flip is not None:
+                logger.info(
+                    "ThesisEngine: %s invalidated (%s) → flipping to %s",
+                    active.dominant.thesis_type,
+                    active.dominant.invalidation_reason,
+                    active.flip.thesis_type,
+                )
+                active.dominant = active.flip
+                active.dominant.state = ThesisState.WATCHING
+                active.flip = None
+            elif active.dominant.state in {ThesisState.INVALIDATED, ThesisState.FLIPPED}:
+                del self._active[symbol]
+
+        current = self._active.get(symbol)
+        if current is not None:
+            await self._emit(current.dominant, snap, level, bar)
+        return current
+
     # ── Event handlers ────────────────────────────────────────────────────────
 
     async def _handle_bar(self, event: AnyEvent) -> None:
@@ -169,6 +234,8 @@ class ThesisEngine(BaseEngine):
             return
         if event.is_partial:
             return
+        if self._pipeline_mode:
+            return  # BarPipeline owns M1 processing
 
         self._bars_processed += 1
         symbol = event.symbol

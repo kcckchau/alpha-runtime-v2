@@ -21,10 +21,12 @@ from alpha.models.enums import (
     OrderSide,
     OrderStatus,
     ORBState,
+    SetupGrade,
     SetupState,
     SetupType,
     TakerSide,
 )
+from alpha.models.flow import BarFlowContext
 
 
 # ── Metadata ─────────────────────────────────────────────────────────────────
@@ -66,6 +68,7 @@ class BarEvent(BaseEvent):
     vwap: Decimal | None = None
     trade_count: int | None = None
     is_partial: bool = False           # in-progress real-time bar
+    is_pipeline_fallback: bool = False # True = re-published by BarPipeline; aggregator must ignore
 
 
 class TradeEvent(BaseEvent):
@@ -157,6 +160,48 @@ class ThesisEvent(BaseEvent):
     session_phase: str | None = None
 
 
+class BarBundleEvent(BaseEvent):
+    """
+    Emitted by BarFlowAggregator when a 1m bar is sealed with its flow context.
+
+    This is the primary input for the sequential pipeline:
+      BarBundleEvent → FeatureEngine → MarketState → Thesis → Setup
+
+    flow: None when trade/quote data is unavailable (e.g. historical bars without full-signals cache).
+    """
+
+    event_type: Literal[EventType.BAR_BUNDLE] = EventType.BAR_BUNDLE
+    timeframe: BarTimeframe
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: int
+    vwap: Decimal | None = None
+    trade_count: int | None = None
+    flow: BarFlowContext | None = None   # None = flow data not available for this bar
+
+    def to_bar_event(self) -> "BarEvent":
+        """Return a BarEvent with the same OHLCV fields (no flow context).
+        is_pipeline_fallback=True so BarFlowAggregator ignores it and avoids
+        re-sealing the already-closed window."""
+        return BarEvent(
+            event_type=EventType.BAR,
+            symbol=self.symbol,
+            timestamp=self.timestamp,
+            timeframe=self.timeframe,
+            open=self.open,
+            high=self.high,
+            low=self.low,
+            close=self.close,
+            volume=self.volume,
+            vwap=self.vwap,
+            trade_count=self.trade_count,
+            is_pipeline_fallback=True,
+            metadata=self.metadata,
+        )
+
+
 class OrderUpdateEvent(BaseEvent):
     """Emitted by OrderEngine on any order lifecycle change."""
 
@@ -180,10 +225,78 @@ class SystemEvent(BaseEvent):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class PipelineOutputEvent(BaseEvent):
+    """
+    Single authoritative output published once per M1 bar after all five pipeline
+    stages have run.  Every downstream consumer — status.json, WebSocket, Parquet
+    writer, PositionMonitor — should read from this event rather than querying
+    individual engine internals.
+
+    Fields:
+      pipeline_ts   — wall-clock time when BarPipeline finished processing
+      bar_snapshot  — FeatureEngine output (VWAP, ATR, slopes, …)
+      flow_context  — BarFlowAggregator output (delta, absorption, V-reversal)
+      market_state  — MarketStateEngine output
+      thesis        — ThesisEngine output (dominant + flip)
+      setups        — all active setups after SetupEngine ran
+      scored_setups — subset: CONFIRMED and already graded by ScoringEngine
+    """
+
+    model_config = {"frozen": True, "arbitrary_types_allowed": True}
+
+    event_type: Literal[EventType.PIPELINE_OUTPUT] = EventType.PIPELINE_OUTPUT
+    pipeline_ts: datetime           # when BarPipeline finished; for UI staleness detection
+
+    # Stage outputs (None when that stage is not yet wired or returned nothing)
+    bar_snapshot: Any               # BarSnapshot — circular import avoided via Any
+    flow_context: BarFlowContext | None
+    market_state: Any | None        # MarketState
+    thesis: Any | None              # ActiveThesis (plain dataclass — arbitrary_types)
+    setups: list[Any]               # list[Setup]
+    scored_setups: list[Any]        # list[Setup] with grade set
+
+
+class PositionSignalEvent(BaseEvent):
+    """
+    Shadow-mode position signal emitted by PositionMonitor.
+    Published every S1 bar while a shadow position is active (WOULD_HOLD),
+    on entry confirmation (WOULD_ENTER), and on exit (WOULD_EXIT).
+    """
+
+    model_config = {"frozen": True}
+
+    event_type: Literal[EventType.POSITION_SIGNAL] = EventType.POSITION_SIGNAL
+    signal_type: str          # "would_enter" | "would_exit" | "would_hold"
+    setup_id: UUID
+    setup_type: SetupType
+    direction: OrderSide
+    entry_price: Decimal
+    stop: Decimal
+    target: Decimal
+    current_price: Decimal
+    grade: SetupGrade
+
+    # Entry confirmation values (set on WOULD_ENTER)
+    intrabar_delta: int | None = None
+    bid_ask_imbalance: float | None = None
+
+    # Exit values (set on WOULD_EXIT)
+    exit_reason: str | None = None    # "stop_hit" | "target_hit" | "thesis_invalidated" | "timeout"
+    pnl_pts: Decimal | None = None
+    bars_held: int | None = None
+
+    # Hold tracking (set on WOULD_HOLD)
+    bars_held_so_far: int | None = None
+    mfe: Decimal | None = None        # max favorable excursion in points
+    mae: Decimal | None = None        # max adverse excursion in points
+
+
 # ── Discriminated union ───────────────────────────────────────────────────────
 
 AnyEvent = Annotated[
     BarEvent
+    | BarBundleEvent
+    | PipelineOutputEvent
     | TradeEvent
     | QuoteEvent
     | OrderBookEvent
@@ -191,6 +304,7 @@ AnyEvent = Annotated[
     | SetupEvent
     | ThesisEvent
     | OrderUpdateEvent
-    | SystemEvent,
+    | SystemEvent
+    | PositionSignalEvent,
     Field(discriminator="event_type"),
 ]

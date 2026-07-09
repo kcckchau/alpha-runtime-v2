@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from alpha.models.bar import Bar
 from alpha.models.enums import BarTimeframe, ORBState, SessionPhase
+from alpha.models.flow import BarFlowContext
 
 
 class BarSnapshot(BaseModel):
@@ -120,3 +121,7 @@ class BarSnapshot(BaseModel):
     rth_median_1m_range: Decimal | None = None  # median 1m bar range this RTH session
     rth_p75_1m_range: Decimal | None = None     # 75th pct — "large but normal" candle
     rth_p90_1m_range: Decimal | None = None     # 90th pct — "abnormally large" candle
+
+    # ── Intrabar flow context (populated by BarFlowAggregator) ───────────────
+    # None when running without full-signals data (historical bars, no trades/quotes cache).
+    flow: BarFlowContext | None = None

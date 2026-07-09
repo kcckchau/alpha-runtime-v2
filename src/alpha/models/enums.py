@@ -63,6 +63,8 @@ class BarTimeframe(StrEnum):
 
 class EventType(StrEnum):
     BAR = "bar"
+    BAR_BUNDLE = "bar_bundle"           # BAR + sealed BarFlowContext from BarFlowAggregator
+    PIPELINE_OUTPUT = "pipeline_output" # single authoritative output per M1 bar
     TRADE = "trade"
     QUOTE = "quote"
     ORDER_BOOK = "order_book"
@@ -72,6 +74,7 @@ class EventType(StrEnum):
     ORDER_UPDATE = "order_update"
     EXECUTION = "execution"
     SYSTEM = "system"
+    POSITION_SIGNAL = "position_signal"
 
 
 class SessionPhase(StrEnum):
@@ -245,3 +248,10 @@ class VWAPEpisodeOutcome(StrEnum):
     RECLAIMED = "reclaimed"  # crossed from below to above
     BROKEN = "broken"        # crossed from above to below
     REJECTED = "rejected"    # cross_up quickly followed by cross_down (failed reclaim)
+
+
+class DataQualityState(StrEnum):
+    CLEAN      = "clean"       # feed healthy, signals allowed
+    DEGRADED   = "degraded"    # bar lag >250ms, silence >30s, or missed bar — signals blocked
+    RECOVERING = "recovering"  # first clean bar seen after DEGRADED, waiting for confirmation
+    FAILED     = "failed"      # silence >5min during RTH — signals blocked, needs investigation

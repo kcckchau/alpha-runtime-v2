@@ -13,6 +13,14 @@ type EngineStatus = {
   details: Record<string, unknown>;
 };
 
+type FeedQualityEntry = {
+  quality: "clean" | "degraded" | "recovering" | "failed";
+  degraded_reason: string | null;
+  signals_allowed: boolean;
+  last_record_at: string | null;
+  last_bar_at: string | null;
+};
+
 type RuntimeStatus = {
   mode: string;
   symbols: string[];
@@ -20,6 +28,7 @@ type RuntimeStatus = {
   runtime_state: string;
   updated_at: string | null;
   runtime_available: boolean;
+  feed_quality: Record<string, FeedQualityEntry> | null;
 };
 
 type QuoteRow = {
@@ -197,6 +206,16 @@ type SetupSessionContext = {
   // Per-bar MarketState snapshots, keyed by ISO timestamp.
   // Populated during backfill replay; absent on live session contexts.
   bar_market_states?: Record<string, MarketStateData>;
+};
+
+type PipelineDebug = {
+  pipeline_ts: string;        // when BarPipeline finished processing this bar
+  bar_ts: string;             // bar close timestamp (M1)
+  market_state_ts: string | null;
+  thesis_type: string | null;
+  flow_available: boolean;
+  active_setup_count: number;
+  scored_setup_count: number;
 };
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -682,7 +701,7 @@ function SetupItem({ setup, past }: { setup: SetupRow; past?: boolean }) {
             background: `${stateCol}18`, color: stateCol,
           }}
         >
-          {setup.state.toUpperCase()}
+          {(setup.state ?? "").toUpperCase()}
         </span>
         <span style={{ fontSize: 9, color: "rgba(255,255,255,0.4)", ...S.mono }}>{time}</span>
       </div>
@@ -703,17 +722,29 @@ function SetupItem({ setup, past }: { setup: SetupRow; past?: boolean }) {
   );
 }
 
-function SetupsPanel({ setups }: { setups: SetupRow[] }) {
+function SetupsPanel({
+  setups,
+  thesis,
+}: {
+  setups: SetupRow[];
+  thesis: ThesisData | null;
+}) {
   const active = setups.filter((s) => !["failed", "invalidated", "expired"].includes(s.state));
+  const confirmed = active.filter((s) => s.state === "confirmed");
   const past = setups
     .filter((s) => ["failed", "invalidated", "expired"].includes(s.state))
     .slice(0, 3);
 
+  // "Why no trade?" — only shown when thesis is active but no confirmed setup exists
+  const thesisActive = thesis?.dominant && !["invalidated", "expired"].includes(thesis.dominant.state);
+  const showWhyNoTrade = thesisActive && confirmed.length === 0;
+
   return (
     <div style={S.panel}>
       <div style={S.panelHd}>
-        <span style={S.panelLbl}>Active Setups</span>
-        {active.length > 0 && <Pill color="green">{active.length}</Pill>}
+        <span style={S.panelLbl}>Setup</span>
+        {confirmed.length > 0 && <Pill color="green">{confirmed.length} confirmed</Pill>}
+        {active.length > 0 && confirmed.length === 0 && <Pill color="amber">{active.length} forming</Pill>}
       </div>
       <div style={{ padding: 8 }}>
         {active.length === 0 ? (
@@ -723,13 +754,466 @@ function SetupsPanel({ setups }: { setups: SetupRow[] }) {
         ) : (
           active.map((s) => <SetupItem key={s.setup_id} setup={s} />)
         )}
+
+        {/* "Why no trade?" — visible when thesis is watching/building but no confirmed setup */}
+        {showWhyNoTrade && (
+          <div style={{
+            marginTop: 6,
+            padding: "7px 9px",
+            borderRadius: 5,
+            background: "rgba(251,191,36,0.06)",
+            border: "0.5px solid rgba(251,191,36,0.2)",
+          }}>
+            <div style={{ ...S.mono, fontSize: 9, color: "#fbbf24", letterSpacing: "0.08em", marginBottom: 4 }}>
+              WHY NO TRADE?
+            </div>
+            <div style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.5)", lineHeight: 1.5 }}>
+              {thesis?.dominant?.state === "watching"
+                ? "Thesis watching — no confirmation signal yet"
+                : thesis?.dominant?.state === "building"
+                ? "Thesis building — waiting for setup confirmation"
+                : "Thesis not ready for entry"}
+              {active.length > 0 && (
+                <span style={{ display: "block", marginTop: 2 }}>
+                  {active.length} setup{active.length > 1 ? "s" : ""} forming, none confirmed yet
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
         {past.length > 0 && (
           <>
             <div style={{ height: 0.5, background: "rgba(255,255,255,0.06)", margin: "6px 0" }} />
-            <span style={{ ...S.panelLbl, display: "block", marginBottom: 6 }}>Past</span>
+            <span style={{ ...S.panelLbl, display: "block", marginBottom: 6 }}>Past (TTL)</span>
             {past.map((s) => <SetupItem key={s.setup_id} setup={s} past />)}
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Flow panel ───────────────────────────────────────────────────────────────
+
+type PositionData = {
+  signal_type: "would_enter" | "would_hold" | "would_exit";
+  setup_type: string;
+  direction: "buy" | "sell";
+  entry_price: string;
+  stop: string;
+  target: string;
+  current_price: string;
+  grade: string;
+  // Entry
+  intrabar_delta?: number | null;
+  bid_ask_imbalance?: number | null;
+  // Exit
+  exit_reason?: string | null;
+  pnl_pts?: string | null;
+  bars_held?: number | null;
+  // Hold
+  bars_held_so_far?: number | null;
+  mfe?: string | null;
+  mae?: string | null;
+};
+
+function PositionPanel({ position }: { position: PositionData | null }) {
+  if (!position) return null;
+
+  const isLong = position.direction === "buy";
+  const entryPrice = parseFloat(position.entry_price);
+  const currentPrice = parseFloat(position.current_price);
+  const stop = parseFloat(position.stop);
+  const target = parseFloat(position.target);
+  const unrealized = isLong ? currentPrice - entryPrice : entryPrice - currentPrice;
+  const distToStop = isLong ? currentPrice - stop : stop - currentPrice;
+  const distToTarget = isLong ? target - currentPrice : currentPrice - target;
+  const rr = Math.abs(target - entryPrice) / Math.abs(stop - entryPrice);
+
+  const dirColor = isLong ? "#26a69a" : "#ef5350";
+  const pnlColor = unrealized >= 0 ? "#26a69a" : "#ef5350";
+
+  const signalLabel =
+    position.signal_type === "would_enter" ? "ENTRY SIGNAL"
+    : position.signal_type === "would_exit" ? "EXITED"
+    : "IN TRADE";
+
+  const signalColor =
+    position.signal_type === "would_enter" ? "#f0b429"
+    : position.signal_type === "would_exit" ? "rgba(255,255,255,0.4)"
+    : "#26a69a";
+
+  return (
+    <div style={{ ...S.panel, borderColor: signalColor + "55" }}>
+      <div style={S.panelHd}>
+        <span style={S.panelLbl}>Shadow Position</span>
+        <span style={{ ...S.mono, fontSize: 10, color: signalColor, fontWeight: 700 }}>{signalLabel}</span>
+      </div>
+
+      {/* Direction + setup type */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+        <span style={{ ...S.mono, fontSize: 11, color: dirColor, fontWeight: 700 }}>
+          {isLong ? "▲ LONG" : "▼ SHORT"}
+        </span>
+        <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.5)" }}>
+          {position.setup_type.replace(/_/g, " ")}
+        </span>
+        <span style={{
+          fontSize: 9, fontWeight: 700, padding: "1px 5px",
+          borderRadius: 3, background: "rgba(255,255,255,0.1)",
+          color: "rgba(255,255,255,0.8)", marginLeft: "auto"
+        }}>{position.grade}</span>
+      </div>
+
+      {/* Price levels */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4, marginBottom: 6 }}>
+        {[
+          { label: "Entry", value: entryPrice.toFixed(2), color: "rgba(255,255,255,0.7)" },
+          { label: "Stop", value: stop.toFixed(2), color: "#ef5350" },
+          { label: "Target", value: target.toFixed(2), color: "#26a69a" },
+        ].map(({ label, value, color }) => (
+          <div key={label} style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)", marginBottom: 1 }}>{label}</div>
+            <div style={{ ...S.mono, fontSize: 11, color }}>{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Exit result */}
+      {position.signal_type === "would_exit" && (
+        <div style={{ padding: "4px 8px", borderRadius: 4, background: "rgba(255,255,255,0.06)", marginBottom: 6, textAlign: "center" }}>
+          <span style={{ fontSize: 9, color: "rgba(255,255,255,0.5)" }}>
+            {(position.exit_reason ?? "").replace(/_/g, " ").toUpperCase()} ·{" "}
+          </span>
+          <span style={{ ...S.mono, fontSize: 12, color: parseFloat(position.pnl_pts ?? "0") >= 0 ? "#26a69a" : "#ef5350", fontWeight: 700 }}>
+            {parseFloat(position.pnl_pts ?? "0") >= 0 ? "+" : ""}{parseFloat(position.pnl_pts ?? "0").toFixed(2)} pts
+          </span>
+          {position.bars_held != null && (
+            <span style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}> · {position.bars_held}s held</span>
+          )}
+        </div>
+      )}
+
+      {/* In-trade metrics */}
+      {position.signal_type === "would_hold" && (
+        <>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+            <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)" }}>Unrealized</span>
+            <span style={{ ...S.mono, fontSize: 11, color: pnlColor, fontWeight: 700 }}>
+              {unrealized >= 0 ? "+" : ""}{unrealized.toFixed(2)} pts
+            </span>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 4, marginBottom: 4 }}>
+            {[
+              { label: "→ Stop", value: distToStop.toFixed(1), color: "#ef5350" },
+              { label: "→ Tgt", value: distToTarget.toFixed(1), color: "#26a69a" },
+              { label: "MFE", value: position.mfe ? parseFloat(position.mfe).toFixed(1) : "—", color: "#26a69a" },
+              { label: "MAE", value: position.mae ? parseFloat(position.mae).toFixed(1) : "—", color: "#ef5350" },
+            ].map(({ label, value, color }) => (
+              <div key={label} style={{ textAlign: "center" }}>
+                <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}>{label}</div>
+                <div style={{ ...S.mono, fontSize: 10, color }}>{value}</div>
+              </div>
+            ))}
+          </div>
+          {position.bars_held_so_far != null && (
+            <div style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", textAlign: "right" }}>
+              {position.bars_held_so_far}s elapsed
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Entry confirmation signals */}
+      {position.signal_type === "would_enter" && (
+        <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+          <div style={{ flex: 1, textAlign: "center" }}>
+            <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}>R:R</div>
+            <div style={{ ...S.mono, fontSize: 11, color: "rgba(255,255,255,0.8)" }}>{rr.toFixed(2)}</div>
+          </div>
+          {position.intrabar_delta != null && (
+            <div style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}>Δ Delta</div>
+              <div style={{ ...S.mono, fontSize: 11, color: position.intrabar_delta > 0 ? "#26a69a" : "#ef5350" }}>
+                {position.intrabar_delta > 0 ? "+" : ""}{position.intrabar_delta}
+              </div>
+            </div>
+          )}
+          {position.bid_ask_imbalance != null && (
+            <div style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ fontSize: 9, color: "rgba(255,255,255,0.4)" }}>BAI</div>
+              <div style={{ ...S.mono, fontSize: 11, color: position.bid_ask_imbalance > 0.5 ? "#26a69a" : "#ef5350" }}>
+                {position.bid_ask_imbalance.toFixed(3)}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+type FlowData = {
+  available: boolean;
+  bar_ts?: string;
+  total_volume?: number;
+  buy_volume?: number;
+  sell_volume?: number;
+  delta?: number;
+  delta_pct?: number | null;
+  large_buy_count?: number;
+  large_sell_count?: number;
+  large_trade_threshold?: number;
+  bid_ask_imbalance?: number | null;
+  twap_bid_size?: number | null;
+  twap_ask_size?: number | null;
+  trade_count?: number;
+  trade_velocity?: number | null;
+  avg_trade_size?: number | null;
+  is_genuine_sweep_reversal?: boolean;
+  is_v_reversal?: boolean;
+  absorption?: { detected: boolean; confidence: number; sell_volume_at_low: number };
+  split?: { sweep_volume: number; sweep_delta: number; recovery_volume: number; recovery_delta: number; recovery_ratio: number | null } | null;
+  has_trade_data?: boolean;
+  has_quote_data?: boolean;
+};
+
+function DeltaSparkline({ history }: { history: number[] }) {
+  if (history.length < 2) return null;
+  const w = 196, h = 36;
+  const min = Math.min(...history);
+  const max = Math.max(...history);
+  const range = max - min || 1;
+  const zero = max >= 0 && min <= 0 ? h - ((0 - min) / range) * h : (min >= 0 ? h : 0);
+
+  const pts = history.map((v, i) => {
+    const x = (i / (history.length - 1)) * w;
+    const y = h - ((v - min) / range) * h;
+    return `${x},${y}`;
+  }).join(" ");
+
+  const lastVal = history[history.length - 1];
+  const prevVal = history[history.length - 2];
+  const slope = lastVal - prevVal;
+  const lineColor = lastVal > 0 ? "#26a69a" : lastVal < 0 ? "#ef5350" : "rgba(255,255,255,0.3)";
+  const slopeLabel = slope > 0 ? "↑" : slope < 0 ? "↓" : "→";
+  const slopeColor = slope > 2 ? "#26a69a" : slope < -2 ? "#ef5350" : "rgba(255,255,255,0.4)";
+
+  return (
+    <div style={{ position: "relative" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+        <span style={{ ...S.mono, fontSize: 8, color: "rgba(255,255,255,0.3)" }}>Δ slope</span>
+        <span style={{ ...S.mono, fontSize: 8, color: slopeColor }}>{slopeLabel} {slope > 0 ? "+" : ""}{slope}</span>
+      </div>
+      <svg width={w} height={h} style={{ display: "block", overflow: "visible" }}>
+        {/* Zero line */}
+        <line x1={0} y1={zero} x2={w} y2={zero}
+          stroke="rgba(255,255,255,0.1)" strokeWidth={0.5} strokeDasharray="2,2" />
+        {/* Delta curve */}
+        <polyline points={pts} fill="none" stroke={lineColor} strokeWidth={1.2} />
+        {/* Last point dot */}
+        <circle
+          cx={(history.length - 1) / (history.length - 1) * w}
+          cy={h - ((lastVal - min) / range) * h}
+          r={2} fill={lineColor}
+        />
+      </svg>
+    </div>
+  );
+}
+
+function FlowPanel({ flow, live, deltaHistory }: { flow: FlowData | null; live?: boolean; deltaHistory?: number[] }) {
+  if (!flow || !flow.available) {
+    return (
+      <div style={{ ...S.panel, borderColor: "rgba(255,255,255,0.05)" }}>
+        <div style={S.panelHd}><span style={S.panelLbl}>Order Flow</span></div>
+        <div style={{ padding: "8px 10px", ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.2)" }}>
+          {flow ? "No flow data for this bar" : "Waiting…"}
+        </div>
+      </div>
+    );
+  }
+
+  const total = flow.total_volume ?? 0;
+  const buyVol = flow.buy_volume ?? 0;
+  const sellVol = flow.sell_volume ?? 0;
+  const buyPct = total > 0 ? (buyVol / total) * 100 : 50;
+  const sellPct = total > 0 ? (sellVol / total) * 100 : 50;
+  const delta = flow.delta ?? 0;
+  const deltaPct = flow.delta_pct ?? null;
+  const deltaColor = delta > 0 ? "#22c55e" : delta < 0 ? "#ef4444" : "rgba(255,255,255,0.4)";
+  const imbalance = flow.bid_ask_imbalance ?? null;
+  // bid_ask_imbalance = twap_bid / (bid+ask); >0.5 = bid-heavy (buyers); <0.5 = ask-heavy (sellers)
+  const imbalancePct = imbalance !== null ? Math.round(imbalance * 100) : null;
+  const imbalanceColor = imbalance !== null
+    ? imbalance > 0.55 ? "#22c55e" : imbalance < 0.45 ? "#ef4444" : "rgba(255,255,255,0.5)"
+    : "rgba(255,255,255,0.3)";
+
+  return (
+    <div style={{ ...S.panel, borderColor: "rgba(255,255,255,0.05)" }}>
+      <div style={S.panelHd}>
+        <span style={S.panelLbl}>Order Flow</span>
+        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+          {live && <span style={{ ...S.mono, fontSize: 8, color: "#22c55e" }}>● LIVE</span>}
+          {!flow.has_trade_data && (
+            <span style={{ ...S.mono, fontSize: 8, color: "#fbbf24" }}>no tape</span>
+          )}
+        </div>
+      </div>
+      <div style={{ padding: "6px 10px", display: "flex", flexDirection: "column", gap: 6 }}>
+
+        {/* Buy / Sell volume bar */}
+        <div>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+            <span style={{ ...S.mono, fontSize: 9, color: "#22c55e" }}>B {buyVol.toLocaleString()}</span>
+            <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.3)" }}>vol {total.toLocaleString()}</span>
+            <span style={{ ...S.mono, fontSize: 9, color: "#ef4444" }}>{sellVol.toLocaleString()} S</span>
+          </div>
+          <div style={{ height: 6, borderRadius: 3, overflow: "hidden", display: "flex", background: "rgba(255,255,255,0.06)" }}>
+            <div style={{ width: `${buyPct}%`, background: "rgba(34,197,94,0.6)", transition: "width 0.3s" }} />
+            <div style={{ width: `${sellPct}%`, background: "rgba(239,68,68,0.6)", transition: "width 0.3s" }} />
+          </div>
+        </div>
+
+        {/* Delta */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.35)" }}>Delta</span>
+          <span style={{ ...S.mono, fontSize: 11, fontWeight: 600, color: deltaColor }}>
+            {delta > 0 ? "+" : ""}{delta.toLocaleString()}
+            {deltaPct !== null && (
+              <span style={{ fontSize: 9, fontWeight: 400, marginLeft: 4, color: "rgba(255,255,255,0.35)" }}>
+                ({deltaPct > 0 ? "+" : ""}{deltaPct}%)
+              </span>
+            )}
+          </span>
+        </div>
+
+        {/* Delta slope sparkline */}
+        {deltaHistory && deltaHistory.length >= 2 && (
+          <DeltaSparkline history={deltaHistory} />
+        )}
+
+        {/* Bid/Ask imbalance */}
+        {imbalancePct !== null && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+              <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.35)" }}>Quote pressure</span>
+              <span style={{ ...S.mono, fontSize: 9, color: imbalanceColor }}>
+                {imbalancePct > 50 ? `${imbalancePct}% bid` : `${100 - imbalancePct}% ask`}
+              </span>
+            </div>
+            <div style={{ height: 4, borderRadius: 2, overflow: "hidden", display: "flex", background: "rgba(255,255,255,0.06)" }}>
+              <div style={{ width: `${imbalancePct}%`, background: "rgba(34,197,94,0.5)", transition: "width 0.3s" }} />
+              <div style={{ width: `${100 - imbalancePct}%`, background: "rgba(239,68,68,0.5)", transition: "width 0.3s" }} />
+            </div>
+          </div>
+        )}
+
+        {/* Large trades */}
+        {((flow.large_buy_count ?? 0) > 0 || (flow.large_sell_count ?? 0) > 0) && (
+          <div style={{ display: "flex", justifyContent: "space-between" }}>
+            <span style={{ ...S.mono, fontSize: 9, color: "rgba(255,255,255,0.35)" }}>
+              Large (≥{flow.large_trade_threshold})
+            </span>
+            <span style={{ ...S.mono, fontSize: 9 }}>
+              <span style={{ color: "#22c55e" }}>▲{flow.large_buy_count ?? 0}</span>
+              <span style={{ color: "rgba(255,255,255,0.2)", margin: "0 4px" }}>|</span>
+              <span style={{ color: "#ef4444" }}>▼{flow.large_sell_count ?? 0}</span>
+            </span>
+          </div>
+        )}
+
+        {/* Signals */}
+        {(flow.is_genuine_sweep_reversal || flow.is_v_reversal || flow.absorption?.detected) && (
+          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+            {flow.is_genuine_sweep_reversal && (
+              <span style={{ ...S.mono, fontSize: 8, padding: "1px 5px", borderRadius: 3, background: "rgba(34,197,94,0.15)", color: "#22c55e", border: "0.5px solid rgba(34,197,94,0.3)" }}>
+                SWEEP REVERSAL
+              </span>
+            )}
+            {flow.absorption?.detected && (
+              <span style={{ ...S.mono, fontSize: 8, padding: "1px 5px", borderRadius: 3, background: "rgba(96,165,250,0.15)", color: "#60a5fa", border: "0.5px solid rgba(96,165,250,0.3)" }}>
+                ABSORPTION {Math.round((flow.absorption.confidence ?? 0) * 100)}%
+              </span>
+            )}
+            {flow.is_v_reversal && !flow.is_genuine_sweep_reversal && (
+              <span style={{ ...S.mono, fontSize: 8, padding: "1px 5px", borderRadius: 3, background: "rgba(251,191,36,0.12)", color: "#fbbf24", border: "0.5px solid rgba(251,191,36,0.3)" }}>
+                V-SNAP
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Split bar */}
+        {flow.split && (
+          <div style={{ borderTop: "0.5px solid rgba(255,255,255,0.06)", paddingTop: 5 }}>
+            <div style={{ ...S.mono, fontSize: 8, color: "rgba(255,255,255,0.25)", marginBottom: 3 }}>Intrabar split</div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ ...S.mono, fontSize: 9, color: "#ef4444" }}>
+                Sweep Δ {flow.split.sweep_delta.toLocaleString()}
+              </span>
+              <span style={{ ...S.mono, fontSize: 9, color: "#22c55e" }}>
+                Recovery Δ +{flow.split.recovery_delta.toLocaleString()}
+                {flow.split.recovery_ratio !== null && (
+                  <span style={{ color: "rgba(255,255,255,0.35)", marginLeft: 4 }}>
+                    ({Math.round(flow.split.recovery_ratio * 100)}%)
+                  </span>
+                )}
+              </span>
+            </div>
+          </div>
+        )}
+
+        <div style={{ ...S.mono, fontSize: 8, color: "rgba(255,255,255,0.15)", marginTop: 1 }}>
+          {flow.trade_count ?? 0} trades · {flow.trade_velocity?.toFixed(1) ?? "—"}/s · avg {flow.avg_trade_size?.toFixed(1) ?? "—"} lots
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Freshness / debug card ────────────────────────────────────────────────────
+
+function FreshnessCard({ debug }: { debug: PipelineDebug | null }) {
+  function fmtTs(iso: string | null): string {
+    if (!iso) return "—";
+    try {
+      const d = new Date(iso);
+      return `${String(d.getUTCHours()).padStart(2,"0")}:${String(d.getUTCMinutes()).padStart(2,"0")}:${String(d.getUTCSeconds()).padStart(2,"0")}.${String(d.getUTCMilliseconds()).padStart(3,"0")}`;
+    } catch { return "—"; }
+  }
+
+  const rows: Array<{ label: string; value: string; dim?: boolean; color?: string }> = debug
+    ? [
+        { label: "Last M1 bar",    value: fmtTs(debug.bar_ts) },
+        { label: "Pipeline seal",  value: fmtTs(debug.pipeline_ts) },
+        { label: "MarketState ts", value: fmtTs(debug.market_state_ts) },
+        { label: "Flow data",      value: debug.flow_available ? "yes" : "no", color: debug.flow_available ? "#22c55e" : "#ef4444" },
+        { label: "Active setups",  value: String(debug.active_setup_count) },
+        { label: "Scored setups",  value: String(debug.scored_setup_count) },
+      ]
+    : [{ label: "Waiting for pipeline…", value: "", dim: true }];
+
+  return (
+    <div style={{ ...S.panel, borderColor: "rgba(255,255,255,0.05)" }}>
+      <div style={S.panelHd}>
+        <span style={S.panelLbl}>Data Freshness</span>
+        <span style={{ ...S.mono, fontSize: 9, color: debug ? "#22c55e" : "rgba(255,255,255,0.25)" }}>
+          {debug ? "live" : "waiting"}
+        </span>
+      </div>
+      <div style={{ padding: "6px 10px", display: "flex", flexDirection: "column", gap: 3 }}>
+        {rows.map(({ label, value, dim, color }) => (
+          <div key={label} style={{ display: "flex", justifyContent: "space-between", gap: 4 }}>
+            <span style={{ ...S.mono, fontSize: 9, color: dim ? "rgba(255,255,255,0.2)" : "rgba(255,255,255,0.35)" }}>
+              {label}
+            </span>
+            <span style={{ ...S.mono, fontSize: 9, color: color ?? (dim ? "rgba(255,255,255,0.15)" : "rgba(255,255,255,0.7)") }}>
+              {value}
+            </span>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -1877,6 +2361,16 @@ export function Dashboard() {
   const [replayEpoch, setReplayEpoch] = useState(0);   // incremented to trigger chart fitContent
   const flashRef = useRef<Set<string>>(new Set());
   const [flashSetupId, setFlashSetupId] = useState<string | null>(null);
+  const [pipelineDebug, setPipelineDebug] = useState<PipelineDebug | null>(null);
+  const [flow, setFlow] = useState<FlowData | null>(null);
+  const [intrabarLive, setIntrabarLive] = useState(false);
+  const deltaHistoryRef = useRef<number[]>([]);  // rolling 60s delta slope
+  const [position, setPosition] = useState<PositionData | null>(null);
+  const [sidebarTab, setSidebarTab] = useState<"signal" | "market">("signal");
+  // Tracks whether we've done the one-time bar history re-fetch after bootstrap.
+  // Bootstrap fills a gap (up to ~20 min) in Parquet that the initial load missed;
+  // the first pipeline_complete event signals bars are ready.
+  const barsRefreshedRef = useRef(false);
 
   // ET clock — ticks every second
   useEffect(() => {
@@ -2123,6 +2617,11 @@ export function Dashboard() {
       `${websocketBaseUrl()}/runtime/ws/live?symbol=${encodeURIComponent(selectedSymbol)}`
     );
 
+    liveWs.onopen = () => {
+      // Reset so the first pipeline_complete after this connection triggers a bar refresh.
+      barsRefreshedRef.current = false;
+    };
+
     liveWs.onmessage = (ev) => {
       if (isHistorical) return;
       try {
@@ -2144,6 +2643,77 @@ export function Dashboard() {
             vwap: msg.vwap ?? null,
           };
           setBars((prev) => mergeLiveBar(prev, barRow, selectedTimeframe));
+        }
+
+        if (msg.type === "pipeline_complete") {
+          // One authoritative packet per M1 bar — update debug state and
+          // trigger targeted re-fetch of all panels from fresh REST data.
+          setPipelineDebug({
+            pipeline_ts: msg.pipeline_ts,
+            bar_ts: msg.timestamp,
+            market_state_ts: msg.market_state_ts ?? null,
+            thesis_type: msg.thesis_type ?? null,
+            flow_available: !!msg.flow_available,
+            active_setup_count: Number(msg.active_setup_count ?? 0),
+            scored_setup_count: Number(msg.scored_setup_count ?? 0),
+          });
+          // Re-fetch all panels in parallel — each is fast and uses fresh data
+          fetchJson<ThesisData>(`/runtime/thesis/${selectedSymbol}`)
+            .then((d) => d && setThesis(d)).catch(() => {});
+          fetchJson<SetupRow[]>(`/runtime/setups/${selectedSymbol}`)
+            .then((d) => d && setSetups(d)).catch(() => {});
+          fetchJson<MarketStateData>(`/runtime/market-state/${selectedSymbol}`)
+            .then((d) => d && setMarketStates((prev) => ({ ...prev, [selectedSymbol]: d }))).catch(() => {});
+          fetchJson<SymbolContext>(`/runtime/context/${selectedSymbol}`)
+            .then((d) => d && setContexts((prev) => ({ ...prev, [selectedSymbol]: d }))).catch(() => {});
+          // Flow data is embedded in pipeline_complete — set it directly from msg.flow
+          if (msg.flow) setFlow(msg.flow as FlowData);
+          deltaHistoryRef.current = [];  // new bar — reset sparkline
+          // One-time bar history refresh after bootstrap: fills the gap between the
+          // initial REST fetch (now-3min) and bars stored during the bootstrap period.
+          if (!barsRefreshedRef.current) {
+            barsRefreshedRef.current = true;
+            const start = historyStartDate(selectedSymbol, selectedTimeframe);
+            fetchJson<BarHistoryRow[]>(
+              `/runtime/bars/history?symbol=${selectedSymbol}&timeframe=${selectedTimeframe}&start=${start}&end=${todayDate()}`
+            ).then((d) => {
+              if (d && d.length > 0) setBars((prev) => mergeHistoryWithLiveTail(d, null, prev, selectedTimeframe));
+            }).catch(() => {});
+          }
+        }
+
+        if (msg.type === "position_signal") {
+          setPosition(msg as PositionData);
+          setSidebarTab("signal");
+        }
+
+        if (msg.type === "intrabar_flow") {
+          // Accumulate delta history for sparkline (reset each bar via pipeline_complete)
+          const h = deltaHistoryRef.current;
+          h.push(msg.delta);
+          if (h.length > 60) h.shift();
+          // Merge live 1s intrabar fields into flow — keep sealed-bar fields from pipeline_complete
+          setIntrabarLive(true);
+          setFlow((prev) => prev ? {
+            ...prev,
+            delta: msg.delta,
+            buy_volume: msg.buy_volume,
+            sell_volume: msg.sell_volume,
+            bid_ask_imbalance: msg.bid_ask_imbalance ?? prev.bid_ask_imbalance,
+            has_trade_data: (msg.trade_count ?? 0) > 0,
+          } : prev);
+        }
+
+        if (msg.type === "thesis") {
+          // Thesis state transition — re-fetch immediately rather than waiting for next poll
+          fetchJson<ThesisData>(`/runtime/thesis/${selectedSymbol}`)
+            .then((d) => d && setThesis(d)).catch(() => {});
+        }
+
+        if (msg.type === "setup") {
+          // Setup state transition — re-fetch immediately
+          fetchJson<SetupRow[]>(`/runtime/setups/${selectedSymbol}`)
+            .then((d) => d && setSetups(d)).catch(() => {});
         }
 
         if (msg.type === "quote" && msg.last_price != null) {
@@ -2380,6 +2950,7 @@ export function Dashboard() {
     if (currentContext?.levels) {
       for (const [label, value] of Object.entries(currentContext.levels)) {
         if (!value) continue;
+        if (label.startsWith("ema")) continue;
         overlays.push({
           label: label.replaceAll("_", " "),
           price: Number(value),
@@ -2512,6 +3083,10 @@ export function Dashboard() {
             onChange={(e) => {
               setSelectedSymbol(e.target.value);
               setBackfillJob(null);
+              setFlow(null);
+              setIntrabarLive(false);
+              deltaHistoryRef.current = [];
+              setPosition(null);
             }}
             style={{
               background: "rgba(255,255,255,0.06)",
@@ -2867,18 +3442,54 @@ export function Dashboard() {
 
         {/* Sidebar */}
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {selectedDate === null && <ThesisPanel thesis={thesis} />}
-          <SetupHistoryPanel
-            context={activeSetupCtx}
-            selectedDate={selectedDate}
-            selectedSetupId={selectedSetupId}
-            onSelectSetup={setSelectedSetupId}
-            flashSetupId={flashSetupId}
-          />
-          <SetupsPanel setups={setups} />
-          <FeaturesPanel context={currentContext} isHistorical={!!selectedDate} />
-          <MarketStatePanel marketState={displayMarketState} isHistorical={!!selectedDate} />
-          <RiskPanel risk={riskState} />
+
+          {/* Tab bar */}
+          <div style={{ display: "flex", gap: 2 }}>
+            {(["signal", "market"] as const).map((tab) => (
+              <button
+                key={tab}
+                onClick={() => setSidebarTab(tab)}
+                style={{
+                  flex: 1, ...S.mono, fontSize: 10, fontWeight: 600,
+                  padding: "5px 0", borderRadius: 4, cursor: "pointer",
+                  border: "0.5px solid rgba(255,255,255,0.08)",
+                  background: sidebarTab === tab ? "rgba(255,255,255,0.08)" : "transparent",
+                  color: sidebarTab === tab ? "rgba(255,255,255,0.88)" : "rgba(255,255,255,0.35)",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.05em",
+                }}
+              >
+                {tab === "signal" ? (position ? "⬤ Signal" : "Signal") : "Market"}
+              </button>
+            ))}
+          </div>
+
+          {/* Signal tab — live trading view */}
+          {sidebarTab === "signal" && (
+            <>
+              {selectedDate === null && <ThesisPanel thesis={thesis} />}
+              <SetupsPanel setups={setups} thesis={thesis} />
+              {selectedDate === null && <PositionPanel position={position} />}
+              {selectedDate === null && <FlowPanel flow={flow} live={intrabarLive} deltaHistory={deltaHistoryRef.current} />}
+            </>
+          )}
+
+          {/* Market tab — reference / analysis */}
+          {sidebarTab === "market" && (
+            <>
+              <SetupHistoryPanel
+                context={activeSetupCtx}
+                selectedDate={selectedDate}
+                selectedSetupId={selectedSetupId}
+                onSelectSetup={setSelectedSetupId}
+                flashSetupId={flashSetupId}
+              />
+              <FeaturesPanel context={currentContext} isHistorical={!!selectedDate} />
+              <MarketStatePanel marketState={displayMarketState} isHistorical={!!selectedDate} />
+              <RiskPanel risk={riskState} />
+              {selectedDate === null && <FreshnessCard debug={pipelineDebug} />}
+            </>
+          )}
         </div>
       </div>
 
@@ -2921,6 +3532,42 @@ export function Dashboard() {
               </div>
             ))}
           </div>
+
+          {/* ── Feed quality per symbol ── */}
+          {status?.feed_quality && Object.keys(status.feed_quality).length > 0 && (
+            <div style={{
+              borderTop: "0.5px solid rgba(255,255,255,0.06)",
+              paddingTop: 6, marginTop: 2,
+              display: "flex", flexWrap: "wrap", gap: 6, padding: "6px 12px",
+            }}>
+              <span style={{ ...S.mono, fontSize: 10, color: "rgba(255,255,255,0.35)", marginRight: 4 }}>
+                Feed Quality
+              </span>
+              {Object.entries(status.feed_quality).map(([sym, fq]) => {
+                const color =
+                  fq.quality === "clean" ? "green"
+                  : fq.quality === "recovering" ? "amber"
+                  : "red";
+                return (
+                  <div
+                    key={sym}
+                    title={fq.degraded_reason ?? `${sym} — ${fq.quality}`}
+                    style={{ display: "flex", alignItems: "center", gap: 4 }}
+                  >
+                    <span style={{ ...S.mono, fontSize: 11, color: "rgba(255,255,255,0.6)" }}>
+                      {sym}
+                    </span>
+                    <Pill color={color}>{fq.quality}</Pill>
+                    {!fq.signals_allowed && (
+                      <span style={{ ...S.mono, fontSize: 10, color: "#ef4444" }}>
+                        signals blocked
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
     </div>

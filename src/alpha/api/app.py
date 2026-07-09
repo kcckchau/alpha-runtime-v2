@@ -26,6 +26,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     event_bus = getattr(app.state, "event_bus", None)
     if event_bus is not None:
         manager.subscribe_to_event_bus(event_bus)
+        # Wire intrabar broadcast into PositionMonitor so it can push 1s flow updates
+        try:
+            from alpha.runtime_registry import get_bootstrap
+            bootstrap = get_bootstrap()
+            if bootstrap is not None and hasattr(bootstrap, "_position_monitor"):
+                pm = bootstrap._position_monitor
+                if pm is not None:
+                    pm.set_intrabar_broadcast(manager.broadcast)
+                    logger.info("API: intrabar broadcast wired to PositionMonitor")
+        except Exception:
+            logger.warning("API: could not wire intrabar broadcast to PositionMonitor")
         logger.info("API: ConnectionManager wired to EventBus — push WS active")
     else:
         logger.info("API: no EventBus injected — push WS inactive (polling WS still works)")
