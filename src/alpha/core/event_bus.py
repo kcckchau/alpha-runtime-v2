@@ -41,6 +41,8 @@ class Subscription:
     queue: asyncio.Queue[AnyEvent] = field(repr=False, default_factory=lambda: asyncio.Queue(maxsize=1000))
     drop_if_full: bool = False         # if True, overflow events are dropped instead of blocking
     _task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    full_count: int = field(default=0, init=False, repr=False)   # times queue was full
+    drop_count: int = field(default=0, init=False, repr=False)   # events dropped (drop_if_full only)
 
 
 class EventBus:
@@ -98,20 +100,25 @@ class EventBus:
             if sub.symbol is not None and sub.symbol != event.symbol:
                 continue
             if sub.queue.full():
+                sub.full_count += 1
                 if sub.drop_if_full:
                     # Subscriber only needs the latest value — evict the oldest stale event
                     # so the incoming one can be enqueued. This preserves recency over ordering.
                     try:
                         sub.queue.get_nowait()
                         sub.queue.task_done()
+                        sub.drop_count += 1
                     except asyncio.QueueEmpty:
                         pass
                 else:
                     logger.warning(
-                        "EventBus: queue full for subscription %s (%s/%s), applying backpressure",
+                        "EventBus: queue full for subscription %s (%s/%s) depth=%d"
+                        " full_count=%d — applying backpressure",
                         sub.subscription_id,
                         event.event_type,
                         event.symbol,
+                        sub.queue.qsize(),
+                        sub.full_count,
                     )
             await sub.queue.put(event)
 
@@ -156,6 +163,29 @@ class EventBus:
             subs.remove(sub)
         except ValueError:
             pass
+
+    # ── Observability ─────────────────────────────────────────────────────────
+
+    def queue_depths(self) -> list[dict]:
+        """
+        Return current queue depth snapshot for all subscriptions.
+
+        Each entry: {event_type, symbol, depth, maxsize, full_count, drop_count}
+        Useful for health checks and periodic logging.
+        """
+        result = []
+        for subs in self._subscriptions.values():
+            for sub in subs:
+                result.append({
+                    "event_type": sub.event_type.value,
+                    "symbol": sub.symbol,
+                    "depth": sub.queue.qsize(),
+                    "maxsize": sub.queue.maxsize,
+                    "full_count": sub.full_count,
+                    "drop_count": sub.drop_count,
+                    "drop_if_full": sub.drop_if_full,
+                })
+        return result
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

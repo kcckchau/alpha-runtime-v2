@@ -167,11 +167,24 @@ class LiveIngestionEngine(BaseEngine):
         connected = [
             sid for sid, a in self._adapters.items() if a.is_connected
         ]
+        queue_depths = self._event_bus.queue_depths()
+        any_backed_up = any(d["depth"] > d["maxsize"] * 0.5 for d in queue_depths)
+        if any_backed_up:
+            for d in queue_depths:
+                if d["depth"] > d["maxsize"] * 0.5:
+                    logger.warning(
+                        "EventBus queue backed up: %s/%s depth=%d/%d"
+                        " full_count=%d drop_count=%d",
+                        d["event_type"], d["symbol"],
+                        d["depth"], d["maxsize"],
+                        d["full_count"], d["drop_count"],
+                    )
         details = {
             "adapters_connected": connected,
             "bars_received": self._bars_received,
             "trades_received": self._trades_received,
             "quotes_received": self._quotes_received,
+            "queue_depths": queue_depths,
         }
         status = HealthStatus.HEALTHY if connected else HealthStatus.UNHEALTHY
         return EngineHealth(status, self.name, details)
