@@ -143,6 +143,11 @@ class LiveIngestionEngine(BaseEngine):
         await adapter.subscribe_bars(symbols, BarTimeframe.S1, self._on_bar)
         await adapter.subscribe_trades(symbols, self._on_trade)
         await adapter.subscribe_quotes(symbols, self._on_quote)
+        # Start the background stream only after ALL subscriptions are registered.
+        # Previously _ensure_thread_started() was called inside each subscribe_*,
+        # so the record loop could start (and detect a connection failure) while
+        # subsequent subscribe() calls were still trying to write to the same socket.
+        adapter.start_stream()
 
         if self._monitor is not None:
             self._health_task = asyncio.create_task(self._health_check_loop())

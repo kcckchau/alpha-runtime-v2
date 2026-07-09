@@ -240,7 +240,6 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             self._bar_handlers[(ticker, schema)] = handler
 
         logger.info("Databento: subscribed to %s bars for %s", timeframe, symbols)
-        self._ensure_thread_started()
 
     async def subscribe_trades(
         self,
@@ -262,7 +261,6 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             self._trade_handlers[ticker] = handler
 
         logger.info("Databento: subscribed to trades for %s", symbols)
-        self._ensure_thread_started()
 
     async def subscribe_quotes(
         self,
@@ -284,7 +282,6 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             self._quote_handlers[ticker] = handler
 
         logger.info("Databento: subscribed to mbp-1 quotes for %s", symbols)
-        self._ensure_thread_started()
 
     async def subscribe_order_book(
         self,
@@ -307,7 +304,6 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             self._book_handlers[ticker] = handler
 
         logger.info("Databento: subscribed to mbp-10 book for %s", symbols)
-        self._ensure_thread_started()
 
     async def subscribe_tick_trades(
         self,
@@ -331,6 +327,9 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             self._tick_handlers[ticker] = handler
 
         logger.info("Databento: subscribed to tick trades for %s", symbols)
+
+    def start_stream(self) -> None:
+        """Start the background record loop. Call once after all subscribe_* calls are done."""
         self._ensure_thread_started()
 
     # ── Symbol management ─────────────────────────────────────────────────────
