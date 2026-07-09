@@ -46,6 +46,7 @@ import databento_dbn as dbn
 
 from alpha.config.settings import DatabentoSettings
 from alpha.core.registry import SymbolRegistry
+from alpha.engines.live.ingress_observer import IngressObserver
 from alpha.engines.live.adapters.base import (
     BarHandlerT,
     BookHandlerT,
@@ -144,6 +145,8 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
         self._db_to_ticker: dict[str, str] = {}
         # schema → set of db_syms — used to replay subscriptions on reconnect.
         self._sub_specs: dict[str, set[str]] = defaultdict(set)
+
+        self._observer = IngressObserver()
 
     @property
     def source_id(self) -> DataSourceId:
@@ -360,6 +363,8 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                         return
                     if not self._loop.is_running():
                         return
+                    arrival_ns = time.time_ns()
+                    self._observer.observe(record, arrival_ns)
                     try:
                         self._dispatch(record)
                     except Exception:
