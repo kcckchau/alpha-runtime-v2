@@ -29,6 +29,7 @@ Migration approach:
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -107,11 +108,14 @@ class BarPipeline:
             return  # only 1m bundles drive the pipeline
 
         sym = bundle.symbol
+        t0 = time.perf_counter()
 
         # ── Stage 1: FeatureEngine ────────────────────────────────────────────
         snap: BarSnapshot | None = None
         if self._feature is not None:
+            t1 = time.perf_counter()
             snap = self._feature.process_bar(bundle)
+            feature_ms = (time.perf_counter() - t1) * 1000
             if snap is None:
                 logger.warning("BarPipeline: FeatureEngine returned None for %s — skipping", sym)
                 return
@@ -121,29 +125,62 @@ class BarPipeline:
 
         # ── Stage 2: MarketStateEngine ────────────────────────────────────────
         market_state: MarketState | None = None
+        market_state_ms = 0.0
         if self._market_state is not None:
+            t2 = time.perf_counter()
             market_state = await self._market_state.process_bar(snap, bundle)
+            market_state_ms = (time.perf_counter() - t2) * 1000
 
         # ── Stage 3: ThesisEngine ─────────────────────────────────────────────
         thesis: ActiveThesis | None = None
+        thesis_ms = 0.0
         if self._thesis is not None and market_state is not None:
+            t3 = time.perf_counter()
             thesis = await self._thesis.process_bar(snap, market_state, bundle)
+            thesis_ms = (time.perf_counter() - t3) * 1000
 
         # ── Stage 4: SetupEngine ──────────────────────────────────────────────
         setups: list[Setup] = []
+        setup_ms = 0.0
         if self._setup is not None and market_state is not None:
+            t4 = time.perf_counter()
             setups = await self._setup.process_bar(snap, market_state, thesis, bundle)
+            setup_ms = (time.perf_counter() - t4) * 1000
 
         # ── Stage 5: ScoringEngine ────────────────────────────────────────────
+        scoring_ms = 0.0
         if self._scoring is not None and setups:
+            t5 = time.perf_counter()
             self._scoring.process_bar(snap, market_state, setups)
+            scoring_ms = (time.perf_counter() - t5) * 1000
+
+        total_ms = (time.perf_counter() - t0) * 1000
+        logger.debug(
+            "BarPipeline %s | total=%.1fms feature=%.1f market_state=%.1f"
+            " thesis=%.1f setup=%.1f scoring=%.1f",
+            sym, total_ms, feature_ms, market_state_ms, thesis_ms, setup_ms, scoring_ms,
+        )
+        if total_ms > 1000:
+            logger.warning(
+                "BarPipeline %s SLOW: total=%.1fms feature=%.1f market_state=%.1f"
+                " thesis=%.1f setup=%.1f scoring=%.1f",
+                sym, total_ms, feature_ms, market_state_ms, thesis_ms, setup_ms, scoring_ms,
+            )
 
         # ── Publish PipelineOutput ────────────────────────────────────────────
+        now_utc = datetime.now(timezone.utc)
+        e2e_ms = (now_utc - bundle.metadata.received_at).total_seconds() * 1000
+        if e2e_ms > 2000:
+            logger.warning(
+                "BarPipeline %s: bar-to-signal latency=%.0fms (bar_ts=%s received_at=%s)",
+                sym, e2e_ms, bundle.timestamp, bundle.metadata.received_at,
+            )
+
         scored_setups = [s for s in setups if s.grade is not None]
         output = PipelineOutputEvent(
             symbol=sym,
             timestamp=bundle.timestamp,
-            pipeline_ts=datetime.now(timezone.utc),
+            pipeline_ts=now_utc,
             bar_snapshot=snap,
             flow_context=bundle.flow,
             market_state=market_state,
