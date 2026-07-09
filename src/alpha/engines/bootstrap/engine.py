@@ -720,7 +720,17 @@ class BootstrapEngine(BaseEngine):
             # Previously only gap bars were emitted as they were fetched, which meant
             # stored bars never flowed through BarFlowAggregator → BarPipeline →
             # SetupEngine, leaving _session_contexts empty after a restart.
+            #
+            # Force is_replay=True regardless of what is stored in metadata.
+            # Stored bars from a previous live session have is_replay=False; re-emitting
+            # them without this flag causes SetupEngine to emit "live" SetupEvents,
+            # triggering Telegram notifications for historical setups during catchup.
+            from alpha.models.events import EventMetadata
             for bar in merged:
+                if not bar.metadata.is_replay:
+                    bar = bar.model_copy(update={
+                        "metadata": bar.metadata.model_copy(update={"is_replay": True})
+                    })
                 await self._event_bus.publish(bar)
 
         return merged
