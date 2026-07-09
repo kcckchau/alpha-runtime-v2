@@ -695,7 +695,7 @@ class BootstrapEngine(BaseEngine):
                 timeframe=timeframe,
                 start=gap_start,
                 end=gap_end,
-                emit=emit,
+                emit=False,  # Always defer — we emit the full merged set below in order.
             )
             fetched.extend(bars)
             if persist_direct:
@@ -714,6 +714,15 @@ class BootstrapEngine(BaseEngine):
             len(fetched),
             len(merged),
         )
+
+        if emit:
+            # Emit all bars in strict chronological order (stored + fetched).
+            # Previously only gap bars were emitted as they were fetched, which meant
+            # stored bars never flowed through BarFlowAggregator → BarPipeline →
+            # SetupEngine, leaving _session_contexts empty after a restart.
+            for bar in merged:
+                await self._event_bus.publish(bar)
+
         return merged
 
     @staticmethod
