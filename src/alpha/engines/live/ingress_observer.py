@@ -57,8 +57,14 @@ class IngressObserver:
         self._total_recv_latency_ms: float = 0.0
         self._recv_latency_count: int = 0
 
-        # Per-instrument last ts_event for out-of-order detection
-        self._last_ts_event_ns: dict[int, int] = {}
+        # Per-(instrument_id, rtype) last ts_event for out-of-order detection.
+        # Keyed by rtype so bars (ts_event = bar open) don't pollute trade/quote ordering.
+        self._last_ts_event_ns: dict[tuple[int, int], int] = {}
+
+        # ts_event → ts_recv latency (CME → Databento gateway)
+        self._max_feed_latency_ms: float = 0.0
+        self._total_feed_latency_ms: float = 0.0
+        self._feed_latency_count: int = 0
 
     def observe(self, record: object, arrival_ns: int) -> None:
         self._records_seen += 1
@@ -78,7 +84,7 @@ class IngressObserver:
                 )
         self._last_arrival_ns = arrival_ns
 
-        # ── ts_recv latency ───────────────────────────────────────────────────
+        # ── ts_recv latency (Databento gateway → our machine) ────────────────
         ts_recv = getattr(record, "ts_recv", None)
         if ts_recv is not None and ts_recv > 0:
             recv_latency_ms = (arrival_ns - ts_recv) / 1_000_000
@@ -93,20 +99,31 @@ class IngressObserver:
                         recv_latency_ms, getattr(record, "instrument_id", "?"),
                     )
 
-        # ── Out-of-order detection per instrument ─────────────────────────────
+        # ── Feed latency (CME → Databento gateway: ts_recv - ts_event) ───────
         ts_event = getattr(record, "ts_event", None)
+        if ts_recv is not None and ts_event is not None and ts_recv > 0 and ts_event > 0:
+            feed_latency_ms = (ts_recv - ts_event) / 1_000_000
+            if 0 <= feed_latency_ms < 60_000:  # sanity: skip negatives and bars (open time)
+                self._feed_latency_count += 1
+                self._total_feed_latency_ms += feed_latency_ms
+                if feed_latency_ms > self._max_feed_latency_ms:
+                    self._max_feed_latency_ms = feed_latency_ms
+
+        # ── Out-of-order detection per (instrument_id, rtype) ────────────────
         iid = getattr(record, "instrument_id", None)
-        if ts_event is not None and iid is not None:
-            prev = self._last_ts_event_ns.get(iid)
+        rtype = getattr(record, "rtype", None)
+        if ts_event is not None and iid is not None and rtype is not None:
+            key = (int(iid), int(rtype))
+            prev = self._last_ts_event_ns.get(key)
             if prev is not None and ts_event < prev:
                 self._out_of_order += 1
                 logger.debug(
-                    "IngressObserver: out-of-order record instrument_id=%d "
+                    "IngressObserver: out-of-order record instrument_id=%d rtype=%d "
                     "ts_event=%d prev=%d delta_ms=%.1f",
-                    iid, ts_event, prev, (prev - ts_event) / 1_000_000,
+                    iid, int(rtype), ts_event, prev, (prev - ts_event) / 1_000_000,
                 )
             if ts_event > 0:
-                self._last_ts_event_ns[iid] = ts_event
+                self._last_ts_event_ns[key] = ts_event
 
         # ── Periodic summary ──────────────────────────────────────────────────
         elapsed_s = (arrival_ns - self._window_start_ns) / 1_000_000_000
@@ -130,19 +147,31 @@ class IngressObserver:
         )
 
         recv_str = (
-            f" | ts_recv_latency avg={recv_avg:.0f}ms max={self._max_recv_latency_ms:.0f}ms"
+            f" | recv_latency avg={recv_avg:.0f}ms max={self._max_recv_latency_ms:.0f}ms"
             if recv_avg is not None
+            else ""
+        )
+
+        feed_avg = (
+            self._total_feed_latency_ms / self._feed_latency_count
+            if self._feed_latency_count > 0
+            else None
+        )
+        feed_str = (
+            f" | feed_latency avg={feed_avg:.0f}ms max={self._max_feed_latency_ms:.0f}ms"
+            if feed_avg is not None
             else ""
         )
 
         logger.info(
             "IngressObserver | %d records in %.1fs (%.1f/s)"
             " | gap avg=%.0fms max=%.0fms"
-            " | out_of_order=%d (total)%s",
+            " | out_of_order=%d (total)%s%s",
             self._window_records, elapsed_s, rate,
             gap_avg, self._max_gap_ms,
             self._out_of_order,
             recv_str,
+            feed_str,
         )
 
     def _reset_window(self, now_ns: int) -> None:
@@ -154,4 +183,7 @@ class IngressObserver:
         self._total_recv_latency_ms = 0.0
         self._max_recv_latency_ms = 0.0
         self._recv_latency_count = 0
+        self._total_feed_latency_ms = 0.0
+        self._max_feed_latency_ms = 0.0
+        self._feed_latency_count = 0
         # out_of_order is cumulative — not reset

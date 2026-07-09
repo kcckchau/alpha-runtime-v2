@@ -123,6 +123,22 @@ class IngestionMonitor:
         else:
             self._record_clean_bar(symbol, state)
 
+    def on_skipped_records(self) -> None:
+        """
+        Call when Databento reports SKIPPED_RECORDS_AFTER_SLOW_READING.
+
+        Degrades all tracked symbols — we don't know which instruments were
+        affected, so the safe default is to treat all as suspect until the
+        next clean bar arrives.
+        """
+        now = datetime.now(timezone.utc)
+        for symbol, state in self._states.items():
+            self._degrade(symbol, state, "Databento skipped records (slow reader)")
+        logger.warning(
+            "IngestionMonitor: Databento reported SKIPPED_RECORDS — degraded %d symbol(s)",
+            len(self._states),
+        )
+
     def on_record_received(self, symbol: str, now: datetime | None = None) -> None:
         """
         Call on every trade or quote record for silence detection.

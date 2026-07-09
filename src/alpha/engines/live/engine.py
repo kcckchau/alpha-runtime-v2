@@ -105,6 +105,8 @@ class LiveIngestionEngine(BaseEngine):
 
     def register_adapter(self, adapter: LiveFeedAdapter) -> None:
         self._adapters[adapter.source_id] = adapter
+        if self._monitor is not None and hasattr(adapter, "set_skipped_records_handler"):
+            adapter.set_skipped_records_handler(self._monitor.on_skipped_records)
         logger.info("Registered live adapter: %s", adapter.source_id)
 
     @property
