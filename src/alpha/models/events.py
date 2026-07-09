@@ -120,6 +120,13 @@ class SetupEvent(BaseEvent):
     setup_type: SetupType
     setup_state: SetupState
     prev_state: SetupState | None = None
+    # Optional scoring / level data — populated when available so downstream
+    # consumers (e.g. TelegramNotifier) don't need a SetupEngine reference.
+    entry_trigger: Decimal | None = None
+    stop_reference: Decimal | None = None
+    target_reference: Decimal | None = None
+    grade: str | None = None
+    score: float | None = None
 
 
 class ThesisEvent(BaseEvent):

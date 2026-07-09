@@ -1,5 +1,5 @@
 """
-Telegram notifier — sends trade alerts when PositionMonitor fires WOULD_ENTER.
+Telegram notifier — sends alerts for setup signals and trade entries/exits.
 """
 
 from __future__ import annotations
@@ -10,19 +10,29 @@ from decimal import Decimal
 import httpx
 
 from alpha.config.settings import TelegramSettings
-from alpha.models.enums import EventType, OrderSide
-from alpha.models.events import AnyEvent, PositionSignalEvent
+from alpha.models.enums import EventType, OrderSide, SetupState
+from alpha.models.events import AnyEvent, PositionSignalEvent, SetupEvent
 
 logger = logging.getLogger(__name__)
 
 _API = "https://api.telegram.org/bot{token}/sendMessage"
 
+# Only notify on these state transitions — ignore FORMING churn.
+_NOTIFY_STATES = {SetupState.CONFIRMED, SetupState.TRIGGERED, SetupState.FAILED, SetupState.INVALIDATED}
+
 
 class TelegramNotifier:
     """
-    Subscribes to POSITION_SIGNAL on the EventBus.
-    Sends a Telegram message on WOULD_ENTER.
-    Sends a follow-up on WOULD_EXIT with P&L.
+    Subscribes to SETUP and POSITION_SIGNAL on the EventBus.
+
+    Setup alerts:
+      CONFIRMED  → setup is ready, shows entry/stop/target if available
+      TRIGGERED  → entry condition met
+      FAILED / INVALIDATED → setup is dead
+
+    Position alerts (from PositionMonitor):
+      WOULD_ENTER → entry signal with R:R
+      WOULD_EXIT  → exit with P&L
     """
 
     def __init__(self, settings: TelegramSettings, event_bus: object) -> None:
@@ -37,12 +47,66 @@ class TelegramNotifier:
         self._client = httpx.AsyncClient(timeout=10)
         from alpha.core.event_bus import EventBus
         if isinstance(self._bus, EventBus):
+            self._bus.subscribe(EventType.SETUP, self._on_setup, drop_if_full=True)
             self._bus.subscribe(EventType.POSITION_SIGNAL, self._on_signal)
         logger.info("TelegramNotifier: started (chat_id=%s)", self._settings.chat_id)
 
     async def stop(self) -> None:
         if self._client:
             await self._client.aclose()
+
+    async def _on_setup(self, event: AnyEvent) -> None:
+        if not isinstance(event, SetupEvent):
+            return
+        if event.setup_state not in _NOTIFY_STATES:
+            return
+        # Skip replay events — we only want live signals.
+        if event.metadata.is_replay:
+            return
+        await self._send_setup(event)
+
+    async def _send_setup(self, event: SetupEvent) -> None:
+        state = event.setup_state
+        name = event.setup_type.replace("_", " ").upper()
+
+        if state == SetupState.CONFIRMED:
+            emoji = "🟡"
+            header = f"{emoji} *SETUP CONFIRMED*"
+        elif state == SetupState.TRIGGERED:
+            emoji = "🟢"
+            header = f"{emoji} *SETUP TRIGGERED*"
+        elif state == SetupState.FAILED:
+            emoji = "🔴"
+            header = f"{emoji} *SETUP FAILED*"
+        else:  # INVALIDATED
+            emoji = "⚫"
+            header = f"{emoji} *SETUP INVALIDATED*"
+
+        lines = [
+            header,
+            f"`{event.symbol}` — {name}",
+        ]
+        if event.grade:
+            grade_part = f"Grade: *{event.grade}*"
+            if event.score is not None:
+                grade_part += f"  score: {event.score:.0f}"
+            lines.append(grade_part)
+
+        if event.entry_trigger or event.stop_reference or event.target_reference:
+            lines.append("")
+            if event.entry_trigger:
+                lines.append(f"Entry:  `{float(event.entry_trigger):,.2f}`")
+            if event.stop_reference:
+                lines.append(f"Stop:   `{float(event.stop_reference):,.2f}`")
+            if event.target_reference:
+                lines.append(f"Target: `{float(event.target_reference):,.2f}`")
+            if event.entry_trigger and event.stop_reference and event.target_reference:
+                risk = abs(float(event.entry_trigger) - float(event.stop_reference))
+                reward = abs(float(event.target_reference) - float(event.entry_trigger))
+                if risk > 0:
+                    lines.append(f"R:R:    *{reward / risk:.1f}*")
+
+        await self._send("\n".join(lines))
 
     async def _on_signal(self, event: AnyEvent) -> None:
         if not isinstance(event, PositionSignalEvent):

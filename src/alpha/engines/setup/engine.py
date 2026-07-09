@@ -1805,6 +1805,11 @@ class SetupEngine(BaseEngine):
             setup_type=setup.setup_type,
             setup_state=setup.state,
             prev_state=prev_state,
+            entry_trigger=setup.entry_trigger,
+            stop_reference=setup.stop_reference,
+            target_reference=setup.target_reference,
+            grade=str(setup.grade) if setup.grade is not None else None,
+            score=setup.score,
         )
         await self._event_bus.publish(event)
 
