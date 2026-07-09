@@ -2993,7 +2993,7 @@ export function Dashboard() {
 
   const historyMarkers = useMemo((): SeriesMarker<Time>[] => {
     return (activeSetupCtx?.setups ?? [])
-      .filter((entry) => !!entry.detected_at && ["triggered", "failed", "invalidated"].includes(entry.state))
+      .filter((entry) => !!entry.detected_at && ["triggered", "failed", "invalidated", "expired"].includes(entry.state))
       .map((entry) => {
         const isSelected = entry.setup_id === selectedSetupId;
         const sideColor = entry.side === "buy" ? "#22c55e" : "#ef4444";
