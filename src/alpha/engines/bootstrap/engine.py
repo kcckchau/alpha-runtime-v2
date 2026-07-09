@@ -509,7 +509,7 @@ class BootstrapEngine(BaseEngine):
                     setup_state=setup.state,
                     prev_state=None,
                     metadata=EventMetadata(
-                        source=DataSourceId.INTERNAL,
+                        source=DataSourceId.UNKNOWN,
                         received_at=now,
                         is_replay=False,
                     ),
