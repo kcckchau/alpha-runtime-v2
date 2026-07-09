@@ -174,7 +174,12 @@ class StorageEngine(BaseEngine):
 
     async def _on_event(self, event: AnyEvent) -> None:
         if isinstance(event, BarEvent):
-            # Bars are low-frequency and critical to the chart — never drop them.
+            # Replay bars are already persisted to Parquet via persist_direct in
+            # _load_or_fetch_bars. Storing them again here would duplicate every
+            # bar on each restart.
+            if event.metadata.is_replay:
+                return
+            # Live bars are low-frequency and critical to the chart — never drop them.
             # A brief await here applies natural backpressure instead of data loss.
             await self._write_queue.put(event)
             return
