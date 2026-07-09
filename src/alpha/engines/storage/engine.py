@@ -173,6 +173,11 @@ class StorageEngine(BaseEngine):
             self._event_bus.subscribe(et, self._on_event, drop_if_full=drop)
 
     async def _on_event(self, event: AnyEvent) -> None:
+        # Don't store SetupEvents emitted during historical catchup replay.
+        # Active setups are reconciled and re-emitted as non-replay events at
+        # the catchup→live transition, so only the final state is stored.
+        if isinstance(event, SetupEvent) and event.metadata.is_replay:
+            return
         if isinstance(event, BarEvent):
             # Bars are low-frequency and critical to the chart — never drop them.
             # A brief await here applies natural backpressure instead of data loss.
@@ -247,7 +252,10 @@ class StorageEngine(BaseEngine):
         import pyarrow as pa
 
         table = pa.Table.from_pylist(rows)
-        self._parquet.write(table, data_type, symbol, d)
+        # Setups use upsert semantics: same setup_id on restart overwrites the
+        # previous row rather than duplicating it.
+        dedup_key = "setup_id" if data_type == "setups" else None
+        self._parquet.write(table, data_type, symbol, d, dedup_key=dedup_key)
 
     @staticmethod
     def _data_type_for(event: AnyEvent) -> str | None:

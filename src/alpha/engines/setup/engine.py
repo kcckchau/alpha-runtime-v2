@@ -22,6 +22,7 @@ Output: SetupEvent
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime
 from decimal import Decimal
 from typing import ClassVar
@@ -1326,10 +1327,17 @@ class SetupEngine(BaseEngine):
         trigger: BarEvent,
     ) -> None:
         bar_time = trigger.timestamp
+        # Deterministic setup_id: same symbol + setup_type + bar_time always
+        # produces the same UUID, so restarts never duplicate stored setups.
+        setup_id = uuid.uuid5(
+            uuid.NAMESPACE_DNS,
+            f"{symbol}:{setup_type}:{bar_time.isoformat()}",
+        )
         # structural_grade is a detection-time hint for ScoringEngine.
         # grade is intentionally left None here — ScoringEngine produces the final grade.
         structural_grade = SetupGrade.SSS if setup_type in _SSS_TYPES else None
         setup = Setup(
+            setup_id=setup_id,
             symbol=symbol,
             setup_type=setup_type,
             state=SetupState.FORMING,

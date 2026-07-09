@@ -202,6 +202,7 @@ class BootstrapEngine(BaseEngine):
             await self._run_tail_catchup()
             if self._storage is not None:
                 await self._storage.flush()
+            await self._reconcile_active_setups()
             logger.info("Catch-up complete — live feed remains active")
         elif mode == RuntimeMode.HISTORICAL_BACKFILL:
             await self._run_backfill()
@@ -476,6 +477,48 @@ class BootstrapEngine(BaseEngine):
         self._telegram_notifier = TelegramNotifier(
             self._settings.telegram, self._event_bus
         )
+
+    async def _reconcile_active_setups(self) -> None:
+        """
+        Publish active setups as non-replay events at the catchup→live transition.
+
+        During catchup, SetupEvents are emitted with is_replay=True and filtered
+        out by StorageEngine. At the transition point, we snapshot whatever setups
+        survived to the present and publish them as authoritative live events so
+        they land in Parquet exactly once.
+
+        Because setup_id is now deterministic (uuid5 of symbol+type+bar_ts),
+        restarting and reconciling again produces the same IDs — the upsert in
+        StorageEngine/ParquetStore overwrites rather than duplicates.
+        """
+        if self._setup is None:
+            return
+
+        from alpha.models.enums import DataSourceId
+        from alpha.models.events import EventMetadata
+
+        now = datetime.now(timezone.utc)
+        total = 0
+        for symbol in self._settings.runtime.symbols:
+            for setup in self._setup.active_setups(symbol):
+                event = SetupEvent(
+                    symbol=symbol,
+                    timestamp=setup.detected_at,
+                    setup_id=setup.setup_id,
+                    setup_type=setup.setup_type,
+                    setup_state=setup.state,
+                    prev_state=None,
+                    metadata=EventMetadata(
+                        source=DataSourceId.INTERNAL,
+                        received_at=now,
+                        is_replay=False,
+                    ),
+                )
+                await self._event_bus.publish(event)
+                total += 1
+
+        if total:
+            logger.info("Reconciled %d active setup(s) to storage at catchup→live transition", total)
 
     async def _run_catchup(self) -> None:
         """Load recent history before connecting the live feed."""
