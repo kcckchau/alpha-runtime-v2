@@ -190,10 +190,9 @@ class CatchupService:
                 await self._event_bus.publish(_force_replay(bar))
 
             logger.info(
-                "Catchup complete for %s | 1m=%d (today=%d) 5m=%d 1h=%d 1d=%d",
+                "Catchup complete for %s | 1m=%d 5m=%d 1h=%d 1d=%d",
                 symbol,
-                len(m1_bars), len(today_m1),
-                len(minute5_bars), len(hourly_bars), len(daily_bars),
+                len(m1_bars), len(minute5_bars), len(hourly_bars), len(daily_bars),
             )
 
             result[symbol] = {
