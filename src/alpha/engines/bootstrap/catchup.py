@@ -98,14 +98,12 @@ class CatchupService:
         historical: "HistoricalDataEngine",
         event_bus: "EventBus",
         registry: "SymbolRegistry",
-        calendar: "SessionCalendar",
     ) -> None:
         self._settings = settings
         self._storage = storage
         self._historical = historical
         self._event_bus = event_bus
         self._registry = registry
-        self._calendar = calendar
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -131,16 +129,13 @@ class CatchupService:
         )
 
         # ── Window calculations ───────────────────────────────────────────────
-        yesterday = now.date() - timedelta(days=1)
-        end_of_yesterday = datetime(
-            yesterday.year, yesterday.month, yesterday.day,
-            23, 59, 59, tzinfo=timezone.utc,
-        )
-        today_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-
-        vwap_start = self.session_start(now)
+        # M1: always fetch fresh from API — no Parquet cache.
+        # Cached M1 files may be incomplete (written mid-session, stale if vendor
+        # was delayed). A fresh fetch ensures the warmup reflects exactly what
+        # the vendor has available, regardless of when the process last ran.
+        # 3-day M1 fetch takes ~6-10s; acceptable vs. serving stale data.
         m1_days = max(3, hist.minute1_warmup_bars // 390 + 1)
-        m1_start = min(end_of_yesterday - timedelta(days=m1_days), vwap_start)
+        m1_start = m1_end - timedelta(days=m1_days)
 
         h1_start = h1_end - timedelta(days=max(60, hist.hourly_warmup_bars // 23 + 15))
         d1_start = d1_end - timedelta(days=int(hist.daily_warmup_bars * 1.5))
@@ -151,22 +146,16 @@ class CatchupService:
             logger.info("Catchup starting for %s", symbol)
             symbol_def = self._registry.get(symbol)
 
-            # ── M1: day-cached past days + today from API ─────────────────────
-            past_m1 = await self._fetch_bars_day_cached(
+            # ── M1: always fetch fresh from historical API ────────────────────
+            m1_bars = await self._historical.fetch_bars(
                 symbol=symbol,
                 timeframe=BarTimeframe.M1,
                 start=m1_start,
-                end=end_of_yesterday,
-                emit=False,
-            )
-            today_m1 = await self._historical.fetch_bars(
-                symbol=symbol,
-                timeframe=BarTimeframe.M1,
-                start=today_start,
                 end=m1_end,
                 emit=False,
             )
-            m1_bars = sorted(past_m1 + today_m1, key=lambda b: b.timestamp)
+            logger.info("M1 fetched for %s | bars=%d | %s → %s",
+                        symbol, len(m1_bars), m1_start.date(), m1_end.isoformat())
 
             # ── H1/D1: Parquet cache with gap-fill ────────────────────────────
             hourly_bars = await self._load_or_fetch_bars(
@@ -231,27 +220,6 @@ class CatchupService:
             emit=False,
         )
 
-    def session_start(self, now: datetime) -> datetime:
-        """Return the start of the current (or most recent completed) VWAP session in UTC."""
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo("America/New_York")
-        now_et = now.astimezone(tz)
-
-        if self._settings.historical.vwap_session == "extended":
-            hour, minute = 4, 0
-        else:
-            hour, minute = 9, 30
-
-        session_open_et = now_et.replace(hour=hour, minute=minute, second=0, microsecond=0)
-
-        if now_et < session_open_et:
-            prev_day = self._calendar.prev_trading_day(now_et.date())
-            session_open_et = session_open_et.replace(
-                year=prev_day.year, month=prev_day.month, day=prev_day.day,
-            )
-
-        return session_open_et.astimezone(timezone.utc)
-
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _availability_ends(self) -> tuple[datetime, datetime, datetime]:
@@ -261,69 +229,6 @@ class CatchupService:
         h1_end = source.availability_end("ohlcv-1h")
         d1_end = source.availability_end("ohlcv-1d")
         return m1_end, h1_end, d1_end
-
-    async def _fetch_bars_day_cached(
-        self,
-        symbol: str,
-        timeframe: BarTimeframe,
-        start: datetime,
-        end: datetime,
-        *,
-        emit: bool,
-    ) -> list[Any]:
-        """Day-level cache for M1 past-days catchup.
-
-        File exists → load from Parquet (0 API calls).
-        No file → 1 Databento call for that day → save to Parquet.
-        """
-        all_bars: list[Any] = []
-
-        current_day = start.date()
-        last_day = end.date()
-        while current_day <= last_day:
-            if await self._storage.has_bars(symbol, timeframe, current_day):
-                day_bars = await self._storage.load_bar_events(
-                    symbol, timeframe, current_day, current_day,
-                )
-                all_bars.extend(day_bars)
-                logger.info(
-                    "Day cache hit %s %s %s | bars=%d",
-                    symbol, timeframe, current_day, len(day_bars),
-                )
-            else:
-                day_start = max(
-                    start,
-                    datetime(current_day.year, current_day.month, current_day.day, tzinfo=timezone.utc),
-                )
-                day_end = datetime(
-                    current_day.year, current_day.month, current_day.day,
-                    23, 59, 59, tzinfo=timezone.utc,
-                )
-                logger.info(
-                    "Fetching %s %s %s | %s → %s",
-                    symbol, timeframe, current_day,
-                    day_start.isoformat(), day_end.isoformat(),
-                )
-                bars = await self._historical.fetch_bars(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    start=day_start,
-                    end=day_end,
-                    emit=False,
-                )
-                for bar in bars:
-                    await self._storage.save_bar(bar)
-                all_bars.extend(bars)
-
-            current_day += timedelta(days=1)
-
-        all_bars.sort(key=lambda b: b.timestamp)
-
-        if emit:
-            for bar in all_bars:
-                await self._event_bus.publish(_force_replay(bar))
-
-        return all_bars
 
     async def _load_or_fetch_bars(
         self,

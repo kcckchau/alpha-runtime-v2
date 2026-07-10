@@ -170,7 +170,6 @@ class BootstrapEngine(BaseEngine, SnapshotMixin):
                 historical=self._historical,
                 event_bus=self._event_bus,
                 registry=self._registry,
-                calendar=self._calendar,
             )
 
         self._write_runtime_snapshot()

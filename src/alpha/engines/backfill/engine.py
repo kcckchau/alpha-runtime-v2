@@ -93,7 +93,6 @@ class BackfillEngine(BaseEngine):
             historical=self._historical,
             event_bus=self._event_bus,
             registry=self._registry,
-            calendar=self._calendar,
         )
 
         hist = self._settings.historical
