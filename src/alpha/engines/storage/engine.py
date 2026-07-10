@@ -141,7 +141,13 @@ class StorageEngine(BaseEngine):
         data_type = f"bars/{timeframe}"
         return self._parquet.read_range(data_type, symbol, start, end, columns)
 
-    async def has_bars(self, symbol: str, timeframe: BarTimeframe, d: date) -> bool:
+    async def is_day_cached(self, symbol: str, timeframe: BarTimeframe, d: date) -> bool:
+        """Return True if a Parquet file exists for this symbol/timeframe/date.
+
+        This is a cache-existence check only — it does NOT guarantee completeness.
+        Use alongside a bar-count guard for the most recent day where a crashed
+        run could have written a partial file.
+        """
         return self._parquet.exists(f"bars/{timeframe}", symbol, d)
 
     async def list_bar_dates(self, symbol: str, timeframe: BarTimeframe) -> list[date]:
