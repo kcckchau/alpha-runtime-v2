@@ -125,24 +125,10 @@ class CatchupService:
 
         # ── Availability edges (single metadata call) ─────────────────────────
         m1_end, h1_end, d1_end = self._availability_ends()
-        lag_minutes = (now - m1_end).total_seconds() / 60
         logger.info(
-            "Catchup availability edges | M1=%s | H1=%s | D1=%s | lag=%.0f min",
-            m1_end.isoformat(), h1_end.isoformat(), d1_end.isoformat(), lag_minutes,
+            "Catchup availability edges | M1=%s | H1=%s | D1=%s",
+            m1_end.isoformat(), h1_end.isoformat(), d1_end.isoformat(),
         )
-
-        # Guard: if M1 availability edge is more than 2 hours behind now, the
-        # vendor is significantly delayed (outage, weekend, long holiday).
-        # Log a prominent warning — the live gateway will need to replay a large
-        # window, which may trigger Telegram for historical setups.
-        _LAG_WARN_MINUTES = 120
-        if lag_minutes > _LAG_WARN_MINUTES:
-            logger.warning(
-                "Historical M1 data is %.0f min behind now (expected <10 min). "
-                "Vendor may be delayed or offline. Live gateway will replay a "
-                "large window (%s → now) as live bars.",
-                lag_minutes, m1_end.isoformat(),
-            )
 
         # ── Window calculations ───────────────────────────────────────────────
         yesterday = now.date() - timedelta(days=1)
@@ -173,23 +159,13 @@ class CatchupService:
                 end=end_of_yesterday,
                 emit=False,
             )
-            # Fetch today's bars only if m1_end is actually today — skip when
-            # the vendor is delayed (m1_end in the past) to avoid an empty
-            # fetch with start > end.
-            today_m1: list[Any] = []
-            if m1_end >= today_start:
-                today_m1 = await self._historical.fetch_bars(
-                    symbol=symbol,
-                    timeframe=BarTimeframe.M1,
-                    start=today_start,
-                    end=m1_end,
-                    emit=False,
-                )
-            else:
-                logger.warning(
-                    "Skipping today's M1 fetch for %s — m1_end (%s) is before today (%s)",
-                    symbol, m1_end.date(), today_start.date(),
-                )
+            today_m1 = await self._historical.fetch_bars(
+                symbol=symbol,
+                timeframe=BarTimeframe.M1,
+                start=today_start,
+                end=m1_end,
+                emit=False,
+            )
             m1_bars = sorted(past_m1 + today_m1, key=lambda b: b.timestamp)
 
             # ── H1/D1: Parquet cache with gap-fill ────────────────────────────
