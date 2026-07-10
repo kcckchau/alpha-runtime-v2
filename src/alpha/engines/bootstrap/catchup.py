@@ -91,7 +91,9 @@ class CatchupService:
         m5_days = max(7, hist.minute5_warmup_bars // 78 + 2)
         m1_start = min(end - timedelta(days=m1_days), vwap_start)
         m5_start = min(end - timedelta(days=m5_days), vwap_start)
-        h1_start = end - timedelta(days=int(hist.hourly_warmup_bars * 0.22) + 30)
+        # H1: MNQ trades ~23h/day — previous coefficient (0.22) was sized for RTH
+        # equities (~4.5 H1 bars/day) and over-fetched 4×. Correct for 23h futures.
+        h1_start = end - timedelta(days=max(60, hist.hourly_warmup_bars // 23 + 15))
         d1_start = end - timedelta(days=int(hist.daily_warmup_bars * 1.5))
 
         result: dict[str, dict[str, list]] = {}
