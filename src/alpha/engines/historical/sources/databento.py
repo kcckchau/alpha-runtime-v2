@@ -103,29 +103,30 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
             return f"{root}{self._settings.continuous_suffix}"
         return sym.ticker
 
-    def _safe_end(self, end: datetime, schema: str | None = None) -> datetime:
-        """
-        Clamp end to Databento's available range for the given schema.
+    def availability_end(self, schema: str) -> datetime:
+        """Return the latest datetime for which data is available for the given schema.
 
-        Each schema has its own ingestion lag (ohlcv-1d lags more than ohlcv-1m).
-        Passing schema fetches the schema-specific available end; omitting it falls
-        back to the overall dataset range.
+        get_dataset_range() has no schema parameter — it returns the overall
+        dataset end which matches ohlcv-1m. ohlcv-1h lags ~30 min behind M1
+        (floor to hour) and ohlcv-1d lags ~7-8h (floor to day). A single
+        metadata call derives all three with conservative truncation.
         """
         try:
-            kwargs: dict = {"dataset": self._settings.dataset}
-            if schema:
-                kwargs["schema"] = schema
-            info = self._client.metadata.get_dataset_range(**kwargs)
-            available_end_str = info.get("end", "")
-            if available_end_str:
-                available_end = datetime.fromisoformat(
-                    available_end_str.replace("Z", "+00:00")
-                )
-                if end > available_end:
-                    return available_end
+            info = self._client.metadata.get_dataset_range(dataset=self._settings.dataset)
+            m1_end = datetime.fromisoformat(info["end"].replace("Z", "+00:00"))
         except Exception:
-            pass
-        return end
+            return datetime.now(tz=_UTC)
+
+        if schema == "ohlcv-1h":
+            return m1_end.replace(minute=0, second=0, microsecond=0)
+        if schema == "ohlcv-1d":
+            return m1_end.replace(hour=0, minute=0, second=0, microsecond=0)
+        return m1_end  # ohlcv-1m and others: use actual dataset edge
+
+    def _safe_end(self, end: datetime, schema: str | None = None) -> datetime:
+        """Clamp end to the schema's availability edge."""
+        avail = self.availability_end(schema or "ohlcv-1m")
+        return min(end, avail)
 
     async def fetch_bars(
         self,

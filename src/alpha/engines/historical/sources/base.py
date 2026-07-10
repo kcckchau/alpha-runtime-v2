@@ -78,6 +78,17 @@ class HistoricalDataSource(ABC):
         return
         yield  # type: ignore[misc]
 
+    # ── Availability ─────────────────────────────────────────────────────────
+
+    def availability_end(self, schema: str) -> "datetime":
+        """Return the latest datetime for which data is available for the given schema.
+
+        Default: now (assume data is always available up to the current moment).
+        Sources with ingestion lag should override this.
+        """
+        from datetime import timezone
+        return datetime.now(timezone.utc)
+
     # ── Health ────────────────────────────────────────────────────────────────
 
     async def ping(self) -> bool:

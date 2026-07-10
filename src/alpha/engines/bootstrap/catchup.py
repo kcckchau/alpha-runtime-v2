@@ -1,22 +1,17 @@
 """
-CatchupService — historical bar fetch and context warm-up for the bootstrap pipeline.
+CatchupService — historical warm-up for the bootstrap pipeline.
 
-Bootstrap runs in three phases:
+Single entry point: run()
 
-  Phase 1 — DISCOVERING
-    fetch_m1_history(): fetch M1 bars for the warmup window (past days, day-cached).
-    historical_watermark(): find the latest M1 bar timestamp → gateway replay start.
+  1. Get per-schema availability edges from the vendor (one metadata call).
+  2. Fetch M1: past days from Parquet day-cache, today from historical API.
+  3. Fetch H1/D1: Parquet cache with gap-fill from API.
+  4. Resample M5 from M1 (no native Databento 5m schema).
+  5. Emit in dependency order: D1 → H1 → M5 → M1 (all is_replay=True).
+  6. Return context map and M1 availability edge.
 
-  Phase 2 — WARMING
-    warm_context(): load D1/H1 from Parquet cache, resample M5 from M1, emit all
-    bars through the pipeline in dependency order (D1 → H1 → M5 → M1).
-
-  Phase 3 — ACTIVATING (in BootstrapEngine)
-    drain gateway buffer, skip overlap bars (timestamp ≤ watermark), reconcile
-    active setups, enable external side effects, mark READY.
-
-Today's bars are NOT fetched here — the live gateway connects with
-start = watermark - 1m and replays the gap to real-time.
+BootstrapEngine then starts the live feed from (m1_end - 1m) so the
+gateway naturally replays the small gap and transitions to real-time.
 """
 
 from __future__ import annotations
@@ -60,8 +55,7 @@ def _timeframe_delta(timeframe: BarTimeframe) -> timedelta:
 def _resample_m5(m1_bars: list[Any]) -> list[BarEvent]:
     """Aggregate M1 bars into M5 bars by 5-minute boundary.
 
-    Databento has no ohlcv-5m schema — M5 is always derived from M1 here.
-    Groups by flooring each bar's timestamp to the nearest 5-minute mark.
+    Databento has no ohlcv-5m schema — M5 is always derived from M1.
     """
     if not m1_bars:
         return []
@@ -95,7 +89,7 @@ def _resample_m5(m1_bars: list[Any]) -> list[BarEvent]:
 
 
 class CatchupService:
-    """Encapsulates all historical catch-up logic for the bootstrap sequence."""
+    """Fetches and emits all historical warm-up bars for the bootstrap sequence."""
 
     def __init__(
         self,
@@ -113,101 +107,90 @@ class CatchupService:
         self._registry = registry
         self._calendar = calendar
 
-    # ── Phase 1: DISCOVERING ──────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────────
 
-    async def fetch_m1_history(self, symbols: list[str]) -> dict[str, list[Any]]:
-        """Fetch M1 bars for the warmup window (past days only, day-level cache).
+    async def run(
+        self,
+        symbols: list[str],
+    ) -> tuple[dict[str, dict[str, list[Any]]], datetime]:
+        """Warm up all timeframes and emit in dependency order.
 
-        Does NOT emit — bars are emitted later by warm_context() after D1/H1
-        context is loaded, ensuring engines receive bars in dependency order.
-
-        Returns dict[symbol → list[BarEvent]].
+        Returns:
+            context_map  — {symbol: {minute_bars, hourly_bars, daily_bars}}
+            m1_end       — Databento M1 availability edge; use as live gateway
+                           replay start so live naturally covers the final gap.
         """
         hist = self._settings.historical
         now = datetime.now(timezone.utc)
+
+        # ── Availability edges (single metadata call) ─────────────────────────
+        m1_end, h1_end, d1_end = self._availability_ends()
+        logger.info(
+            "Catchup availability edges | M1=%s | H1=%s | D1=%s",
+            m1_end.isoformat(), h1_end.isoformat(), d1_end.isoformat(),
+        )
+
+        # ── Window calculations ───────────────────────────────────────────────
         yesterday = now.date() - timedelta(days=1)
-        end = datetime(yesterday.year, yesterday.month, yesterday.day, 23, 59, 59, tzinfo=timezone.utc)
+        end_of_yesterday = datetime(
+            yesterday.year, yesterday.month, yesterday.day,
+            23, 59, 59, tzinfo=timezone.utc,
+        )
+        today_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
 
         vwap_start = self.session_start(now)
         m1_days = max(3, hist.minute1_warmup_bars // 390 + 1)
-        m1_start = min(end - timedelta(days=m1_days), vwap_start)
+        m1_start = min(end_of_yesterday - timedelta(days=m1_days), vwap_start)
 
-        result: dict[str, list[Any]] = {}
-        for symbol in symbols:
-            bars = await self._fetch_bars_day_cached(
-                symbol=symbol,
-                timeframe=BarTimeframe.M1,
-                start=m1_start,
-                end=end,
-                emit=False,
-            )
-            logger.info(
-                "M1 history fetched for %s | bars=%d | window=%s → %s",
-                symbol, len(bars), m1_start.date(), end.date(),
-            )
-            result[symbol] = bars
-
-        return result
-
-    def historical_watermark(self, m1_bars_by_symbol: dict[str, list[Any]]) -> datetime | None:
-        """Return the latest M1 bar timestamp across all symbols.
-
-        This is the handoff boundary: the live gateway replays from
-        (watermark - 1m) to cover the gap between historical and real-time.
-        """
-        timestamps = [
-            bar.timestamp
-            for bars in m1_bars_by_symbol.values()
-            for bar in bars
-        ]
-        return max(timestamps) if timestamps else None
-
-    # ── Phase 2: WARMING ──────────────────────────────────────────────────────
-
-    async def warm_context(
-        self,
-        symbols: list[str],
-        m1_bars_by_symbol: dict[str, list[Any]],
-    ) -> dict[str, dict[str, list[Any]]]:
-        """Load H1/D1 from cache, resample M5 from M1, emit all in dependency order.
-
-        Emit order: D1 → H1 → M5 → M1 (each as is_replay=True).
-        Higher-timeframe context must be present before lower-timeframe bars
-        flow through SetupEngine so structural levels and EMAs are ready.
-
-        Returns dict[symbol → {minute_bars, hourly_bars, daily_bars}].
-        """
-        hist = self._settings.historical
-        now = datetime.now(timezone.utc)
-        yesterday = now.date() - timedelta(days=1)
-        end = datetime(yesterday.year, yesterday.month, yesterday.day, 23, 59, 59, tzinfo=timezone.utc)
-
-        h1_start = end - timedelta(days=max(60, hist.hourly_warmup_bars // 23 + 15))
-        d1_start = end - timedelta(days=int(hist.daily_warmup_bars * 1.5))
+        h1_start = h1_end - timedelta(days=max(60, hist.hourly_warmup_bars // 23 + 15))
+        d1_start = d1_end - timedelta(days=int(hist.daily_warmup_bars * 1.5))
 
         result: dict[str, dict[str, list[Any]]] = {}
 
         for symbol in symbols:
-            m1_bars = m1_bars_by_symbol.get(symbol, [])
+            logger.info("Catchup starting for %s", symbol)
+            symbol_def = self._registry.get(symbol)
 
-            daily_bars = await self._load_or_fetch_bars(
+            # ── M1: day-cached past days + today from API ─────────────────────
+            past_m1 = await self._fetch_bars_day_cached(
                 symbol=symbol,
-                timeframe=BarTimeframe.D1,
-                start=d1_start,
-                end=end,
+                timeframe=BarTimeframe.M1,
+                start=m1_start,
+                end=end_of_yesterday,
                 emit=False,
             )
+            today_m1 = await self._historical.fetch_bars(
+                symbol=symbol,
+                timeframe=BarTimeframe.M1,
+                start=today_start,
+                end=m1_end,
+                emit=False,
+            )
+            m1_bars = sorted(past_m1 + today_m1, key=lambda b: b.timestamp)
+
+            # ── H1/D1: Parquet cache with gap-fill ────────────────────────────
             hourly_bars = await self._load_or_fetch_bars(
                 symbol=symbol,
                 timeframe=BarTimeframe.H1,
                 start=h1_start,
-                end=end,
+                end=h1_end,
                 emit=False,
             )
+            symbol_d1_start = d1_start
+            if symbol_def.asset_class == AssetClass.FUTURE:
+                symbol_d1_start = max(d1_start, d1_end - timedelta(days=45))
+            daily_bars = await self._load_or_fetch_bars(
+                symbol=symbol,
+                timeframe=BarTimeframe.D1,
+                start=symbol_d1_start,
+                end=d1_end,
+                emit=False,
+            )
+
+            # ── M5: resample from M1 ──────────────────────────────────────────
             minute5_bars = _resample_m5(m1_bars)
 
-            # Emit in dependency order so downstream engines have structural
-            # context before processing lower-timeframe setup signals.
+            # ── Emit in dependency order ──────────────────────────────────────
             for bar in daily_bars:
                 await self._event_bus.publish(_force_replay(bar))
             for bar in hourly_bars:
@@ -218,8 +201,10 @@ class CatchupService:
                 await self._event_bus.publish(_force_replay(bar))
 
             logger.info(
-                "Warm context complete for %s | 1m=%d 5m=%d 1h=%d 1d=%d",
-                symbol, len(m1_bars), len(minute5_bars), len(hourly_bars), len(daily_bars),
+                "Catchup complete for %s | 1m=%d (today=%d) 5m=%d 1h=%d 1d=%d",
+                symbol,
+                len(m1_bars), len(today_m1),
+                len(minute5_bars), len(hourly_bars), len(daily_bars),
             )
 
             result[symbol] = {
@@ -228,9 +213,7 @@ class CatchupService:
                 "daily_bars": daily_bars,
             }
 
-        return result
-
-    # ── BackfillEngine API ────────────────────────────────────────────────────
+        return result, m1_end
 
     async def fetch_range(
         self,
@@ -248,14 +231,11 @@ class CatchupService:
             emit=False,
         )
 
-    # ── Session helpers ───────────────────────────────────────────────────────
-
     def session_start(self, now: datetime) -> datetime:
         """Return the start of the current (or most recent completed) VWAP session in UTC."""
         from zoneinfo import ZoneInfo
         tz = ZoneInfo("America/New_York")
         now_et = now.astimezone(tz)
-        today = now_et.date()
 
         if self._settings.historical.vwap_session == "extended":
             hour, minute = 4, 0
@@ -265,14 +245,22 @@ class CatchupService:
         session_open_et = now_et.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
         if now_et < session_open_et:
-            prev_day = self._calendar.prev_trading_day(today)
+            prev_day = self._calendar.prev_trading_day(now_et.date())
             session_open_et = session_open_et.replace(
-                year=prev_day.year, month=prev_day.month, day=prev_day.day
+                year=prev_day.year, month=prev_day.month, day=prev_day.day,
             )
 
         return session_open_et.astimezone(timezone.utc)
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _availability_ends(self) -> tuple[datetime, datetime, datetime]:
+        """Return (m1_end, h1_end, d1_end) from a single metadata call."""
+        source = self._historical.primary_source
+        m1_end = source.availability_end("ohlcv-1m")
+        h1_end = source.availability_end("ohlcv-1h")
+        d1_end = source.availability_end("ohlcv-1d")
+        return m1_end, h1_end, d1_end
 
     async def _fetch_bars_day_cached(
         self,
@@ -283,10 +271,10 @@ class CatchupService:
         *,
         emit: bool,
     ) -> list[Any]:
-        """Day-level cache for M1 catchup.
+        """Day-level cache for M1 past-days catchup.
 
-        Past days with an existing Parquet file → load from disk (0 API calls).
-        Days with no file → 1 Databento call for that full day → save to Parquet.
+        File exists → load from Parquet (0 API calls).
+        No file → 1 Databento call for that day → save to Parquet.
         """
         all_bars: list[Any] = []
 
@@ -294,7 +282,9 @@ class CatchupService:
         last_day = end.date()
         while current_day <= last_day:
             if await self._storage.has_bars(symbol, timeframe, current_day):
-                day_bars = await self._storage.load_bar_events(symbol, timeframe, current_day, current_day)
+                day_bars = await self._storage.load_bar_events(
+                    symbol, timeframe, current_day, current_day,
+                )
                 all_bars.extend(day_bars)
                 logger.info(
                     "Day cache hit %s %s %s | bars=%d",
@@ -305,7 +295,10 @@ class CatchupService:
                     start,
                     datetime(current_day.year, current_day.month, current_day.day, tzinfo=timezone.utc),
                 )
-                day_end = datetime(current_day.year, current_day.month, current_day.day, 23, 59, 59, tzinfo=timezone.utc)
+                day_end = datetime(
+                    current_day.year, current_day.month, current_day.day,
+                    23, 59, 59, tzinfo=timezone.utc,
+                )
                 logger.info(
                     "Fetching %s %s %s | %s → %s",
                     symbol, timeframe, current_day,
@@ -353,7 +346,7 @@ class CatchupService:
         fetched: list[Any] = []
         for gap_start, gap_end in missing_ranges:
             logger.info(
-                "Fetching gap for %s %s | %s → %s",
+                "Fetching gap %s %s | %s → %s",
                 symbol, timeframe, gap_start.isoformat(), gap_end.isoformat(),
             )
             bars = await self._historical.fetch_bars(
@@ -373,7 +366,7 @@ class CatchupService:
 
         merged = sorted(merged_by_ts.values(), key=lambda bar: bar.timestamp)
         logger.info(
-            "Catch-up %s %s complete | fetched=%d | merged_total=%d",
+            "Catch-up %s %s complete | fetched=%d | total=%d",
             symbol, timeframe, len(fetched), len(merged),
         )
 
@@ -403,52 +396,21 @@ class CatchupService:
         missing: list[tuple[datetime, datetime]] = []
 
         first = relevant[0]
-        if _should_fill_head_gap(calendar, timeframe, start, first.timestamp):
+        if first.timestamp > start:
             missing.append((start, first.timestamp - step))
 
         for left, right in zip(relevant, relevant[1:]):
             expected_next = left.timestamp + step
-            if _should_fill_internal_gap(calendar, timeframe, left.timestamp, right.timestamp, expected_next):
+            if right.timestamp > expected_next:
+                if timeframe in {BarTimeframe.H1, BarTimeframe.D1}:
+                    if calendar.session_key(left.timestamp) != calendar.session_key(right.timestamp):
+                        continue
                 missing.append((expected_next, right.timestamp - step))
 
         last = relevant[-1]
-        if _should_fill_tail_gap(calendar, timeframe, last.timestamp, end):
+        if last.timestamp < end:
             missing.append((last.timestamp + step, end))
 
         return [
-            (gap_start, gap_end)
-            for gap_start, gap_end in missing
-            if gap_start <= gap_end
+            (gs, ge) for gs, ge in missing if gs <= ge
         ]
-
-
-def _should_fill_head_gap(
-    calendar: "SessionCalendar",
-    timeframe: BarTimeframe,
-    start: datetime,
-    first: datetime,
-) -> bool:
-    return first > start
-
-
-def _should_fill_internal_gap(
-    calendar: "SessionCalendar",
-    timeframe: BarTimeframe,
-    left: datetime,
-    right: datetime,
-    expected_next: datetime,
-) -> bool:
-    if right <= expected_next:
-        return False
-    if timeframe in {BarTimeframe.H1, BarTimeframe.D1}:
-        return calendar.session_key(left) == calendar.session_key(right)
-    return True
-
-
-def _should_fill_tail_gap(
-    calendar: "SessionCalendar",
-    timeframe: BarTimeframe,
-    last: datetime,
-    end: datetime,
-) -> bool:
-    return last < end
