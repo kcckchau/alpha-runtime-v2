@@ -97,6 +97,9 @@ class LiveIngestionEngine(BaseEngine):
         self._partial_accum: dict[str, _PartialAccum] = {}
         self._health_task: asyncio.Task[None] | None = None
         self._replay_start: datetime | None = None
+        # Bootstrap buffer — when set, completed bars are held here instead of
+        # being published to the EventBus. Set to None to switch to live mode.
+        self._bootstrap_buffer: list | None = None
 
     @property
     def name(self) -> str:
@@ -107,6 +110,25 @@ class LiveIngestionEngine(BaseEngine):
     def set_replay_start(self, start: datetime) -> None:
         """Set the start time for live gateway replay. Must be called before start()."""
         self._replay_start = start
+
+    def enable_buffer_mode(self) -> None:
+        """Hold completed bars in an internal buffer instead of publishing them.
+
+        Call before start(). The gateway begins streaming immediately but bars
+        accumulate here while historical context is being warmed. Call
+        drain_buffer() to retrieve buffered bars and switch to live mode.
+        """
+        self._bootstrap_buffer = []
+
+    def drain_buffer(self) -> list:
+        """Return buffered bars sorted by timestamp and switch to live mode.
+
+        After this call, incoming bars are published to the EventBus directly.
+        """
+        buf = sorted(self._bootstrap_buffer or [], key=lambda b: b.timestamp)
+        self._bootstrap_buffer = None
+        logger.info("LiveIngestionEngine: drained %d buffered bars", len(buf))
+        return buf
 
     def register_adapter(self, adapter: LiveFeedAdapter) -> None:
         self._adapters[adapter.source_id] = adapter
@@ -249,6 +271,14 @@ class LiveIngestionEngine(BaseEngine):
         _SNAPSHOT_TIMEFRAMES = {BarTimeframe.M1, BarTimeframe.M5, BarTimeframe.H1, BarTimeframe.D1}
         if event.timeframe in _SNAPSHOT_TIMEFRAMES:
             self._latest_bars[event.symbol] = event
+
+        # During bootstrap WARMING phase, buffer bars instead of publishing.
+        # BootstrapEngine drains them in timestamp order after historical context
+        # is ready, skipping any that overlap with already-processed history.
+        if self._bootstrap_buffer is not None:
+            self._bootstrap_buffer.append(event)
+            return
+
         await self._event_bus.publish(event)
 
     async def _on_trade(self, event: TradeEvent) -> None:

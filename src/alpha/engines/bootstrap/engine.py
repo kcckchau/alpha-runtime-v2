@@ -223,30 +223,56 @@ class BootstrapEngine(BaseEngine, SnapshotMixin):
     # ── Private ───────────────────────────────────────────────────────────────
 
     async def _start_live(self) -> None:
-        """LIVE/PAPER startup sequence.
+        """LIVE/PAPER startup sequence — three phases.
 
-        1. Set live feed replay start = today's session open so the gateway
-           replays today's bars before going real-time (Databento supports 24h).
-        2. Start live feed (begins streaming + replaying immediately).
-        3. Historical catchup for past days (yesterday and older, from Parquet cache
-           or Databento historical API).
-        4. Flush storage, reconcile active setups.
+        Phase 1 — DISCOVERING
+          Fetch M1 history to find the historical watermark (latest available
+          bar). Start the live gateway replaying from (watermark - 1m) in
+          buffer mode so the stream is active but bars are held, not processed.
+
+        Phase 2 — WARMING
+          Load D1/H1 from Parquet cache (or Databento on cold start).
+          Resample M5 from M1 (no native Databento 5m schema).
+          Emit all bars in dependency order: D1 → H1 → M5 → M1 (is_replay=True).
+          Engines build their indicator state from this replay.
+
+        Phase 3 — ACTIVATING
+          Drain the gateway buffer. Skip bars whose timestamp ≤ watermark
+          (overlap with historical). Remaining bars flow through as is_replay=True
+          to gate Telegram until reconciliation is complete.
+          Reconcile active setups, then the runtime is READY.
         """
+        from alpha.engines.bootstrap.catchup import _force_replay
+
         assert self._catchup is not None
         symbols = list(self._settings.runtime.symbols)
 
-        # Configure live feed to replay from today's session open so we get
-        # today's bars without a separate historical fetch or tail catchup.
+        # ── Phase 1: DISCOVERING ──────────────────────────────────────────────
+        logger.info("Bootstrap phase 1: DISCOVERING")
+        m1_bars = await self._catchup.fetch_m1_history(symbols)
+        watermark = self._catchup.historical_watermark(m1_bars)
+
         if self._live is not None:
-            session_open = self._catchup.session_start(datetime.now(timezone.utc))
-            self._live.set_replay_start(session_open)
+            if watermark is not None:
+                replay_start = watermark - timedelta(minutes=1)
+            else:
+                replay_start = self._catchup.session_start(datetime.now(timezone.utc))
+            self._live.set_replay_start(replay_start)
+            self._live.enable_buffer_mode()
             await self._live.start()
             self._write_runtime_snapshot()
             if self._feature is not None:
                 await self._live.subscribe_tick_trades(self._feature.record_trade)
 
-        # Catchup covers past days only (stops at end of yesterday).
-        context_map = await self._catchup.run(symbols)
+        logger.info(
+            "Bootstrap phase 1 complete | watermark=%s | gateway_replay_from=%s",
+            watermark.isoformat() if watermark else "none",
+            replay_start.isoformat() if self._live else "n/a",
+        )
+
+        # ── Phase 2: WARMING ──────────────────────────────────────────────────
+        logger.info("Bootstrap phase 2: WARMING")
+        context_map = await self._catchup.warm_context(symbols, m1_bars)
         for symbol, ctx in context_map.items():
             self._startup_context[symbol] = build_symbol_context(
                 symbol=symbol,
@@ -259,8 +285,21 @@ class BootstrapEngine(BaseEngine, SnapshotMixin):
         if self._storage is not None:
             await self._storage.flush()
 
+        # ── Phase 3: ACTIVATING ───────────────────────────────────────────────
+        logger.info("Bootstrap phase 3: ACTIVATING")
+        if self._live is not None:
+            buffered = self._live.drain_buffer()
+            skipped = 0
+            for bar in buffered:
+                if watermark is not None and bar.timestamp <= watermark:
+                    skipped += 1
+                    continue  # deduplicate overlap with historical
+                await self._event_bus.publish(_force_replay(bar))
+            if skipped:
+                logger.info("Bootstrap: skipped %d overlap bars (timestamp ≤ watermark)", skipped)
+
         await self._reconcile_active_setups()
-        logger.info("Startup complete — live feed active (replaying from %s)", session_open.isoformat() if self._live else "n/a")
+        logger.info("Bootstrap READY — live feed active")
 
     def _cleanup_stale_tmp_files(self) -> None:
         """Remove temp files left behind by previous crashed runs."""
