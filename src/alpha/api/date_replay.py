@@ -106,9 +106,9 @@ async def run_date_backfill(
 
     try:
         # ── Step 1: ensure 1m bars are in Parquet ────────────────────────────
-        day_cached = parquet.exists(f"bars/{BarTimeframe.M1}", symbol.upper(), d)
+        has_bars = parquet.exists(f"bars/{BarTimeframe.M1}", symbol.upper(), d)
 
-        if not day_cached:
+        if not has_bars:
             job["status"] = JobStatus.FETCHING_BARS
             logger.info("[backfill] Fetching 1m bars for %s %s", symbol, d)
             bars_count = await _fetch_bars_from_best_source(symbol, d, settings, parquet)

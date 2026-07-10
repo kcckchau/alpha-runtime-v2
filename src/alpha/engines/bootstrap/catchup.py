@@ -43,16 +43,6 @@ def _timeframe_delta(timeframe: BarTimeframe) -> timedelta:
     return mapping[timeframe]
 
 
-# Minimum bar count for a cached day to be considered complete.
-# Used only for yesterday — to detect a partial file written by a crashed run.
-# Floors are well below any real trading day (RTH M1 ≈ 390, M5 ≈ 78)
-# but high enough that a mid-session crash is always caught.
-_MIN_COMPLETE_DAY_BARS: dict[BarTimeframe, int] = {
-    BarTimeframe.M1: 300,
-    BarTimeframe.M5: 55,
-}
-
-
 class CatchupService:
     """Encapsulates all historical catch-up logic for the bootstrap sequence."""
 
@@ -221,55 +211,40 @@ class CatchupService:
 
         Days with an existing Parquet file → load from storage (0 Databento calls).
         Days with no file → 1 Databento call per missing day.
-
-        Yesterday completeness guard: the most recent completed day's file may be
-        partial if the previous run crashed mid-session. If the cached bar count
-        is below the minimum plausible threshold, treat as incomplete and re-fetch.
-        Older days are immutable — file existence is sufficient.
         """
         all_bars: list[Any] = []
 
         current_day = start.date()
         last_day = end.date()  # end is always end-of-yesterday from run()
         while current_day <= last_day:
-            is_yesterday = (current_day == last_day)
-            if await self._storage.is_day_cached(symbol, timeframe, current_day):
+            if await self._storage.has_bars(symbol, timeframe, current_day):
                 day_bars = await self._storage.load_bar_events(symbol, timeframe, current_day, current_day)
-                min_bars = _MIN_COMPLETE_DAY_BARS.get(timeframe, 1)
-                if is_yesterday and len(day_bars) < min_bars:
-                    logger.warning(
-                        "Yesterday cache incomplete %s %s %s | cached=%d < min=%d — re-fetching",
-                        symbol, timeframe, current_day, len(day_bars), min_bars,
-                    )
-                else:
-                    all_bars.extend(day_bars)
-                    logger.info(
-                        "Day cache hit %s %s %s | bars=%d",
-                        symbol, timeframe, current_day, len(day_bars),
-                    )
-                    current_day += timedelta(days=1)
-                    continue
-
-            day_start = max(
-                start,
-                datetime(current_day.year, current_day.month, current_day.day, tzinfo=timezone.utc),
-            )
-            day_end = datetime(current_day.year, current_day.month, current_day.day, 23, 59, 59, tzinfo=timezone.utc)
-            logger.info(
-                "Fetching %s %s %s | %s -> %s",
-                symbol, timeframe, current_day,
-                day_start.isoformat(), day_end.isoformat(),
-            )
-            bars = await self._historical.fetch_bars(
-                symbol=symbol,
-                timeframe=timeframe,
-                start=day_start,
-                end=day_end,
-                emit=False,
-            )
-            for bar in bars:
-                await self._storage.save_bar(bar)
-            all_bars.extend(bars)
+                all_bars.extend(day_bars)
+                logger.info(
+                    "Day cache hit %s %s %s | bars=%d",
+                    symbol, timeframe, current_day, len(day_bars),
+                )
+            else:
+                day_start = max(
+                    start,
+                    datetime(current_day.year, current_day.month, current_day.day, tzinfo=timezone.utc),
+                )
+                day_end = datetime(current_day.year, current_day.month, current_day.day, 23, 59, 59, tzinfo=timezone.utc)
+                logger.info(
+                    "Fetching %s %s %s | %s -> %s",
+                    symbol, timeframe, current_day,
+                    day_start.isoformat(), day_end.isoformat(),
+                )
+                bars = await self._historical.fetch_bars(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    start=day_start,
+                    end=day_end,
+                    emit=False,
+                )
+                for bar in bars:
+                    await self._storage.save_bar(bar)
+                all_bars.extend(bars)
 
             current_day += timedelta(days=1)
 
