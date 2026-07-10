@@ -159,8 +159,8 @@ def backfill(start: str | None, end: str | None, dry_run: bool) -> None:
         return
 
     async def _run() -> None:
-        from alpha.engines.bootstrap.engine import BootstrapEngine
-        engine = BootstrapEngine(backfill_settings)
+        from alpha.engines.backfill.engine import BackfillEngine
+        engine = BackfillEngine(backfill_settings)
         try:
             await engine.initialize()
             await engine.start()

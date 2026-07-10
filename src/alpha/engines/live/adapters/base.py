@@ -9,6 +9,7 @@ leaks outside the adapter directory.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Callable, Coroutine, Any
 
 from alpha.models.enums import BarTimeframe, DataSourceId
@@ -59,8 +60,15 @@ class LiveFeedAdapter(ABC):
         symbols: list[str],
         timeframe: BarTimeframe,
         handler: BarHandlerT,
+        *,
+        start: "datetime | None" = None,
     ) -> None:
-        """Subscribe to real-time bars. Handler called on each new bar."""
+        """Subscribe to real-time bars. Handler called on each new bar.
+
+        start: replay from this point in history before going real-time.
+               Only supported by adapters that implement gateway replay
+               (e.g. Databento live). Ignored by others.
+        """
 
     @abstractmethod
     async def subscribe_trades(

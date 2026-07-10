@@ -110,6 +110,8 @@ class IBKRLiveFeedAdapter(LiveFeedAdapter):
         symbols: list[str],
         timeframe: BarTimeframe,
         handler: BarHandlerT,
+        *,
+        start: "datetime | None" = None,
     ) -> None:
         ib = await self._conn.get()
         bar_size = TIMEFRAME_TO_IBKR[timeframe]

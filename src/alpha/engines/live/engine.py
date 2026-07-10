@@ -96,12 +96,17 @@ class LiveIngestionEngine(BaseEngine):
         # completed bars). Keyed by symbol; reset on each new minute boundary.
         self._partial_accum: dict[str, _PartialAccum] = {}
         self._health_task: asyncio.Task[None] | None = None
+        self._replay_start: datetime | None = None
 
     @property
     def name(self) -> str:
         return "LiveIngestionEngine"
 
     # ── Adapter registration ──────────────────────────────────────────────────
+
+    def set_replay_start(self, start: datetime) -> None:
+        """Set the start time for live gateway replay. Must be called before start()."""
+        self._replay_start = start
 
     def register_adapter(self, adapter: LiveFeedAdapter) -> None:
         self._adapters[adapter.source_id] = adapter
@@ -139,7 +144,7 @@ class LiveIngestionEngine(BaseEngine):
             )
             return
 
-        await adapter.subscribe_bars(symbols, BarTimeframe.M1, self._on_bar)
+        await adapter.subscribe_bars(symbols, BarTimeframe.M1, self._on_bar, start=self._replay_start)
         await adapter.subscribe_bars(symbols, BarTimeframe.S1, self._on_bar)
         await adapter.subscribe_trades(symbols, self._on_trade)
         await adapter.subscribe_quotes(symbols, self._on_quote)

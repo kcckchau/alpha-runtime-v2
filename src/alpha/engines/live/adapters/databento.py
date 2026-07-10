@@ -217,6 +217,8 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
         symbols: list[str],
         timeframe: BarTimeframe,
         handler: BarHandlerT,
+        *,
+        start: datetime | None = None,
     ) -> None:
         if self._client is None:
             raise RuntimeError("Call connect() before subscribing")
@@ -229,12 +231,16 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             return
 
         db_syms = self._register_db_symbols(symbols)
-        self._client.subscribe(
+        subscribe_kwargs: dict = dict(
             dataset=self._settings.dataset,
             schema=schema,
             symbols=db_syms,
             stype_in=self._settings.stype_in,
         )
+        if start is not None:
+            subscribe_kwargs["start"] = start.isoformat()
+            logger.info("Live replay from %s for schema=%s", start.isoformat(), schema)
+        self._client.subscribe(**subscribe_kwargs)
         self._sub_specs[schema].update(db_syms)
         for ticker in symbols:
             self._bar_handlers[(ticker, schema)] = handler
