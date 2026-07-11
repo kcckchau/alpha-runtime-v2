@@ -74,7 +74,19 @@ class StorageEngine(BaseEngine):
     # read-modify-write of the target day's file, so batching many events into
     # one flush (rather than one flush per event) is what keeps the writer
     # ahead of high-frequency trade/quote volume as the file grows over the day.
+    #
+    # trades/quotes get a much longer interval than everything else: the
+    # rewrite cost scales with the *existing* file size, not the batch being
+    # appended, so late in the day a 2s cadence falls hopelessly behind —
+    # measured on a real MNQ-09 session, a single quotes flush at end-of-day
+    # volume (~23.7M rows) took ~17s, 8.5x the 2s budget. bars/setups/etc.
+    # stay on the short interval since their daily row counts are trivial.
     _FLUSH_INTERVAL_SECONDS = 2.0
+    _HIGH_FREQ_FLUSH_INTERVAL_SECONDS = 120.0
+    _HIGH_FREQ_TYPES = frozenset({"trades", "quotes"})
+    # Safety cap so a burst (e.g. a volatile open) can't grow the in-memory
+    # buffer unbounded while waiting out the long interval above.
+    _MAX_BUFFERED_ROWS = 50_000
 
     def __init__(self, settings: AlphaSettings, event_bus: EventBus) -> None:
         super().__init__()
@@ -89,6 +101,11 @@ class StorageEngine(BaseEngine):
         # Buffered rows awaiting flush, keyed by (data_type, symbol, date).
         # Populated synchronously (no I/O) by the writer loop; drained by _flush_loop.
         self._buffers: dict[tuple[str, str, date], list[dict[str, Any]]] = defaultdict(list)
+        # monotonic time a given partition key was last actually written —
+        # used to apply _HIGH_FREQ_FLUSH_INTERVAL_SECONDS per-key rather than
+        # globally, since bars and trades for the same symbol/day shouldn't
+        # share a cadence.
+        self._last_flush_at: dict[tuple[str, str, date], float] = {}
 
     @property
     def name(self) -> str:
@@ -248,12 +265,46 @@ class StorageEngine(BaseEngine):
         key = (data_type, self._storage_symbol(event), event.timestamp.date())
         self._buffers[key].append(row)
 
+    def _flush_interval_for(self, data_type: str) -> float:
+        return (
+            self._HIGH_FREQ_FLUSH_INTERVAL_SECONDS
+            if data_type in self._HIGH_FREQ_TYPES
+            else self._FLUSH_INTERVAL_SECONDS
+        )
+
     async def _flush_loop(self) -> None:
+        # Ticks on the short interval regardless of data type — that's just a
+        # cheap timestamp comparison per buffered key (see _flush_due). Only
+        # keys whose own interval has elapsed, or whose buffer has grown past
+        # _MAX_BUFFERED_ROWS, actually trigger a write this tick.
         while True:
             await asyncio.sleep(self._FLUSH_INTERVAL_SECONDS)
-            await self._flush_all()
+            await self._flush_due()
+
+    async def _flush_due(self) -> None:
+        if not self._buffers:
+            return
+        now = asyncio.get_running_loop().time()
+        due_keys = [
+            key
+            for key, rows in self._buffers.items()
+            if rows
+            and (
+                now - self._last_flush_at.get(key, 0.0) >= self._flush_interval_for(key[0])
+                or len(rows) >= self._MAX_BUFFERED_ROWS
+            )
+        ]
+        if not due_keys:
+            return
+        pending = {key: self._buffers.pop(key) for key in due_keys}
+        await self._write_pending(pending, now)
 
     async def _flush_all(self) -> None:
+        """Force-flush every buffered partition regardless of its interval.
+
+        Used for durability guarantees (flush(), shutdown) where "wait out
+        the rest of the high-frequency interval" isn't an acceptable answer.
+        """
         if not self._buffers:
             return
         # Swap out the buffer up front (single-threaded event loop — no race
@@ -261,10 +312,16 @@ class StorageEngine(BaseEngine):
         # so new events keep accumulating in a fresh buffer while this flush
         # writes the previous batch out.
         pending, self._buffers = self._buffers, defaultdict(list)
+        await self._write_pending(pending, asyncio.get_running_loop().time())
+
+    async def _write_pending(
+        self, pending: dict[tuple[str, str, date], list[dict[str, Any]]], flushed_at: float
+    ) -> None:
         loop = asyncio.get_running_loop()
         for (data_type, symbol, d), rows in pending.items():
             if not rows:
                 continue
+            self._last_flush_at[(data_type, symbol, d)] = flushed_at
             try:
                 await loop.run_in_executor(None, self._write_rows_sync, rows, data_type, symbol, d)
             except Exception:
