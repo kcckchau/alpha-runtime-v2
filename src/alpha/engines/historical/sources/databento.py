@@ -333,8 +333,10 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
 
 
 def _map_taker_side(raw: str | None) -> TakerSide:
+    # Databento side: 'A' = aggressor hit the ask (buyer) → BUY
+    #                 'B' = aggressor hit the bid (seller) → SELL
     if raw == "A":
-        return TakerSide.SELL   # aggressor hit the ask → sell
+        return TakerSide.BUY
     if raw == "B":
-        return TakerSide.BUY    # aggressor lifted the bid → buy
+        return TakerSide.SELL
     return TakerSide.UNKNOWN

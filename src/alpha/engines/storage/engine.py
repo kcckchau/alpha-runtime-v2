@@ -47,6 +47,15 @@ from alpha.models.events import (
 
 logger = logging.getLogger(__name__)
 
+# Event types where the same logical record may be written more than once
+# (restart, or a tick backfill re-covering a day already captured live) —
+# mapped to the column that uniquely identifies one logical record, so
+# ParquetStore.write() can upsert instead of blindly appending.
+_DEDUP_KEYS: dict[str, str] = {
+    "setups": "setup_id",
+    "trades": "trade_id",
+}
+
 
 class StorageEngine(BaseEngine):
     """
@@ -119,6 +128,12 @@ class StorageEngine(BaseEngine):
     async def save_bar(self, event: BarEvent) -> None:
         await self._write_queue.put(event)
 
+    async def save_trade(self, event: TradeEvent) -> None:
+        await self._write_queue.put(event)
+
+    async def save_quote(self, event: QuoteEvent) -> None:
+        await self._write_queue.put(event)
+
     async def flush(self) -> None:
         await self._write_queue.join()
         # Draining the queue only moves events into the in-memory buffer; force
@@ -143,6 +158,18 @@ class StorageEngine(BaseEngine):
 
     async def has_bars(self, symbol: str, timeframe: BarTimeframe, d: date) -> bool:
         return self._parquet.exists(f"bars/{timeframe}", symbol, d)
+
+    async def has_trades(self, symbol: str, d: date) -> bool:
+        return self._parquet.exists("trades", symbol, d)
+
+    async def has_quotes(self, symbol: str, d: date) -> bool:
+        return self._parquet.exists("quotes", symbol, d)
+
+    async def clear_quotes(self, symbol: str, d: date) -> None:
+        """Delete a day's quotes file. Quotes have no per-row dedup key (see
+        _DEDUP_KEYS), so a forced refetch must clear the old file first —
+        otherwise the new rows would just append on top of the old ones."""
+        self._parquet.delete("quotes", symbol, d)
 
     async def list_bar_dates(self, symbol: str, timeframe: BarTimeframe) -> list[date]:
         return self._parquet.list_dates(f"bars/{timeframe}", symbol)
@@ -192,11 +219,12 @@ class StorageEngine(BaseEngine):
         while True:
             event = await self._write_queue.get()
             try:
-                # Quotes are ephemeral high-frequency data (~hundreds/sec). They are
-                # never loaded back from Parquet, so skip buffering/writing them
-                # entirely — the write queue and buffers below only ever see the
-                # other (much lower-frequency) event types.
-                if not isinstance(event, QuoteEvent):
+                # Live quotes are ephemeral high-frequency data (~hundreds/sec) and
+                # are never loaded back from Parquet, so skip buffering/writing them
+                # to avoid falling behind the live feed. Historical/replay quotes
+                # (e.g. from an explicit tick backfill via save_quote) are finite
+                # and requested specifically to be persisted, so those are kept.
+                if not (isinstance(event, QuoteEvent) and not event.metadata.is_replay):
                     self._buffer_event(event)
                 self._writes_total += 1
             except Exception:
@@ -253,9 +281,17 @@ class StorageEngine(BaseEngine):
 
         table = pa.Table.from_pylist(rows)
         # Setups use upsert semantics: same setup_id on restart overwrites the
-        # previous row rather than duplicating it.
-        dedup_key = "setup_id" if data_type == "setups" else None
-        self._parquet.write(table, data_type, symbol, d, dedup_key=dedup_key)
+        # previous row rather than duplicating it. Trades can be written twice
+        # (once live, once via a later tick backfill covering the same day) —
+        # trade_id is stable across both sources, so dedup on it the same way.
+        # For trades specifically, prefer the live-captured row on conflict:
+        # its received_at reflects real feed latency, which a replay/backfill
+        # rewrite of the same trade would otherwise silently overwrite with a
+        # meaningless value (whenever the backfill happened to run).
+        dedup_key = _DEDUP_KEYS.get(data_type)
+        self._parquet.write(
+            table, data_type, symbol, d, dedup_key=dedup_key, prefer_live=(data_type == "trades")
+        )
 
     @staticmethod
     def _data_type_for(event: AnyEvent) -> str | None:

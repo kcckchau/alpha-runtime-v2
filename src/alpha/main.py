@@ -103,7 +103,18 @@ def api() -> None:
 @click.option("--start", default=None, help="Start date YYYY-MM-DD (default: warmup-driven per timeframe)")
 @click.option("--end", default=None, help="End date YYYY-MM-DD (default: today)")
 @click.option("--dry-run", is_flag=True, default=False, help="Show what would be fetched without making IBKR requests")
-def backfill(start: str | None, end: str | None, dry_run: bool) -> None:
+@click.option(
+    "--ticks", is_flag=True, default=False,
+    help="Also fetch and save raw trades + top-of-book quotes (MBP-1) for --start..--end. "
+         "Requires --start (ticks are not warmup-driven and default to just --end's day otherwise).",
+)
+@click.option(
+    "--force", is_flag=True, default=False,
+    help="Refetch --ticks days even if already stored (default: skip days already on disk). "
+         "Trades upsert safely by trade_id; quotes have no per-row key, so the day's file is "
+         "deleted and rewritten from scratch.",
+)
+def backfill(start: str | None, end: str | None, dry_run: bool, ticks: bool, force: bool) -> None:
     """Run historical backfill for configured symbols.
 
     Fetches only missing gaps from IBKR and writes them to the local Parquet cache.
@@ -129,6 +140,9 @@ def backfill(start: str | None, end: str | None, dry_run: bool) -> None:
     if end:
         overrides["replay"]["end_date"] = end
     backfill_settings = AlphaSettings.model_validate(overrides)
+
+    if ticks and not start:
+        raise click.UsageError("--ticks requires --start (tick backfill is not warmup-driven)")
 
     if dry_run:
         from datetime import datetime, timedelta, timezone
@@ -156,11 +170,13 @@ def backfill(start: str | None, end: str | None, dry_run: bool) -> None:
         click.echo(f"  5m start: {(end_dt - timedelta(days=m5_days)).date()} ({m5_days}d window) explicit={explicit_start}")
         click.echo(f"  1h start: {(end_dt - timedelta(days=h1_days)).date()} ({h1_days}d window) explicit={explicit_start}")
         click.echo(f"  1d start: {(end_dt - timedelta(days=d1_days)).date()} ({d1_days}d window) explicit={explicit_start}")
+        if ticks:
+            click.echo(f"  ticks   : trades + quotes(mbp-1) for {explicit_start} → {end_dt.date()}")
         return
 
     async def _run() -> None:
         from alpha.engines.backfill.engine import BackfillEngine
-        engine = BackfillEngine(backfill_settings)
+        engine = BackfillEngine(backfill_settings, fetch_ticks=ticks, force=force)
         try:
             await engine.initialize()
             await engine.start()

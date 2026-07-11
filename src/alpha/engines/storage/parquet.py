@@ -14,7 +14,6 @@ import os
 import tempfile
 from datetime import date
 from pathlib import Path
-from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -53,6 +52,7 @@ class ParquetStore:
         symbol: str,
         d: date,
         dedup_key: str | None = None,
+        prefer_live: bool = False,
     ) -> Path:
         """Write table to Parquet partition, appending to any existing data.
 
@@ -60,6 +60,12 @@ class ParquetStore:
         value appears in the new table are removed before concatenation — i.e.
         new rows win (upsert semantics). Use this for event types where the
         same logical record may be written more than once (e.g. setups on restart).
+
+        If prefer_live is also set, an existing row with is_replay=False is
+        protected from being overwritten by an incoming row for the same key —
+        live rows are the authoritative source for ingestion metadata (e.g.
+        received_at, used for feed latency stats), which a later replay/backfill
+        rewrite of the same logical record would otherwise silently discard.
         """
         path = _partition_path(self._root, data_type, symbol, d)
         path.mkdir(parents=True, exist_ok=True)
@@ -67,10 +73,25 @@ class ParquetStore:
         if file_path.exists():
             try:
                 existing = pq.ParquetFile(file_path).read()
-                if dedup_key is not None and dedup_key in existing.schema.names and dedup_key in table.schema.names:
-                    # Remove existing rows whose dedup_key appears in the new table.
-                    new_keys = table.column(dedup_key)
+                has_dedup_key = (
+                    dedup_key is not None
+                    and dedup_key in existing.schema.names
+                    and dedup_key in table.schema.names
+                )
+                if has_dedup_key:
                     import pyarrow.compute as pc
+                    if (
+                        prefer_live
+                        and "is_replay" in existing.schema.names
+                        and "is_replay" in table.schema.names
+                    ):
+                        live_rows = existing.filter(pc.invert(existing.column("is_replay")))
+                        live_keys = live_rows.column(dedup_key)
+                        new_key_col = table.column(dedup_key)
+                        table = table.filter(pc.invert(pc.is_in(new_key_col, value_set=live_keys)))
+                    # Remove existing rows whose dedup_key appears in the (possibly
+                    # now-filtered) new table.
+                    new_keys = table.column(dedup_key)
                     mask = pc.invert(pc.is_in(existing.column(dedup_key), value_set=new_keys))
                     existing = existing.filter(mask)
                 # Use "permissive" so null-typed columns (e.g. optional string fields
@@ -149,6 +170,16 @@ class ParquetStore:
 
     def exists(self, data_type: str, symbol: str, d: date) -> bool:
         return (_partition_path(self._root, data_type, symbol, d) / "data.parquet").exists()
+
+    def delete(self, data_type: str, symbol: str, d: date) -> None:
+        """Remove a partition's file, if present.
+
+        Used for data types with no natural per-row dedup key (e.g. quotes,
+        where a tick has no stable identity to upsert on) — a forced refetch
+        deletes the old file first so the next write starts clean instead of
+        appending duplicate rows on top of the old ones.
+        """
+        (_partition_path(self._root, data_type, symbol, d) / "data.parquet").unlink(missing_ok=True)
 
     def list_dates(self, data_type: str, symbol: str) -> list[date]:
         base = self._root / data_type / symbol
