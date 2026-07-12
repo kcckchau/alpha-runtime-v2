@@ -17,6 +17,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import AsyncIterator, Any
 
 import databento as db
@@ -128,6 +129,29 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
         avail = self.availability_end(schema or "ohlcv-1m")
         return min(end, avail)
 
+    def _archive_path(self, schema: str, db_symbol: str, start: datetime, end: datetime) -> Path | None:
+        root = self._settings.raw_archive_root
+        if root is None:
+            return None
+        fname = f"{start.strftime('%Y%m%dT%H%M%S')}_{end.strftime('%Y%m%dT%H%M%S')}.dbn.zst"
+        return root / schema / db_symbol / fname
+
+    def _load_from_archive(
+        self, schema: str, db_symbol: str, start: datetime, end: datetime
+    ) -> db.DBNStore | None:
+        """Decode a local raw-DBN archive instead of paying for another
+        Databento call, if one exists for this exact (schema, symbol, start,
+        end) key — e.g. `scripts/download_raw.py` already fetched it.
+        """
+        path = self._archive_path(schema, db_symbol, start, end)
+        if path is None or not path.exists():
+            return None
+        try:
+            return db.DBNStore.from_file(path)
+        except Exception:
+            logger.exception("Failed to read raw DBN archive, re-fetching: %s", path)
+            return None
+
     def _archive_raw(
         self, store: Any, schema: str, db_symbol: str, start: datetime, end: datetime
     ) -> None:
@@ -141,12 +165,8 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
         Synchronous (called via run_in_executor) — this is local file I/O
         on data already fully downloaded, not a network call.
         """
-        root = self._settings.raw_archive_root
-        if root is None:
-            return
-        fname = f"{start.strftime('%Y%m%dT%H%M%S')}_{end.strftime('%Y%m%dT%H%M%S')}.dbn.zst"
-        path = root / schema / db_symbol / fname
-        if path.exists():
+        path = self._archive_path(schema, db_symbol, start, end)
+        if path is None or path.exists():
             return
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -180,39 +200,46 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
             symbol, timeframe, schema, start.date(), end.date(),
         )
 
-        try:
-            store = self._client.timeseries.get_range(
-                dataset=self._settings.dataset,
-                schema=schema,
-                symbols=[db_symbol],
-                start=start.isoformat(),
-                end=end.isoformat(),
-                stype_in=self._settings.stype_in,
+        loop = asyncio.get_running_loop()
+        store = await loop.run_in_executor(None, self._load_from_archive, schema, db_symbol, start, end)
+        if store is not None:
+            logger.debug(
+                "Databento fetch_bars: %s [%s] schema=%s — using local raw archive, no API call",
+                symbol, timeframe, schema,
             )
-        except Exception as exc:
-            msg = str(exc)
-            if (
-                "data_schema_not_fully_available" in msg
-                or "data_end_after_available_end" in msg
-                or "data_start_after_available_end" in msg
-            ):
-                # Per-schema ingestion lags behind wall-clock — ohlcv-1h and ohlcv-1d
-                # lag significantly more than ohlcv-1m. metadata.get_dataset_range()
-                # ignores the schema arg and returns the overall dataset end, so the
-                # clamp doesn't help for slower schemas. Expected near realtime.
-                logger.debug(
-                    "Databento fetch_bars: %s [%s] schema=%s not yet available at end=%s — skipping",
-                    symbol, timeframe, schema, end.isoformat(),
+        else:
+            try:
+                store = self._client.timeseries.get_range(
+                    dataset=self._settings.dataset,
+                    schema=schema,
+                    symbols=[db_symbol],
+                    start=start.isoformat(),
+                    end=end.isoformat(),
+                    stype_in=self._settings.stype_in,
                 )
-            else:
-                logger.exception("Databento timeseries.get_range failed for %s", symbol)
-            return
+            except Exception as exc:
+                msg = str(exc)
+                if (
+                    "data_schema_not_fully_available" in msg
+                    or "data_end_after_available_end" in msg
+                    or "data_start_after_available_end" in msg
+                ):
+                    # Per-schema ingestion lags behind wall-clock — ohlcv-1h and ohlcv-1d
+                    # lag significantly more than ohlcv-1m. metadata.get_dataset_range()
+                    # ignores the schema arg and returns the overall dataset end, so the
+                    # clamp doesn't help for slower schemas. Expected near realtime.
+                    logger.debug(
+                        "Databento fetch_bars: %s [%s] schema=%s not yet available at end=%s — skipping",
+                        symbol, timeframe, schema, end.isoformat(),
+                    )
+                else:
+                    logger.exception("Databento timeseries.get_range failed for %s", symbol)
+                return
+            await loop.run_in_executor(None, self._archive_raw, store, schema, db_symbol, start, end)
 
         # Collect records in a thread to avoid blocking the event loop.
         # `store` iterates synchronously over an HTTP response — doing it on
         # the main thread would starve the live MBP-1 feed and trigger slow-client errors.
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._archive_raw, store, schema, db_symbol, start, end)
         records: list = await loop.run_in_executor(None, list, store)
 
         now = datetime.now(tz=_UTC)
@@ -255,25 +282,29 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
             "Databento fetch_trades: %s %s → %s", symbol, start.date(), end.date()
         )
 
-        try:
-            store = self._client.timeseries.get_range(
-                dataset=self._settings.dataset,
-                schema="trades",
-                symbols=[db_symbol],
-                start=start.isoformat(),
-                end=end.isoformat(),
-                stype_in=self._settings.stype_in,
-            )
-        except Exception as exc:
-            msg = str(exc)
-            if "data_schema_not_fully_available" in msg or "data_end_after_available_end" in msg:
-                logger.debug("Databento fetch_trades: %s schema not yet available at end=%s", symbol, end.isoformat())
-            else:
-                logger.exception("Databento trades fetch failed for %s", symbol)
-            return
-
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._archive_raw, store, "trades", db_symbol, start, end)
+        store = await loop.run_in_executor(None, self._load_from_archive, "trades", db_symbol, start, end)
+        if store is not None:
+            logger.debug("Databento fetch_trades: %s — using local raw archive, no API call", symbol)
+        else:
+            try:
+                store = self._client.timeseries.get_range(
+                    dataset=self._settings.dataset,
+                    schema="trades",
+                    symbols=[db_symbol],
+                    start=start.isoformat(),
+                    end=end.isoformat(),
+                    stype_in=self._settings.stype_in,
+                )
+            except Exception as exc:
+                msg = str(exc)
+                if "data_schema_not_fully_available" in msg or "data_end_after_available_end" in msg:
+                    logger.debug("Databento fetch_trades: %s schema not yet available at end=%s", symbol, end.isoformat())
+                else:
+                    logger.exception("Databento trades fetch failed for %s", symbol)
+                return
+            await loop.run_in_executor(None, self._archive_raw, store, "trades", db_symbol, start, end)
+
         records = await loop.run_in_executor(None, list, store)
 
         now = datetime.now(tz=_UTC)
@@ -314,25 +345,29 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
             "Databento fetch_quotes: %s %s → %s", symbol, start.date(), end.date()
         )
 
-        try:
-            store = self._client.timeseries.get_range(
-                dataset=self._settings.dataset,
-                schema="mbp-1",
-                symbols=[db_symbol],
-                start=start.isoformat(),
-                end=end.isoformat(),
-                stype_in=self._settings.stype_in,
-            )
-        except Exception as exc:
-            msg = str(exc)
-            if "data_schema_not_fully_available" in msg or "data_end_after_available_end" in msg:
-                logger.debug("Databento fetch_quotes: %s schema not yet available at end=%s", symbol, end.isoformat())
-            else:
-                logger.exception("Databento quotes fetch failed for %s", symbol)
-            return
-
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._archive_raw, store, "mbp-1", db_symbol, start, end)
+        store = await loop.run_in_executor(None, self._load_from_archive, "mbp-1", db_symbol, start, end)
+        if store is not None:
+            logger.debug("Databento fetch_quotes: %s — using local raw archive, no API call", symbol)
+        else:
+            try:
+                store = self._client.timeseries.get_range(
+                    dataset=self._settings.dataset,
+                    schema="mbp-1",
+                    symbols=[db_symbol],
+                    start=start.isoformat(),
+                    end=end.isoformat(),
+                    stype_in=self._settings.stype_in,
+                )
+            except Exception as exc:
+                msg = str(exc)
+                if "data_schema_not_fully_available" in msg or "data_end_after_available_end" in msg:
+                    logger.debug("Databento fetch_quotes: %s schema not yet available at end=%s", symbol, end.isoformat())
+                else:
+                    logger.exception("Databento quotes fetch failed for %s", symbol)
+                return
+            await loop.run_in_executor(None, self._archive_raw, store, "mbp-1", db_symbol, start, end)
+
         records = await loop.run_in_executor(None, list, store)
 
         now = datetime.now(tz=_UTC)
