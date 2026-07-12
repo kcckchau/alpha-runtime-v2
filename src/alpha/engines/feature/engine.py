@@ -202,6 +202,16 @@ class _HTFEMAState:
         self.ema_10: Decimal | None = None          # None unless track_ema10
         self.ema_20: Decimal | None = None          # None unless track_ema20
         self.ema_50: Decimal | None = None          # None unless track_ema50
+        self.prev_ema_9: Decimal | None = None
+        self.prev_ema_21: Decimal | None = None
+        self.prev_ema_10: Decimal | None = None
+        self.prev_ema_20: Decimal | None = None
+        self.prev_ema_50: Decimal | None = None
+        self.ema_9_slope: float | None = None
+        self.ema_21_slope: float | None = None
+        self.ema_10_slope: float | None = None
+        self.ema_20_slope: float | None = None
+        self.ema_50_slope: float | None = None
         self._track_ema10 = track_ema10
         self._track_ema20 = track_ema20
         self._track_ema50 = track_ema50
@@ -608,6 +618,8 @@ class FeatureEngine(BaseEngine):
             if state.latest_bid and state.latest_ask else None
         )
         spread_pct = float(spread / mid * 100) if spread and mid else None
+        m5 = self._m5_ema.get(bar.symbol)
+        h1 = self._h1_ema.get(bar.symbol)
 
         ema_9_slope: float | None = (
             float((state.ema_9 - state.prev_ema_9) / state.prev_ema_9 * 100)
@@ -678,12 +690,26 @@ class FeatureEngine(BaseEngine):
             ema_20=state.ema_20,
             ema_21=state.ema_21,
             ema_50=state.ema_50,
-            ema9_5m=self._m5_ema[bar.symbol].ema_9 if bar.symbol in self._m5_ema else None,
-            ema21_5m=self._m5_ema[bar.symbol].ema_21 if bar.symbol in self._m5_ema else None,
-            ema9_1h=self._h1_ema[bar.symbol].ema_9 if bar.symbol in self._h1_ema else None,
-            ema21_1h=self._h1_ema[bar.symbol].ema_21 if bar.symbol in self._h1_ema else None,
-            ema50_1h=self._h1_ema[bar.symbol].ema_50 if bar.symbol in self._h1_ema else None,
-            sma200_1h=self._h1_ema[bar.symbol].sma_200 if bar.symbol in self._h1_ema else None,
+            ema9_5m=m5.ema_9 if m5 is not None else None,
+            ema21_5m=m5.ema_21 if m5 is not None else None,
+            ema9_5m_slope=m5.ema_9_slope if m5 is not None else None,
+            ema9_5m_slope_direction=self._slope_direction(m5.ema_9_slope, 0.005) if m5 is not None else None,
+            ema21_5m_slope=m5.ema_21_slope if m5 is not None else None,
+            ema21_5m_slope_direction=self._slope_direction(m5.ema_21_slope, 0.005) if m5 is not None else None,
+            is_bull_stack_5m=self._is_bull_stack_5m(m5) if m5 is not None else None,
+            is_bear_stack_5m=self._is_bear_stack_5m(m5) if m5 is not None else None,
+            ema9_1h=h1.ema_9 if h1 is not None else None,
+            ema21_1h=h1.ema_21 if h1 is not None else None,
+            ema50_1h=h1.ema_50 if h1 is not None else None,
+            sma200_1h=h1.sma_200 if h1 is not None else None,
+            ema9_1h_slope=h1.ema_9_slope if h1 is not None else None,
+            ema9_1h_slope_direction=self._slope_direction(h1.ema_9_slope, 0.005) if h1 is not None else None,
+            ema21_1h_slope=h1.ema_21_slope if h1 is not None else None,
+            ema21_1h_slope_direction=self._slope_direction(h1.ema_21_slope, 0.005) if h1 is not None else None,
+            ema50_1h_slope=h1.ema_50_slope if h1 is not None else None,
+            ema50_1h_slope_direction=self._slope_direction(h1.ema_50_slope, 0.005) if h1 is not None else None,
+            is_bull_stack_1h=self._is_bull_stack_1h(h1) if h1 is not None else None,
+            is_bear_stack_1h=self._is_bear_stack_1h(h1) if h1 is not None else None,
             ema10_1d=self._d1_ema[bar.symbol].ema_10 if bar.symbol in self._d1_ema else None,
             ema20_1d=self._d1_ema[bar.symbol].ema_20 if bar.symbol in self._d1_ema else None,
             ema_9_slope=ema_9_slope,
@@ -751,6 +777,11 @@ class FeatureEngine(BaseEngine):
                 track_sma200=track_sma200,
             )
         s = store[sym]
+        s.prev_ema_9 = s.ema_9
+        s.prev_ema_21 = s.ema_21
+        s.prev_ema_10 = s.ema_10
+        s.prev_ema_20 = s.ema_20
+        s.prev_ema_50 = s.ema_50
         s.ema_9 = self._ema(bar.close, s.ema_9, 9)
         s.ema_21 = self._ema(bar.close, s.ema_21, 21)
         if s._track_ema10:
@@ -763,6 +794,11 @@ class FeatureEngine(BaseEngine):
             s._sma200_buf.append(bar.close)
             if len(s._sma200_buf) == 200:
                 s.sma_200 = sum(s._sma200_buf) / Decimal(200)
+        s.ema_9_slope = self._pct_slope(s.ema_9, s.prev_ema_9)
+        s.ema_21_slope = self._pct_slope(s.ema_21, s.prev_ema_21)
+        s.ema_10_slope = self._pct_slope(s.ema_10, s.prev_ema_10)
+        s.ema_20_slope = self._pct_slope(s.ema_20, s.prev_ema_20)
+        s.ema_50_slope = self._pct_slope(s.ema_50, s.prev_ema_50)
 
     @staticmethod
     def _ema(price: Decimal, prev: Decimal | None, period: int) -> Decimal:
@@ -770,6 +806,12 @@ class FeatureEngine(BaseEngine):
             return price
         k = Decimal(2) / Decimal(period + 1)
         return price * k + prev * (1 - k)
+
+    @staticmethod
+    def _pct_slope(current: Decimal | None, prev: Decimal | None) -> float | None:
+        if current is None or prev is None or prev <= _ZERO:
+            return None
+        return float((current - prev) / prev * 100)
 
     @staticmethod
     def _slope_direction(slope: float | None, flat_threshold: float) -> str | None:
@@ -784,6 +826,34 @@ class FeatureEngine(BaseEngine):
         if slope < -flat_threshold:
             return "down"
         return "flat"
+
+    @staticmethod
+    def _is_bull_stack_5m(state: _HTFEMAState) -> bool | None:
+        if state.ema_9 is None or state.ema_21 is None:
+            return None
+        return state.ema_9 > state.ema_21
+
+    @staticmethod
+    def _is_bear_stack_5m(state: _HTFEMAState) -> bool | None:
+        if state.ema_9 is None or state.ema_21 is None:
+            return None
+        return state.ema_9 < state.ema_21
+
+    @staticmethod
+    def _is_bull_stack_1h(state: _HTFEMAState) -> bool | None:
+        if state.ema_9 is None or state.ema_21 is None or state.ema_50 is None:
+            return None
+        if not (state.ema_9 > state.ema_21 > state.ema_50):
+            return False
+        return state.sma_200 is None or state.ema_50 > state.sma_200
+
+    @staticmethod
+    def _is_bear_stack_1h(state: _HTFEMAState) -> bool | None:
+        if state.ema_9 is None or state.ema_21 is None or state.ema_50 is None:
+            return None
+        if not (state.ema_9 < state.ema_21 < state.ema_50):
+            return False
+        return state.sma_200 is None or state.ema_50 < state.sma_200
 
     @staticmethod
     def _orb_state(state: SymbolFeatureState, bar: BarEvent) -> ORBState:

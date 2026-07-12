@@ -51,6 +51,12 @@ class BarSnapshot(BaseModel):
     # ── Trend indicators — 5m (carry-forward: updated on each M5 bar) ────────
     ema9_5m: Decimal | None = None            # 5m EMA9
     ema21_5m: Decimal | None = None           # 5m EMA21
+    ema9_5m_slope: float | None = None        # % rate-of-change of 5m EMA9 vs prior 5m bar
+    ema9_5m_slope_direction: str | None = None
+    ema21_5m_slope: float | None = None       # % rate-of-change of 5m EMA21 vs prior 5m bar
+    ema21_5m_slope_direction: str | None = None
+    is_bull_stack_5m: bool | None = None      # EMA9 > EMA21
+    is_bear_stack_5m: bool | None = None      # EMA9 < EMA21
 
     # ── Trend indicators — 1h (carry-forward: updated on each H1 bar) ────────
     # SMA200 requires 200 H1 bars (~8.5 trading days); will be None until warm.
@@ -58,6 +64,14 @@ class BarSnapshot(BaseModel):
     ema21_1h: Decimal | None = None           # 1h EMA21
     ema50_1h: Decimal | None = None           # 1h EMA50
     sma200_1h: Decimal | None = None          # 1h SMA200
+    ema9_1h_slope: float | None = None        # % rate-of-change of 1h EMA9 vs prior 1h bar
+    ema9_1h_slope_direction: str | None = None
+    ema21_1h_slope: float | None = None       # % rate-of-change of 1h EMA21 vs prior 1h bar
+    ema21_1h_slope_direction: str | None = None
+    ema50_1h_slope: float | None = None       # % rate-of-change of 1h EMA50 vs prior 1h bar
+    ema50_1h_slope_direction: str | None = None
+    is_bull_stack_1h: bool | None = None      # EMA9 > EMA21 > EMA50 (and > SMA200 when warmed)
+    is_bear_stack_1h: bool | None = None      # EMA9 < EMA21 < EMA50 (and < SMA200 when warmed)
 
     # ── Trend indicators — 1D (carry-forward: updated on each D1 bar) ────────
     ema10_1d: Decimal | None = None           # 1d EMA10

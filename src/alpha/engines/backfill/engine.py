@@ -33,9 +33,13 @@ logger = logging.getLogger(__name__)
 class BackfillEngine(BaseEngine):
     """Standalone engine that fetches missing bar gaps and writes them to Parquet cache."""
 
-    def __init__(self, settings: AlphaSettings | None = None) -> None:
+    def __init__(
+        self, settings: AlphaSettings | None = None, *, fetch_ticks: bool = False, force: bool = False
+    ) -> None:
         super().__init__()
         self._settings = settings or get_settings()
+        self._fetch_ticks = fetch_ticks
+        self._force = force
         self._event_bus = EventBus()
         self._registry = SymbolRegistry()
         self._calendar = NYSECalendar()
@@ -147,6 +151,66 @@ class BackfillEngine(BaseEngine):
                     timeframe=timeframe,
                     start=starts[timeframe],
                     end=end,
+                )
+
+        if self._fetch_ticks:
+            # Ticks use the explicit --start/--end range only (not the
+            # warmup-driven windows above) — there is no indicator warmup
+            # concept for raw trades/quotes, and the windows above can span
+            # months, which would be an enormous, almost certainly unwanted
+            # tick-level fetch.
+            tick_start = (
+                datetime(
+                    replay.start_date.year, replay.start_date.month, replay.start_date.day,
+                    tzinfo=timezone.utc,
+                )
+                if replay.start_date
+                else end - timedelta(days=1)
+            )
+            trading_days = self._calendar.trading_days(tick_start.date(), end.date())
+            for symbol in self._settings.runtime.symbols:
+                total_trades = total_quotes = 0
+                for d in trading_days:
+                    day_start = max(tick_start, datetime(d.year, d.month, d.day, tzinfo=timezone.utc))
+                    day_end = min(end, datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=timezone.utc))
+                    if day_start >= day_end:
+                        continue
+
+                    # Day-level idempotency: skip a day already captured (live or a
+                    # prior backfill run) instead of re-fetching and re-saving it —
+                    # trades/quotes don't have the bar-style gap-diff bars get in
+                    # CatchupService, so "already has a file for this day" is the
+                    # coarser check used here. --force bypasses the skip to let a
+                    # day be intentionally refreshed.
+                    trades_exist = await self._storage.has_trades(symbol, d)
+                    if self._force or not trades_exist:
+                        # Trades dedup on trade_id at write time (see StorageEngine
+                        # _DEDUP_KEYS), so a forced refetch safely upserts in place —
+                        # no need to clear the file first.
+                        trades = await self._historical.fetch_trades(symbol, day_start, day_end, emit=False)
+                        for trade in trades:
+                            await self._storage.save_trade(trade)
+                        total_trades += len(trades)
+                    else:
+                        logger.debug("Trades already stored for %s %s — skipping", symbol, d.isoformat())
+
+                    quotes_exist = await self._storage.has_quotes(symbol, d)
+                    if self._force or not quotes_exist:
+                        # Quotes have no per-row identity to dedup on, so a forced
+                        # refetch of a day that already has data must clear the old
+                        # file first or the new rows just duplicate on top of it.
+                        if self._force and quotes_exist:
+                            await self._storage.clear_quotes(symbol, d)
+                        quotes = await self._historical.fetch_quotes(symbol, day_start, day_end, emit=False)
+                        for quote in quotes:
+                            await self._storage.save_quote(quote)
+                        total_quotes += len(quotes)
+                    else:
+                        logger.debug("Quotes already stored for %s %s — skipping", symbol, d.isoformat())
+
+                logger.info(
+                    "Ticks saved for %s | %s → %s | trades=%d quotes=%d",
+                    symbol, tick_start.date(), end.date(), total_trades, total_quotes,
                 )
 
         await self._storage.flush()

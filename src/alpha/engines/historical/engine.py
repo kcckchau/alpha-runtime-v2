@@ -32,7 +32,7 @@ from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.engines.historical.sources.base import HistoricalDataSource
 from alpha.models.enums import BarTimeframe, HealthStatus
-from alpha.models.events import BarEvent
+from alpha.models.events import BarEvent, QuoteEvent, TradeEvent
 
 if TYPE_CHECKING:
     pass
@@ -158,6 +158,56 @@ class HistoricalDataEngine(BaseEngine):
         logger.debug(
             "Fetched %d bars for %s [%s] %s→%s",
             len(events), symbol, timeframe, start.date(), end.date(),
+        )
+        return events
+
+    async def fetch_trades(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        *,
+        source_id: str | None = None,
+        emit: bool = True,
+    ) -> list[TradeEvent]:
+        """Fetch, and optionally emit, trade ticks."""
+        source = self._sources.get(source_id or self._settings.historical.primary_source)
+        if source is None:
+            raise RuntimeError(f"No source available for id={source_id}")
+
+        events: list[TradeEvent] = []
+        async for event in source.fetch_trades(symbol, start, end):
+            events.append(event)
+            if emit:
+                await self._event_bus.publish(event)
+
+        logger.debug(
+            "Fetched %d trades for %s %s→%s", len(events), symbol, start.date(), end.date(),
+        )
+        return events
+
+    async def fetch_quotes(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        *,
+        source_id: str | None = None,
+        emit: bool = True,
+    ) -> list[QuoteEvent]:
+        """Fetch, and optionally emit, top-of-book (MBP-1) quotes."""
+        source = self._sources.get(source_id or self._settings.historical.primary_source)
+        if source is None:
+            raise RuntimeError(f"No source available for id={source_id}")
+
+        events: list[QuoteEvent] = []
+        async for event in source.fetch_quotes(symbol, start, end):
+            events.append(event)
+            if emit:
+                await self._event_bus.publish(event)
+
+        logger.debug(
+            "Fetched %d quotes for %s %s→%s", len(events), symbol, start.date(), end.date(),
         )
         return events
 

@@ -47,6 +47,15 @@ from alpha.models.events import (
 
 logger = logging.getLogger(__name__)
 
+# Event types where the same logical record may be written more than once
+# (restart, or a tick backfill re-covering a day already captured live) —
+# mapped to the column that uniquely identifies one logical record, so
+# ParquetStore.write() can upsert instead of blindly appending.
+_DEDUP_KEYS: dict[str, str] = {
+    "setups": "setup_id",
+    "trades": "trade_id",
+}
+
 
 class StorageEngine(BaseEngine):
     """
@@ -65,7 +74,19 @@ class StorageEngine(BaseEngine):
     # read-modify-write of the target day's file, so batching many events into
     # one flush (rather than one flush per event) is what keeps the writer
     # ahead of high-frequency trade/quote volume as the file grows over the day.
+    #
+    # trades/quotes get a much longer interval than everything else: the
+    # rewrite cost scales with the *existing* file size, not the batch being
+    # appended, so late in the day a 2s cadence falls hopelessly behind —
+    # measured on a real MNQ-09 session, a single quotes flush at end-of-day
+    # volume (~23.7M rows) took ~17s, 8.5x the 2s budget. bars/setups/etc.
+    # stay on the short interval since their daily row counts are trivial.
     _FLUSH_INTERVAL_SECONDS = 2.0
+    _HIGH_FREQ_FLUSH_INTERVAL_SECONDS = 120.0
+    _HIGH_FREQ_TYPES = frozenset({"trades", "quotes"})
+    # Safety cap so a burst (e.g. a volatile open) can't grow the in-memory
+    # buffer unbounded while waiting out the long interval above.
+    _MAX_BUFFERED_ROWS = 50_000
 
     def __init__(self, settings: AlphaSettings, event_bus: EventBus) -> None:
         super().__init__()
@@ -80,6 +101,11 @@ class StorageEngine(BaseEngine):
         # Buffered rows awaiting flush, keyed by (data_type, symbol, date).
         # Populated synchronously (no I/O) by the writer loop; drained by _flush_loop.
         self._buffers: dict[tuple[str, str, date], list[dict[str, Any]]] = defaultdict(list)
+        # monotonic time a given partition key was last actually written —
+        # used to apply _HIGH_FREQ_FLUSH_INTERVAL_SECONDS per-key rather than
+        # globally, since bars and trades for the same symbol/day shouldn't
+        # share a cadence.
+        self._last_flush_at: dict[tuple[str, str, date], float] = {}
 
     @property
     def name(self) -> str:
@@ -119,6 +145,12 @@ class StorageEngine(BaseEngine):
     async def save_bar(self, event: BarEvent) -> None:
         await self._write_queue.put(event)
 
+    async def save_trade(self, event: TradeEvent) -> None:
+        await self._write_queue.put(event)
+
+    async def save_quote(self, event: QuoteEvent) -> None:
+        await self._write_queue.put(event)
+
     async def flush(self) -> None:
         await self._write_queue.join()
         # Draining the queue only moves events into the in-memory buffer; force
@@ -143,6 +175,18 @@ class StorageEngine(BaseEngine):
 
     async def has_bars(self, symbol: str, timeframe: BarTimeframe, d: date) -> bool:
         return self._parquet.exists(f"bars/{timeframe}", symbol, d)
+
+    async def has_trades(self, symbol: str, d: date) -> bool:
+        return self._parquet.exists("trades", symbol, d)
+
+    async def has_quotes(self, symbol: str, d: date) -> bool:
+        return self._parquet.exists("quotes", symbol, d)
+
+    async def clear_quotes(self, symbol: str, d: date) -> None:
+        """Delete a day's quotes file. Quotes have no per-row dedup key (see
+        _DEDUP_KEYS), so a forced refetch must clear the old file first —
+        otherwise the new rows would just append on top of the old ones."""
+        self._parquet.delete("quotes", symbol, d)
 
     async def list_bar_dates(self, symbol: str, timeframe: BarTimeframe) -> list[date]:
         return self._parquet.list_dates(f"bars/{timeframe}", symbol)
@@ -192,11 +236,12 @@ class StorageEngine(BaseEngine):
         while True:
             event = await self._write_queue.get()
             try:
-                # Quotes are ephemeral high-frequency data (~hundreds/sec). They are
-                # never loaded back from Parquet, so skip buffering/writing them
-                # entirely — the write queue and buffers below only ever see the
-                # other (much lower-frequency) event types.
-                if not isinstance(event, QuoteEvent):
+                # Live quotes are ephemeral high-frequency data (~hundreds/sec) and
+                # are never loaded back from Parquet, so skip buffering/writing them
+                # to avoid falling behind the live feed. Historical/replay quotes
+                # (e.g. from an explicit tick backfill via save_quote) are finite
+                # and requested specifically to be persisted, so those are kept.
+                if not (isinstance(event, QuoteEvent) and not event.metadata.is_replay):
                     self._buffer_event(event)
                 self._writes_total += 1
             except Exception:
@@ -220,12 +265,46 @@ class StorageEngine(BaseEngine):
         key = (data_type, self._storage_symbol(event), event.timestamp.date())
         self._buffers[key].append(row)
 
+    def _flush_interval_for(self, data_type: str) -> float:
+        return (
+            self._HIGH_FREQ_FLUSH_INTERVAL_SECONDS
+            if data_type in self._HIGH_FREQ_TYPES
+            else self._FLUSH_INTERVAL_SECONDS
+        )
+
     async def _flush_loop(self) -> None:
+        # Ticks on the short interval regardless of data type — that's just a
+        # cheap timestamp comparison per buffered key (see _flush_due). Only
+        # keys whose own interval has elapsed, or whose buffer has grown past
+        # _MAX_BUFFERED_ROWS, actually trigger a write this tick.
         while True:
             await asyncio.sleep(self._FLUSH_INTERVAL_SECONDS)
-            await self._flush_all()
+            await self._flush_due()
+
+    async def _flush_due(self) -> None:
+        if not self._buffers:
+            return
+        now = asyncio.get_running_loop().time()
+        due_keys = [
+            key
+            for key, rows in self._buffers.items()
+            if rows
+            and (
+                now - self._last_flush_at.get(key, 0.0) >= self._flush_interval_for(key[0])
+                or len(rows) >= self._MAX_BUFFERED_ROWS
+            )
+        ]
+        if not due_keys:
+            return
+        pending = {key: self._buffers.pop(key) for key in due_keys}
+        await self._write_pending(pending, now)
 
     async def _flush_all(self) -> None:
+        """Force-flush every buffered partition regardless of its interval.
+
+        Used for durability guarantees (flush(), shutdown) where "wait out
+        the rest of the high-frequency interval" isn't an acceptable answer.
+        """
         if not self._buffers:
             return
         # Swap out the buffer up front (single-threaded event loop — no race
@@ -233,10 +312,16 @@ class StorageEngine(BaseEngine):
         # so new events keep accumulating in a fresh buffer while this flush
         # writes the previous batch out.
         pending, self._buffers = self._buffers, defaultdict(list)
+        await self._write_pending(pending, asyncio.get_running_loop().time())
+
+    async def _write_pending(
+        self, pending: dict[tuple[str, str, date], list[dict[str, Any]]], flushed_at: float
+    ) -> None:
         loop = asyncio.get_running_loop()
         for (data_type, symbol, d), rows in pending.items():
             if not rows:
                 continue
+            self._last_flush_at[(data_type, symbol, d)] = flushed_at
             try:
                 await loop.run_in_executor(None, self._write_rows_sync, rows, data_type, symbol, d)
             except Exception:
@@ -253,9 +338,17 @@ class StorageEngine(BaseEngine):
 
         table = pa.Table.from_pylist(rows)
         # Setups use upsert semantics: same setup_id on restart overwrites the
-        # previous row rather than duplicating it.
-        dedup_key = "setup_id" if data_type == "setups" else None
-        self._parquet.write(table, data_type, symbol, d, dedup_key=dedup_key)
+        # previous row rather than duplicating it. Trades can be written twice
+        # (once live, once via a later tick backfill covering the same day) —
+        # trade_id is stable across both sources, so dedup on it the same way.
+        # For trades specifically, prefer the live-captured row on conflict:
+        # its received_at reflects real feed latency, which a replay/backfill
+        # rewrite of the same trade would otherwise silently overwrite with a
+        # meaningless value (whenever the backfill happened to run).
+        dedup_key = _DEDUP_KEYS.get(data_type)
+        self._parquet.write(
+            table, data_type, symbol, d, dedup_key=dedup_key, prefer_live=(data_type == "trades")
+        )
 
     @staticmethod
     def _data_type_for(event: AnyEvent) -> str | None:
