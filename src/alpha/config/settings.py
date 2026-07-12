@@ -144,6 +144,11 @@ class DatabentoSettings(BaseSettings):
     # Suffix appended to root_symbol to build the Databento continuous symbol.
     # ".c.0" = front-month, ".c.1" = second-month, etc.
     continuous_suffix: str = ".c.0"
+    # Every historical fetch is archived here as a raw DBN file before being
+    # decoded into our own event models — lets a parsing bug (e.g. a
+    # taker_side mismapping) be re-checked or reprocessed offline without
+    # paying for another Databento API call. None disables archiving.
+    raw_archive_root: Path | None = Path("data/dbn_raw")
 
 
 class RiskSettings(BaseSettings):

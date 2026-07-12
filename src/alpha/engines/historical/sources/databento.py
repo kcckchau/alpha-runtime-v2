@@ -17,7 +17,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import AsyncIterator
+from typing import AsyncIterator, Any
 
 import databento as db
 
@@ -128,6 +128,32 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
         avail = self.availability_end(schema or "ohlcv-1m")
         return min(end, avail)
 
+    def _archive_raw(
+        self, store: Any, schema: str, db_symbol: str, start: datetime, end: datetime
+    ) -> None:
+        """Persist the raw DBN response before it's decoded and discarded.
+
+        Every parsing decision this file makes (fixed-point price scaling,
+        taker_side mapping, etc.) is only as trustworthy as our own code —
+        we've already found one of those backwards once. Keeping the raw
+        bytes means a parsing bug can be re-checked or reprocessed offline
+        against ground truth without paying for another Databento call.
+        Synchronous (called via run_in_executor) — this is local file I/O
+        on data already fully downloaded, not a network call.
+        """
+        root = self._settings.raw_archive_root
+        if root is None:
+            return
+        fname = f"{start.strftime('%Y%m%dT%H%M%S')}_{end.strftime('%Y%m%dT%H%M%S')}.dbn.zst"
+        path = root / schema / db_symbol / fname
+        if path.exists():
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            store.to_file(path)
+        except Exception:
+            logger.exception("Failed to archive raw DBN: %s", path)
+
     async def fetch_bars(
         self,
         symbol: str,
@@ -186,6 +212,7 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
         # `store` iterates synchronously over an HTTP response — doing it on
         # the main thread would starve the live MBP-1 feed and trigger slow-client errors.
         loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._archive_raw, store, schema, db_symbol, start, end)
         records: list = await loop.run_in_executor(None, list, store)
 
         now = datetime.now(tz=_UTC)
@@ -246,6 +273,7 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
             return
 
         loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._archive_raw, store, "trades", db_symbol, start, end)
         records = await loop.run_in_executor(None, list, store)
 
         now = datetime.now(tz=_UTC)
@@ -304,6 +332,7 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
             return
 
         loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._archive_raw, store, "mbp-1", db_symbol, start, end)
         records = await loop.run_in_executor(None, list, store)
 
         now = datetime.now(tz=_UTC)
@@ -333,10 +362,16 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
 
 
 def _map_taker_side(raw: str | None) -> TakerSide:
-    # Databento side: 'A' = aggressor hit the ask (buyer) → BUY
-    #                 'B' = aggressor hit the bid (seller) → SELL
+    # Empirically verified (2026-07-12) by joining trades against quotes and
+    # checking which side of the book each print actually landed on — a
+    # comment-trusting "fix" made earlier in this file's history had this
+    # backwards. Don't re-flip this without re-running that check: 18,012/
+    # 18,348 'A'-derived BUY-tagged trades in a June 5 sample printed at the
+    # bid, and 17,463/17,826 'B'-derived SELL-tagged trades printed at the
+    # ask — i.e. the on-disk truth is the opposite of Databento's own schema
+    # docs as previously understood here.
     if raw == "A":
-        return TakerSide.BUY
-    if raw == "B":
         return TakerSide.SELL
+    if raw == "B":
+        return TakerSide.BUY
     return TakerSide.UNKNOWN

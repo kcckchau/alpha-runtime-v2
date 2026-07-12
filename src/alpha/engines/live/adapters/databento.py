@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import threading
 from collections import defaultdict
@@ -93,6 +94,12 @@ _RTYPE_TRADE = 0    # MBP_0 / Trades schema records
 _RTYPE_SYMBOL_MAPPING = 22
 _RTYPE_SYSTEM = 23
 _RTYPE_ERROR = 21
+
+# Matches the live gateway's rejection message for a schema the account's plan
+# doesn't cover for real-time delivery, e.g. "Not authorized for mbp-10 schema"
+# — confirmed 2026-07-12 that this plan has full mbo/mbp-10 access historically
+# but not live, so this isn't hypothetical.
+_UNAUTHORIZED_SCHEMA_RE = re.compile(r"Not authorized for (\S+) schema")
 
 
 def _to_datetime(ts_ns: int) -> datetime:
@@ -389,7 +396,26 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                     # normal disconnect, not an error.
                     logger.warning("Databento live session closed unexpectedly (deque)")
                 else:
-                    logger.warning("Databento live session error: %s", exc)
+                    unauthorized = _UNAUTHORIZED_SCHEMA_RE.search(msg)
+                    if unauthorized is not None:
+                        # A single unauthorized schema (e.g. mbp-10/mbo on a plan that
+                        # only covers historical, not live, for that schema) tears down
+                        # the *entire* connection, not just that subscription — and
+                        # _reconnect() blindly replays every entry in _sub_specs, so
+                        # without this, an unauthorized schema puts the whole live feed
+                        # (bars, quotes, trades — everything) into a permanent
+                        # reconnect-reject loop. Drop it so the rest can recover.
+                        schema = unauthorized.group(1)
+                        if self._sub_specs.pop(schema, None) is not None:
+                            logger.error(
+                                "Databento: %s is not authorized on this account's live "
+                                "plan — dropped from the live feed so reconnects can "
+                                "succeed for the rest (%s). Historical/backfill access for "
+                                "this schema is unaffected.",
+                                schema, list(self._sub_specs.keys()),
+                            )
+                    else:
+                        logger.warning("Databento live session error: %s", exc)
             except Exception:
                 logger.exception("Databento live record loop exited with error")
 
