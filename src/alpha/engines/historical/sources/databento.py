@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import AsyncIterator, Any
+from uuid import uuid4
 
 import databento as db
 
@@ -446,6 +447,92 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
                 ),
             )
             yield event
+
+    async def fetch_quotes_rows(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+    ) -> AsyncIterator[dict]:
+        """Bulk-backfill fast path for quotes: yields row dicts in the exact
+        shape StorageEngine._serialize_event() produces for a QuoteEvent,
+        without ever constructing the Pydantic QuoteEvent object.
+
+        fetch_quotes() above is correct and stays as the normal path — the
+        live/replay pipeline genuinely needs a real, validated QuoteEvent for
+        engines to consume. But for a bulk backfill, that object is
+        immediately re-serialized into a dict and discarded (see
+        StorageEngine.save_quotes_bulk), so the Pydantic validation cost is
+        pure overhead we pay for and throw away. Measured directly: building
+        2M QuoteEvent objects took ~50-56s (~35-40k/s) regardless of
+        sync/async — extrapolated to a real 43.66M-row day, ~18-20 *minutes*
+        just for object construction, before any write logic even runs. That
+        was the actual bottleneck behind two write-side "fixes" earlier
+        tonight that were solving a downstream problem — this fixes the
+        upstream one.
+        """
+        db_symbol = self._databento_symbol(symbol)
+        end = self._safe_end(end, schema="mbp-1")
+
+        if start >= end:
+            return
+
+        loop = asyncio.get_running_loop()
+        t0 = time.perf_counter()
+        store = await loop.run_in_executor(None, self._load_from_archive, "mbp-1", db_symbol, start, end)
+        from_cache = store is not None
+        if store is None:
+            await loop.run_in_executor(None, self._log_cost_estimate, "mbp-1", db_symbol, start, end)
+            try:
+                store = self._client.timeseries.get_range(
+                    dataset=self._settings.dataset,
+                    schema="mbp-1",
+                    symbols=[db_symbol],
+                    start=start.isoformat(),
+                    end=end.isoformat(),
+                    stype_in=self._settings.stype_in,
+                )
+            except Exception as exc:
+                msg = str(exc)
+                if "data_schema_not_fully_available" in msg or "data_end_after_available_end" in msg:
+                    logger.debug("Databento fetch_quotes_rows: %s schema not yet available at end=%s", symbol, end.isoformat())
+                else:
+                    logger.exception("Databento quotes fetch failed for %s", symbol)
+                return
+            await loop.run_in_executor(None, self._archive_raw, store, "mbp-1", db_symbol, start, end)
+
+        records = await loop.run_in_executor(None, list, store)
+        elapsed = time.perf_counter() - t0
+        rate = len(records) / elapsed if elapsed > 0 else 0.0
+        logger.info(
+            "Databento fetch_quotes_rows: %s — %d records in %.1fs (%.0f/s)%s",
+            symbol, len(records), elapsed, rate, " [cache]" if from_cache else "",
+        )
+
+        source_str = str(DataSourceId.DATABENTO)
+        for record in records:
+            ts = _to_datetime(record.ts_event)
+            if ts < start or ts > end:
+                continue
+            now = datetime.now(tz=_UTC)
+            # MBP-1 top-of-book: levels[0] is best bid/ask
+            yield {
+                "event_id": str(uuid4()),
+                "event_type": "quote",
+                "symbol": symbol,
+                "timestamp": ts.isoformat(),
+                "source": source_str,
+                "received_at": now.isoformat(),
+                "is_replay": True,
+                "sequence_num": None,
+                "recorded_at": now.isoformat(),
+                "bid_price": str(_to_decimal(record.levels[0].bid_px)),
+                "bid_size": int(record.levels[0].bid_sz),
+                "ask_price": str(_to_decimal(record.levels[0].ask_px)),
+                "ask_size": int(record.levels[0].ask_sz),
+                "bid_exchange": None,
+                "ask_exchange": None,
+            }
 
 
 def _map_taker_side(raw: str | None) -> TakerSide:

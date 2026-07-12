@@ -211,6 +211,38 @@ class HistoricalDataEngine(BaseEngine):
         )
         return events
 
+    async def fetch_quotes_rows(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        *,
+        source_id: str | None = None,
+    ) -> list[dict]:
+        """Bulk-backfill fast path: row dicts, not QuoteEvents.
+
+        See DatabentoHistoricalDataSource.fetch_quotes_rows for why — skips
+        Pydantic construction entirely for a bulk fetch where the event
+        object would just be immediately re-serialized and discarded anyway.
+        No `emit` param: this path never publishes to the bus, since it only
+        exists for BackfillEngine's already-`emit=False` tick fetch.
+        """
+        source = self._sources.get(source_id or self._settings.historical.primary_source)
+        if source is None:
+            raise RuntimeError(f"No source available for id={source_id}")
+        if not hasattr(source, "fetch_quotes_rows"):
+            raise RuntimeError(f"{type(source).__name__} does not support fetch_quotes_rows")
+
+        rows: list[dict] = []
+        async for row in source.fetch_quotes_rows(symbol, start, end):
+            rows.append(row)
+
+        logger.debug(
+            "Fetched %d quote rows (bulk) for %s %s→%s",
+            len(rows), symbol, start.date(), end.date(),
+        )
+        return rows
+
     async def fetch_bars_multi(
         self,
         symbols: list[str],

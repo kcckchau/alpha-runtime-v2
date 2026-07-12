@@ -162,6 +162,9 @@ class StorageEngine(BaseEngine):
         grows, which is the same O(day size) cost per flush we fixed the
         flush interval for, just triggered on a compressed few-second dump
         instead of spread over a real trading session.
+
+        Builds one in-memory table — fine at trades scale (a full MNQ day
+        is ~2M rows). Quotes need a different approach; see save_quotes_bulk.
         """
         if not events:
             return
@@ -172,34 +175,63 @@ class StorageEngine(BaseEngine):
         )
 
     async def save_quotes_bulk(self, symbol: str, d: date, events: list[QuoteEvent]) -> None:
-        """Write an entire day's quotes in one shot. See save_trades_bulk."""
+        """Write an entire day's quotes in one shot, from already-constructed
+        QuoteEvents. Prefer save_quote_rows_bulk when the source supports the
+        row-dict fast path (see its docstring) — constructing a full
+        QuoteEvent per row for 40M+ rows costs ~18-20 minutes of pure Pydantic
+        validation overhead before this method even starts. Kept for sources
+        that don't implement fetch_quotes_rows.
+
+        Streams rather than building one in-memory table: a full day of MNQ
+        quotes is ~40M+ rows, and two earlier attempts to hold it all in one
+        table (a giant list-of-dicts, then a chunked-but-still-concatenated
+        version) drove RSS to 55GB and then 67GB on a real day and had to be
+        killed. Mirrors Databento's own DBNStore.to_parquet() implementation
+        instead (small chunks, one ParquetWriter kept open, never
+        concatenated). No dedup_key needed: a bulk quotes write only ever
+        runs against a day with no existing file (day-level skip in
+        BackfillEngine, or clear_quotes() on --force), so there's nothing to
+        merge against.
+        """
         if not events:
             return
         loop = asyncio.get_running_loop()
-        table = await loop.run_in_executor(None, self._events_to_table, events)
+        chunks = (
+            self._events_to_table(events[i : i + self._STREAM_CHUNK_SIZE])
+            for i in range(0, len(events), self._STREAM_CHUNK_SIZE)
+        )
         await loop.run_in_executor(
-            None, self._parquet.write, table, "quotes", symbol, d, None, False
+            None, self._parquet.write_streaming, chunks, "quotes", symbol, d
         )
 
-    # Chunk size for _events_to_table. Converting a whole day's events into
-    # one Python list of dicts before handing it to pa.Table.from_pylist()
-    # doesn't scale: a real 40M-row quotes day drove RSS to 55GB and stalled
-    # the process (confirmed against a live run, not a hunch). Chunking
-    # bounds peak memory to one chunk's worth of Python dicts plus the
-    # already-columnar (far more compact) Arrow tables concatenated so far.
-    _TABLE_CHUNK_SIZE = 500_000
+    async def save_quote_rows_bulk(self, symbol: str, d: date, rows: list[dict]) -> None:
+        """Write an entire day's quotes in one shot, from already-serialized
+        row dicts (see DatabentoHistoricalDataSource.fetch_quotes_rows) —
+        skips both the QuoteEvent construction cost and the _serialize_event
+        step, since these rows are already in final Parquet-row shape.
+        """
+        if not rows:
+            return
+        import pyarrow as pa
+
+        loop = asyncio.get_running_loop()
+        chunks = (
+            pa.Table.from_pylist(rows[i : i + self._STREAM_CHUNK_SIZE])
+            for i in range(0, len(rows), self._STREAM_CHUNK_SIZE)
+        )
+        await loop.run_in_executor(
+            None, self._parquet.write_streaming, chunks, "quotes", symbol, d
+        )
+
+    # Matches Databento's own DBNStore.to_parquet() chunk size (PARQUET_CHUNK_SIZE) —
+    # used for save_quotes_bulk's streaming write, not save_trades_bulk (which
+    # still builds one table; see its docstring for why that's fine at trades scale).
+    _STREAM_CHUNK_SIZE = 65_536
 
     def _events_to_table(self, events: list[AnyEvent]) -> Any:
         import pyarrow as pa
 
-        if len(events) <= self._TABLE_CHUNK_SIZE:
-            return pa.Table.from_pylist([self._serialize_event(e) for e in events])
-
-        tables = []
-        for i in range(0, len(events), self._TABLE_CHUNK_SIZE):
-            chunk = events[i : i + self._TABLE_CHUNK_SIZE]
-            tables.append(pa.Table.from_pylist([self._serialize_event(e) for e in chunk]))
-        return pa.concat_tables(tables, promote_options="permissive")
+        return pa.Table.from_pylist([self._serialize_event(e) for e in events])
 
     async def flush(self) -> None:
         await self._write_queue.join()

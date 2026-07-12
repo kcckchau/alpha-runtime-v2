@@ -207,9 +207,19 @@ class BackfillEngine(BaseEngine):
                         # file first or the new rows just duplicate on top of it.
                         if self._force and quotes_exist:
                             await self._storage.clear_quotes(symbol, d)
-                        quotes = await self._historical.fetch_quotes(symbol, day_start, day_end, emit=False)
-                        await self._storage.save_quotes_bulk(symbol, d, quotes)
-                        total_quotes += len(quotes)
+                        # Row-dict fast path (skips constructing a QuoteEvent per
+                        # row — measured at ~18-20 minutes of pure Pydantic
+                        # validation overhead for a real 43M-row day, before any
+                        # write logic even runs). Falls back to the QuoteEvent
+                        # path for sources that don't implement it (e.g. IBKR).
+                        try:
+                            rows = await self._historical.fetch_quotes_rows(symbol, day_start, day_end)
+                            await self._storage.save_quote_rows_bulk(symbol, d, rows)
+                            total_quotes += len(rows)
+                        except RuntimeError:
+                            quotes = await self._historical.fetch_quotes(symbol, day_start, day_end, emit=False)
+                            await self._storage.save_quotes_bulk(symbol, d, quotes)
+                            total_quotes += len(quotes)
                     else:
                         logger.debug("Quotes already stored for %s %s — skipping", symbol, d.isoformat())
 

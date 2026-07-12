@@ -9,9 +9,11 @@ data_type: bars | trades | quotes | snapshots | market_states | setups | orders
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import tempfile
+from collections.abc import Iterable
 from datetime import date
 from pathlib import Path
 
@@ -128,6 +130,68 @@ class ParquetStore:
             raise
 
         logger.debug("Wrote %d rows → %s", len(table), file_path)
+        return file_path
+
+    def write_streaming(
+        self,
+        table_chunks: Iterable[pa.Table],
+        data_type: str,
+        symbol: str,
+        d: date,
+    ) -> Path:
+        """Write a very large dataset without ever materializing it as one
+        in-memory table — for data types with no per-row dedup key (quotes),
+        where a bulk write always starts from a clean file (day-level skip
+        in BackfillEngine, or clear_quotes() on --force), so there's no
+        existing data to merge against.
+
+        Mirrors Databento's own DBNStore.to_parquet() implementation: small
+        chunks, one pyarrow.parquet.ParquetWriter kept open for the whole
+        file, each chunk written as its own row group, never concatenated.
+        Two earlier attempts that instead built one giant pa.Table before
+        writing (list-of-dicts, then chunked-but-still-concatenated) drove
+        RSS to 55GB and then 67GB on a real 43M-row quotes day and had to
+        be killed — this never holds more than one chunk in memory.
+
+        Does NOT support dedup_key/prefer_live — if a caller needs upsert
+        semantics against existing data, use write() instead.
+        """
+        path = _partition_path(self._root, data_type, symbol, d)
+        path.mkdir(parents=True, exist_ok=True)
+        file_path = path / "data.parquet"
+
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=path, suffix=".parquet.tmp")
+        os.close(tmp_fd)
+        writer: pq.ParquetWriter | None = None
+        total_rows = 0
+        try:
+            for chunk in table_chunks:
+                if chunk.num_rows == 0:
+                    continue
+                if writer is None:
+                    writer = pq.ParquetWriter(
+                        tmp_path,
+                        schema=chunk.schema,
+                        compression=self._compress,
+                    )
+                writer.write_table(chunk, row_group_size=self._row_group_size)
+                total_rows += chunk.num_rows
+            if writer is not None:
+                writer.close()
+                writer = None
+                os.replace(tmp_path, file_path)
+            else:
+                # No rows at all — nothing to write, clean up the empty temp file.
+                os.unlink(tmp_path)
+        except Exception:
+            if writer is not None:
+                with contextlib.suppress(Exception):
+                    writer.close()
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
+
+        logger.debug("Wrote %d rows (streamed) → %s", total_rows, file_path)
         return file_path
 
     def read(
