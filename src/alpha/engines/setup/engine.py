@@ -446,11 +446,20 @@ class SetupEngine(BaseEngine):
 
     def _reason_deep_exhaustion_reclaim(self, snap: BarSnapshot, ms: MarketState) -> str | None:
         """
-        FORMING: deep VWAP deviation (≤−0.35%), new session low, high volume
-        capitulation candle that closes off its lows.
+        FORMING: deep intrabar sweep below VWAP (low ≤−0.35%), new session low,
+        high volume capitulation candle that closes off its lows.
         CONFIRMED only after 3+ bars with no new low and VWAP deviation shrinking.
+
+        Depth is measured off the bar's low, not its close: vwap_deviation_pct
+        is close-based, so a bar with a strong reclaim (high
+        bar_close_position_pct) mechanically pulls its own close back toward
+        VWAP, shrinking the very depth measurement this gate needs — the
+        cleaner the reclaim, the less likely a close-based check is to see it
+        as "deep enough." Using the low keeps the two checks independent, the
+        same way Fake Breakdown measures sweep depth off bar.low while
+        measuring reclaim quality off bar_close_position_pct.
         """
-        if snap.vwap_deviation_pct > -0.35:
+        if snap.bar.low > snap.vwap * Decimal("0.9965"):
             return "not_deep_enough_below_vwap"
         if not snap.is_new_lod:
             return "not_new_lod"
