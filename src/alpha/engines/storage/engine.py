@@ -165,8 +165,9 @@ class StorageEngine(BaseEngine):
         """
         if not events:
             return
-        table = self._events_to_table(events)
-        await asyncio.get_running_loop().run_in_executor(
+        loop = asyncio.get_running_loop()
+        table = await loop.run_in_executor(None, self._events_to_table, events)
+        await loop.run_in_executor(
             None, self._parquet.write, table, "trades", symbol, d, "trade_id", True
         )
 
@@ -174,14 +175,31 @@ class StorageEngine(BaseEngine):
         """Write an entire day's quotes in one shot. See save_trades_bulk."""
         if not events:
             return
-        table = self._events_to_table(events)
-        await asyncio.get_running_loop().run_in_executor(
+        loop = asyncio.get_running_loop()
+        table = await loop.run_in_executor(None, self._events_to_table, events)
+        await loop.run_in_executor(
             None, self._parquet.write, table, "quotes", symbol, d, None, False
         )
 
+    # Chunk size for _events_to_table. Converting a whole day's events into
+    # one Python list of dicts before handing it to pa.Table.from_pylist()
+    # doesn't scale: a real 40M-row quotes day drove RSS to 55GB and stalled
+    # the process (confirmed against a live run, not a hunch). Chunking
+    # bounds peak memory to one chunk's worth of Python dicts plus the
+    # already-columnar (far more compact) Arrow tables concatenated so far.
+    _TABLE_CHUNK_SIZE = 500_000
+
     def _events_to_table(self, events: list[AnyEvent]) -> Any:
         import pyarrow as pa
-        return pa.Table.from_pylist([self._serialize_event(e) for e in events])
+
+        if len(events) <= self._TABLE_CHUNK_SIZE:
+            return pa.Table.from_pylist([self._serialize_event(e) for e in events])
+
+        tables = []
+        for i in range(0, len(events), self._TABLE_CHUNK_SIZE):
+            chunk = events[i : i + self._TABLE_CHUNK_SIZE]
+            tables.append(pa.Table.from_pylist([self._serialize_event(e) for e in chunk]))
+        return pa.concat_tables(tables, promote_options="permissive")
 
     async def flush(self) -> None:
         await self._write_queue.join()
