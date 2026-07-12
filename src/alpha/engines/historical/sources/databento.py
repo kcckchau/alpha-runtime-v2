@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -174,6 +175,30 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
         except Exception:
             logger.exception("Failed to archive raw DBN: %s", path)
 
+    def _log_cost_estimate(self, schema: str, db_symbol: str, start: datetime, end: datetime) -> None:
+        """Log Databento's own estimated $ cost before a real fetch.
+
+        Cheap (one metadata call) and catches an accidentally huge pull —
+        e.g. a full day of a dense schema — before it happens instead of
+        after the bill arrives. Synchronous (called via run_in_executor);
+        best-effort, never blocks the actual fetch if it fails.
+        """
+        try:
+            cost = self._client.metadata.get_cost(
+                dataset=self._settings.dataset,
+                schema=schema,
+                symbols=[db_symbol],
+                start=start.isoformat(),
+                end=end.isoformat(),
+                stype_in=self._settings.stype_in,
+            )
+            logger.info(
+                "Databento estimated cost: %s %s %s → %s: $%.4f",
+                schema, db_symbol, start.date(), end.date(), cost,
+            )
+        except Exception:
+            logger.debug("Databento get_cost failed (non-fatal)", exc_info=True)
+
     async def fetch_bars(
         self,
         symbol: str,
@@ -201,13 +226,16 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
         )
 
         loop = asyncio.get_running_loop()
+        t0 = time.perf_counter()
         store = await loop.run_in_executor(None, self._load_from_archive, schema, db_symbol, start, end)
+        from_cache = store is not None
         if store is not None:
             logger.debug(
                 "Databento fetch_bars: %s [%s] schema=%s — using local raw archive, no API call",
                 symbol, timeframe, schema,
             )
         else:
+            await loop.run_in_executor(None, self._log_cost_estimate, schema, db_symbol, start, end)
             try:
                 store = self._client.timeseries.get_range(
                     dataset=self._settings.dataset,
@@ -241,6 +269,12 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
         # `store` iterates synchronously over an HTTP response — doing it on
         # the main thread would starve the live MBP-1 feed and trigger slow-client errors.
         records: list = await loop.run_in_executor(None, list, store)
+        elapsed = time.perf_counter() - t0
+        rate = len(records) / elapsed if elapsed > 0 else 0.0
+        logger.info(
+            "Databento fetch_bars: %s [%s] schema=%s — %d records in %.1fs (%.0f/s)%s",
+            symbol, timeframe, schema, len(records), elapsed, rate, " [cache]" if from_cache else "",
+        )
 
         now = datetime.now(tz=_UTC)
         for record in records:
@@ -283,10 +317,13 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
         )
 
         loop = asyncio.get_running_loop()
+        t0 = time.perf_counter()
         store = await loop.run_in_executor(None, self._load_from_archive, "trades", db_symbol, start, end)
+        from_cache = store is not None
         if store is not None:
             logger.debug("Databento fetch_trades: %s — using local raw archive, no API call", symbol)
         else:
+            await loop.run_in_executor(None, self._log_cost_estimate, "trades", db_symbol, start, end)
             try:
                 store = self._client.timeseries.get_range(
                     dataset=self._settings.dataset,
@@ -306,6 +343,12 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
             await loop.run_in_executor(None, self._archive_raw, store, "trades", db_symbol, start, end)
 
         records = await loop.run_in_executor(None, list, store)
+        elapsed = time.perf_counter() - t0
+        rate = len(records) / elapsed if elapsed > 0 else 0.0
+        logger.info(
+            "Databento fetch_trades: %s — %d records in %.1fs (%.0f/s)%s",
+            symbol, len(records), elapsed, rate, " [cache]" if from_cache else "",
+        )
 
         now = datetime.now(tz=_UTC)
         for record in records:
@@ -346,10 +389,13 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
         )
 
         loop = asyncio.get_running_loop()
+        t0 = time.perf_counter()
         store = await loop.run_in_executor(None, self._load_from_archive, "mbp-1", db_symbol, start, end)
+        from_cache = store is not None
         if store is not None:
             logger.debug("Databento fetch_quotes: %s — using local raw archive, no API call", symbol)
         else:
+            await loop.run_in_executor(None, self._log_cost_estimate, "mbp-1", db_symbol, start, end)
             try:
                 store = self._client.timeseries.get_range(
                     dataset=self._settings.dataset,
@@ -369,6 +415,12 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
             await loop.run_in_executor(None, self._archive_raw, store, "mbp-1", db_symbol, start, end)
 
         records = await loop.run_in_executor(None, list, store)
+        elapsed = time.perf_counter() - t0
+        rate = len(records) / elapsed if elapsed > 0 else 0.0
+        logger.info(
+            "Databento fetch_quotes: %s — %d records in %.1fs (%.0f/s)%s",
+            symbol, len(records), elapsed, rate, " [cache]" if from_cache else "",
+        )
 
         now = datetime.now(tz=_UTC)
         for record in records:

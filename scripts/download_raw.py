@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -37,6 +38,14 @@ from alpha.instruments import resolve_symbol
 from alpha.models.enums import BarTimeframe
 
 _UTC = timezone.utc
+
+
+def _configure_logging(level: str) -> None:
+    logging.basicConfig(
+        format="%(message)s",
+        stream=sys.stdout,
+        level=getattr(logging, level.upper(), logging.INFO),
+    )
 
 _TIMEFRAME_SCHEMAS = {
     "1s": BarTimeframe.S1,
@@ -111,6 +120,8 @@ def main() -> None:
         help="Shorthand for --schemas trades,mbp-1 (ignored if --schemas is also given)",
     )
     args = parser.parse_args()
+
+    _configure_logging(get_settings().runtime.log_level)
 
     if args.schemas:
         schemas = [s.strip() for s in args.schemas.split(",") if s.strip()]
