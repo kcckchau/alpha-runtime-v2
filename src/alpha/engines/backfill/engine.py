@@ -184,12 +184,18 @@ class BackfillEngine(BaseEngine):
                     # day be intentionally refreshed.
                     trades_exist = await self._storage.has_trades(symbol, d)
                     if self._force or not trades_exist:
-                        # Trades dedup on trade_id at write time (see StorageEngine
-                        # _DEDUP_KEYS), so a forced refetch safely upserts in place —
-                        # no need to clear the file first.
+                        # The whole day is already materialized in memory by
+                        # fetch_trades() below, so write it in one shot rather
+                        # than trickling events through save_trade()'s
+                        # queue/periodic-flush pipeline — that pipeline exists
+                        # to batch *incrementally arriving* live events into
+                        # fewer writes, and forces repeated full-file
+                        # read-rewrite cycles on an already-huge file if fed a
+                        # day's worth of events in a few seconds instead.
+                        # Trades still dedup on trade_id (prefer_live=True),
+                        # so a forced refetch safely upserts in place.
                         trades = await self._historical.fetch_trades(symbol, day_start, day_end, emit=False)
-                        for trade in trades:
-                            await self._storage.save_trade(trade)
+                        await self._storage.save_trades_bulk(symbol, d, trades)
                         total_trades += len(trades)
                     else:
                         logger.debug("Trades already stored for %s %s — skipping", symbol, d.isoformat())
@@ -202,8 +208,7 @@ class BackfillEngine(BaseEngine):
                         if self._force and quotes_exist:
                             await self._storage.clear_quotes(symbol, d)
                         quotes = await self._historical.fetch_quotes(symbol, day_start, day_end, emit=False)
-                        for quote in quotes:
-                            await self._storage.save_quote(quote)
+                        await self._storage.save_quotes_bulk(symbol, d, quotes)
                         total_quotes += len(quotes)
                     else:
                         logger.debug("Quotes already stored for %s %s — skipping", symbol, d.isoformat())

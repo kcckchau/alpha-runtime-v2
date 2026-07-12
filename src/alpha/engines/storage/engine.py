@@ -151,6 +151,38 @@ class StorageEngine(BaseEngine):
     async def save_quote(self, event: QuoteEvent) -> None:
         await self._write_queue.put(event)
 
+    async def save_trades_bulk(self, symbol: str, d: date, events: list[TradeEvent]) -> None:
+        """Write an entire day's trades in one shot — for backfill, where the
+        whole day is already materialized in memory before any storage call
+        happens. Bypasses the write queue / periodic-flush buffer entirely:
+        that pipeline exists to batch *incrementally arriving* live events
+        into fewer writes, but a backfill has no incremental arrival to batch
+        — routing it through save_trade() one event at a time instead forces
+        a flush to repeatedly read-and-rewrite an already-huge file as it
+        grows, which is the same O(day size) cost per flush we fixed the
+        flush interval for, just triggered on a compressed few-second dump
+        instead of spread over a real trading session.
+        """
+        if not events:
+            return
+        table = self._events_to_table(events)
+        await asyncio.get_running_loop().run_in_executor(
+            None, self._parquet.write, table, "trades", symbol, d, "trade_id", True
+        )
+
+    async def save_quotes_bulk(self, symbol: str, d: date, events: list[QuoteEvent]) -> None:
+        """Write an entire day's quotes in one shot. See save_trades_bulk."""
+        if not events:
+            return
+        table = self._events_to_table(events)
+        await asyncio.get_running_loop().run_in_executor(
+            None, self._parquet.write, table, "quotes", symbol, d, None, False
+        )
+
+    def _events_to_table(self, events: list[AnyEvent]) -> Any:
+        import pyarrow as pa
+        return pa.Table.from_pylist([self._serialize_event(e) for e in events])
+
     async def flush(self) -> None:
         await self._write_queue.join()
         # Draining the queue only moves events into the in-memory buffer; force
