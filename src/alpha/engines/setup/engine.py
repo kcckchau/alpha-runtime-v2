@@ -222,7 +222,7 @@ class SetupEngine(BaseEngine):
         """
         symbol = bundle.symbol
         bar = bundle.to_bar_event()
-        self._roll_session_if_needed(symbol, bar.timestamp)
+        await self._roll_session_if_needed(symbol, bar.timestamp, bar)
         session_key = self._session_keys.get(symbol, "")
 
         if self._bar_count_session.get(symbol) != session_key:
@@ -250,7 +250,7 @@ class SetupEngine(BaseEngine):
         symbol = event.symbol
         # Roll session BEFORE reading session_key so the bar counter compares
         # against the current (possibly just-rolled) session, not the prior one.
-        self._roll_session_if_needed(symbol, event.timestamp)
+        await self._roll_session_if_needed(symbol, event.timestamp, event)
         session_key = self._session_keys.get(symbol, "")
 
         # Increment per-symbol bar counter; reset on new session.
@@ -634,6 +634,9 @@ class SetupEngine(BaseEngine):
                     # Entry above the reclaim bar's high; stop = reclaim bar's low
                     entry = setup.bar_snapshot.bar.high
                     stop = setup.bar_snapshot.bar.low
+                    rw_reason = self._risk_width_rejection(entry, stop, snap)
+                    if rw_reason:
+                        return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
                     mult = self._target_mult("buy", ms)
                     target = (
                         snap.intraday_high
@@ -919,6 +922,22 @@ class SetupEngine(BaseEngine):
             return "close_in_lower_half_of_bar"
         return None
 
+    @staticmethod
+    def _vwap_rejection_alignment_reason(snap: BarSnapshot) -> str | None:
+        if snap.ema_9 is not None and snap.bar.close >= snap.ema_9:
+            return "close_not_below_ema9"
+        if snap.ema_20 is not None and snap.bar.close >= snap.ema_20:
+            return "close_not_below_ema20"
+        if snap.ema_9_slope is not None and snap.ema_9_slope >= 0:
+            return "ema9_slope_not_down"
+        if snap.ema_20_slope is not None and snap.ema_20_slope >= 0:
+            return "ema20_slope_not_down"
+        if snap.is_bull_stack_5m is True:
+            return "five_min_stack_still_bullish"
+        if snap.ema9_5m_slope_direction == "up" or snap.ema21_5m_slope_direction == "up":
+            return "five_min_slope_not_bearish"
+        return None
+
     def _detect_vwap_rejection(self, snap: BarSnapshot, ms: MarketState) -> bool:
         """
         Detects the INITIAL clean cross below VWAP — effectively a VWAP breakdown short.
@@ -939,6 +958,8 @@ class SetupEngine(BaseEngine):
             return False
         if snap.bar_close_position_pct is not None and snap.bar_close_position_pct > 0.5:
             return False
+        if self._vwap_rejection_alignment_reason(snap) is not None:
+            return False
         return True
 
     def _reason_vwap_rejection(self, snap: BarSnapshot, ms: MarketState) -> str | None:
@@ -950,6 +971,35 @@ class SetupEngine(BaseEngine):
             return "close_not_below_vwap_with_conviction"
         if snap.bar_close_position_pct is not None and snap.bar_close_position_pct > 0.5:
             return "close_in_upper_half_of_bar"
+        alignment_reason = self._vwap_rejection_alignment_reason(snap)
+        if alignment_reason is not None:
+            return alignment_reason
+        return None
+
+    def _detect_orb_breakout(self, snap: BarSnapshot, ms: MarketState) -> bool:
+        if snap.orb_high is None:
+            return False
+        if snap.orb_state != ORBState.BREAKOUT_UP:
+            return False
+        if not snap.is_above_vwap:
+            return False
+        if snap.bar.close <= snap.orb_high:
+            return False
+        if snap.bar.open > snap.orb_high and snap.bar.low > snap.orb_high:
+            return False
+        return True
+
+    def _reason_orb_breakout(self, snap: BarSnapshot, ms: MarketState) -> str | None:
+        if snap.orb_high is None:
+            return "no_orb_high_set"
+        if snap.orb_state != ORBState.BREAKOUT_UP:
+            return "not_orb_breakout_up"
+        if not snap.is_above_vwap:
+            return "below_vwap"
+        if snap.bar.close <= snap.orb_high:
+            return "close_not_above_orb_high"
+        if snap.bar.open > snap.orb_high and snap.bar.low > snap.orb_high:
+            return "already_extended_above_orb_high"
         return None
 
     def _detect_orb_breakdown(self, snap: BarSnapshot, ms: MarketState) -> bool:
@@ -1284,11 +1334,6 @@ class SetupEngine(BaseEngine):
 
         return setup, ""
 
-    # ── Stub detectors (not yet implemented) ─────────────────────────────────
-
-    def _detect_orb_breakout(self, snap: BarSnapshot, ms: MarketState) -> bool:
-        return False
-
     def _detector_reason(
         self,
         setup_type: SetupType,
@@ -1318,7 +1363,7 @@ class SetupEngine(BaseEngine):
         if setup_type == SetupType.ORB_BREAKDOWN:
             return self._reason_orb_breakdown(snapshot, market_state)
         if setup_type == SetupType.ORB_BREAKOUT:
-            return "not_implemented"
+            return self._reason_orb_breakout(snapshot, market_state)
         if setup_type == SetupType.ONL_SWEEP_RECLAIM_LONG:
             return self._reason_onl_sweep_reclaim_long(snapshot, market_state)
         if setup_type == SetupType.DOUBLE_BOTTOM_RECLAIM_LONG:
@@ -1494,6 +1539,8 @@ class SetupEngine(BaseEngine):
             return self._advance_vwap_failed_reclaim_short(setup, snapshot, market_state)
         if setup.setup_type == SetupType.TREND_PULLBACK_SHORT:
             return self._advance_trend_pullback_short(setup, snapshot, market_state)
+        if setup.setup_type == SetupType.ORB_BREAKOUT:
+            return self._advance_orb_breakout(setup, snapshot, market_state)
         if setup.setup_type == SetupType.ORB_BREAKDOWN:
             return self._advance_orb_breakdown(setup, snapshot, market_state)
         if setup.setup_type == SetupType.ONL_SWEEP_RECLAIM_LONG:
@@ -1685,6 +1732,9 @@ class SetupEngine(BaseEngine):
                 if no_new_low and ema_reclaim and shrinking:
                     entry = snap.bar.high
                     stop = setup.bar_snapshot.bar.low * Decimal("0.9995")
+                    rw_reason = self._risk_width_rejection(entry, stop, snap)
+                    if rw_reason:
+                        return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
                     mult = self._target_mult("buy", ms)
                     target = entry + (entry - stop) * mult
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
@@ -1720,6 +1770,9 @@ class SetupEngine(BaseEngine):
                     # Use breakout bar's low as stop — tighter and more logical
                     # than vwap-based stop which can be 100+ pts wide on MNQ.
                     stop = snap.bar.low
+                    rw_reason = self._risk_width_rejection(entry, stop, snap)
+                    if rw_reason:
+                        return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
                     mult = self._target_mult("buy", ms)
                     target = entry + (entry - stop) * mult
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
@@ -1737,6 +1790,58 @@ class SetupEngine(BaseEngine):
                     return confirmed, "confirmed"
 
         elif setup.state == SetupState.CONFIRMED:
+            if setup.entry_trigger and snap.bar.high >= setup.entry_trigger:
+                return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"
+            if setup.stop_reference and snap.bar.low <= setup.stop_reference:
+                return setup.transition(SetupState.FAILED, bar_time=snap.timestamp), "stop hit"
+
+        return setup, ""
+
+    def _advance_orb_breakout(
+        self, setup: Setup, snap: BarSnapshot, ms: MarketState
+    ) -> tuple[Setup, str]:
+        if setup.state == SetupState.FORMING:
+            self._forming_bars[setup.setup_id] = (
+                self._forming_bars.get(setup.setup_id, 0) + 1
+            )
+            if snap.orb_high is not None and snap.bar.close < snap.orb_high:
+                return setup.transition(SetupState.INVALIDATED, "fell_back_below_orb_high", bar_time=snap.timestamp), ""
+            if not snap.is_above_vwap:
+                return setup.transition(SetupState.INVALIDATED, "lost_vwap_while_forming", bar_time=snap.timestamp), ""
+            if snap.orb_high is not None and snap.bar.close > snap.orb_high:
+                rvol_ok = snap.relative_volume is None or snap.relative_volume >= 1.0
+                if rvol_ok:
+                    entry = setup.bar_snapshot.bar.close
+                    stop = snap.orb_high * Decimal("0.999")
+                    rw_reason = self._risk_width_rejection(entry, stop, snap)
+                    if rw_reason:
+                        return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
+                    orb_range = (
+                        (snap.orb_high - snap.orb_low)
+                        if snap.orb_high and snap.orb_low else None
+                    )
+                    mult = self._target_mult("buy", ms)
+                    target = (
+                        entry + orb_range * mult
+                        if orb_range else entry + (entry - stop) * mult
+                    )
+                    confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
+                        update={
+                            "entry_trigger": entry,
+                            "stop_reference": stop,
+                            "target_reference": target,
+                        }
+                    )
+                    logger.info(
+                        "Setup confirmed: %s %s entry=%.2f stop=%.2f target=%.2f",
+                        setup.symbol, setup.setup_type,
+                        float(entry), float(stop), float(target),
+                    )
+                    return confirmed, "confirmed"
+
+        elif setup.state == SetupState.CONFIRMED:
+            if snap.orb_high is not None and snap.bar.close < snap.orb_high:
+                return setup.transition(SetupState.INVALIDATED, "fell_back_below_orb_high", bar_time=snap.timestamp), ""
             if setup.entry_trigger and snap.bar.high >= setup.entry_trigger:
                 return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"
             if setup.stop_reference and snap.bar.low <= setup.stop_reference:
@@ -1768,6 +1873,9 @@ class SetupEngine(BaseEngine):
                     # Stop: confirmation bar's low (unique per bar, tighter and more
                     # relevant than a fixed VWAP percentage across all detections).
                     stop = snap.bar.low
+                    rw_reason = self._risk_width_rejection(entry, stop, snap)
+                    if rw_reason:
+                        return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
                     mult = self._target_mult("buy", ms)
                     target = (
                         snap.intraday_high
@@ -1824,17 +1932,29 @@ class SetupEngine(BaseEngine):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _roll_session_if_needed(self, symbol: str, timestamp: datetime) -> None:
+    async def _roll_session_if_needed(
+        self,
+        symbol: str,
+        timestamp: datetime,
+        trigger: BarEvent,
+    ) -> None:
         calendar = self._calendar_for_symbol(symbol)
         session_key = calendar.session_key(timestamp)
         if self._session_keys.get(symbol) == session_key:
             return
 
-        self._session_keys[symbol] = session_key
-        stale_ids = list(self._active.get(symbol, {}).keys())
-        self._active[symbol] = {}
-        for setup_id in stale_ids:
+        for setup_id, active_setup in list(self._active.get(symbol, {}).items()):
+            expired = active_setup.transition(
+                SetupState.EXPIRED,
+                reason="session_rolled",
+                bar_time=timestamp,
+            )
+            self._record_setup(symbol, expired)
+            await self._emit(expired, active_setup.state, trigger)
             self._forming_bars.pop(setup_id, None)
+
+        self._session_keys[symbol] = session_key
+        self._active[symbol] = {}
         # Reset per-session cooldown and bar counter on roll.
         self._last_close_bar.pop(symbol, None)
         self._bar_counts[symbol] = 0
@@ -1989,7 +2109,7 @@ class SetupEngine(BaseEngine):
     def _session_allows_detection(self, symbol: str, snapshot: BarSnapshot) -> bool:
         asset_class = self._registry.get(symbol).asset_class
         if asset_class == AssetClass.FUTURE:
-            return snapshot.session_phase != SessionPhase.CLOSED
+            return snapshot.session_phase in _RTH_PHASES
         return snapshot.session_phase in _RTH_PHASES
 
     def _get_snapshot(self, symbol: str) -> BarSnapshot | None:
