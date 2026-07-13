@@ -309,12 +309,15 @@ function formatPnl(value: number | null | undefined): string {
 
 function historyStartDate(symbol: string, timeframe: Timeframe): string {
   // Limit rows returned per timeframe so the initial load stays fast.
-  // 1m = 2 days (~2880 bars for 24h futures), 5m/15m = 5 days, 1h/1d = 30 days.
+  // 5m/15m = 5 days, 1h/1d = 30 days.
+  // 1m for 24h futures (MNQ, ES, …): 5 days so the previous Friday session is
+  // always visible on Monday — a 2-day window only reaches Saturday and misses it.
+  // 1m for equities/other: 2 days is enough (no weekend session gap to bridge).
+  const is24hSymbol = /^(MNQ|NQ|ES|MES|RTY|M2K|YM|MYM|CL|GC|SI|NKD|EMD)/.test(symbol);
   const lookbackDays =
-    timeframe === "1m" ? 2
+    timeframe === "1m" ? (is24hSymbol ? 5 : 2)
     : timeframe === "5m" || timeframe === "15m" ? 5
     : 30;
-  void symbol; // symbol-specific overrides can go here in the future
   const start = new Date(Date.now() - lookbackDays * 864e5);
   return start.toISOString().slice(0, 10);
 }
