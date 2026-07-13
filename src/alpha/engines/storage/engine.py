@@ -300,9 +300,11 @@ class StorageEngine(BaseEngine):
 
     async def _on_event(self, event: AnyEvent) -> None:
         if isinstance(event, BarEvent):
-            # Replay bars are already persisted to Parquet via persist_direct in
-            # _load_or_fetch_bars. Storing them again here would duplicate every
-            # bar on each restart.
+            # Replay bars are persisted directly by CatchupService (M1) and
+            # _load_or_fetch_bars (H1/D1) via save_bar(). Storing them again
+            # here via the EventBus path would duplicate rows on every restart.
+            # Bar writes use dedup_key="timestamp" so any overlap is harmless,
+            # but skipping is_replay bars avoids the unnecessary I/O entirely.
             if event.metadata.is_replay:
                 return
             # Live bars are low-frequency and critical to the chart — never drop them.
@@ -427,7 +429,10 @@ class StorageEngine(BaseEngine):
         # its received_at reflects real feed latency, which a replay/backfill
         # rewrite of the same trade would otherwise silently overwrite with a
         # meaningless value (whenever the backfill happened to run).
-        dedup_key = _DEDUP_KEYS.get(data_type)
+        # Bars: dedup on timestamp so catchup re-writes don't duplicate rows.
+        # Each (symbol, timeframe, date, timestamp) tuple is unique by definition.
+        is_bar = data_type.startswith("bars/")
+        dedup_key = "timestamp" if is_bar else _DEDUP_KEYS.get(data_type)
         self._parquet.write(
             table, data_type, symbol, d, dedup_key=dedup_key, prefer_live=(data_type == "trades")
         )
