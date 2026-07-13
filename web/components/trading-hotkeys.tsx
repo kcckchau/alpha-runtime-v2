@@ -77,10 +77,18 @@ type QuoteData = {
   timestamp: string;
 };
 
+type PriceLevels = {
+  entry: number;
+  stop: number;
+  target: number | null;
+  action: Action;
+} | null;
+
 type Props = {
   symbol: string;
   quote: QuoteData | null;
   isLive: boolean;
+  onPriceLevels?: (levels: PriceLevels) => void;
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -109,7 +117,7 @@ function actionColor(action: Action): string {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function TradingHotkeys({ symbol, quote, isLive }: Props) {
+export function TradingHotkeys({ symbol, quote, isLive, onPriceLevels }: Props) {
   const [armed, setArmed] = useState(false);
   const [overlay, setOverlay] = useState<OverlayState | null>(null);
   const submittingRef = useRef(false);
@@ -117,11 +125,21 @@ export function TradingHotkeys({ symbol, quote, isLive }: Props) {
   const hotkeyCountRef = useRef(0);
   const dismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Notify parent of price levels when a preview is set or cleared
+  const setOverlayAndLevels = useCallback((next: OverlayState | null) => {
+    setOverlay(next);
+    if (next?.type === "preview") {
+      onPriceLevels?.({ entry: next.entry, stop: next.stop, target: next.target, action: next.action });
+    } else {
+      onPriceLevels?.(null);
+    }
+  }, [onPriceLevels]);
+
   // Auto-dismiss terminal overlay after 4s
   const autoDismiss = useCallback((ms = 4000) => {
     if (dismissTimerRef.current) clearTimeout(dismissTimerRef.current);
-    dismissTimerRef.current = setTimeout(() => setOverlay(null), ms);
-  }, []);
+    dismissTimerRef.current = setTimeout(() => setOverlayAndLevels(null), ms);
+  }, [setOverlayAndLevels]);
 
   const clearDismiss = useCallback(() => {
     if (dismissTimerRef.current) {
@@ -134,9 +152,9 @@ export function TradingHotkeys({ symbol, quote, isLive }: Props) {
   useEffect(() => {
     if (!isLive) {
       setArmed(false);
-      setOverlay(null);
+      setOverlayAndLevels(null);
     }
-  }, [isLive, symbol]);
+  }, [isLive, symbol]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── API calls ──────────────────────────────────────────────────────────────
 
@@ -210,13 +228,13 @@ export function TradingHotkeys({ symbol, quote, isLive }: Props) {
   const handleAction = useCallback(async (action: Action) => {
     const res = await submitIntent(action);
     if (!res) {
-      setOverlay({ type: "error", message: "Network error — could not reach runtime" });
+      setOverlayAndLevels({ type: "error", message: "Network error — could not reach runtime" });
       autoDismiss();
       return;
     }
 
     if (res.status === "rejected" || res.decision === "rejected") {
-      setOverlay({
+      setOverlayAndLevels({
         type: "rejected",
         reasons: res.explanation ?? [],
         flags: res.risk_flags ?? [],
@@ -225,14 +243,14 @@ export function TradingHotkeys({ symbol, quote, isLive }: Props) {
       return;
     }
 
-    setOverlay({
+    setOverlayAndLevels({
       type: "preview",
       action,
-      entry: res.entry_price ?? 0,
-      stop: res.stop_price ?? 0,
-      target: res.target_price ?? null,
-      risk: res.risk_usd ?? 0,
-      rr: res.reward_risk ?? 0,
+      entry: parseFloat(String(res.entry_price ?? 0)),
+      stop: parseFloat(String(res.stop_price ?? 0)),
+      target: res.target_price != null ? parseFloat(String(res.target_price)) : null,
+      risk: parseFloat(String(res.risk_usd ?? 0)),
+      rr: parseFloat(String(res.reward_risk ?? 0)),
       requires_confirmation: res.requires_confirmation ?? false,
       intent_id: res.intent_id,
     });
@@ -253,12 +271,12 @@ export function TradingHotkeys({ symbol, quote, isLive }: Props) {
     const intentId = overlay.intent_id;
     const res = await confirmIntent(intentId);
     if (!res) {
-      setOverlay({ type: "error", message: "Confirm failed — network error" });
+      setOverlayAndLevels({ type: "error", message: "Confirm failed — network error" });
       autoDismiss();
       return;
     }
     if (res.status === "rejected") {
-      setOverlay({
+      setOverlayAndLevels({
         type: "rejected",
         reasons: ["Revalidation failed: " + (res.explanation?.[0] ?? "unknown")],
         flags: res.risk_flags ?? [],
@@ -266,7 +284,7 @@ export function TradingHotkeys({ symbol, quote, isLive }: Props) {
       autoDismiss();
       return;
     }
-    setOverlay({
+    setOverlayAndLevels({
       type: "active",
       action: overlay.action,
       entry: overlay.entry,
@@ -280,8 +298,8 @@ export function TradingHotkeys({ symbol, quote, isLive }: Props) {
       await cancelIntent(overlay.intent_id);
     }
     clearDismiss();
-    setOverlay(null);
-  }, [overlay, cancelIntent, clearDismiss]);
+    setOverlayAndLevels(null);
+  }, [overlay, cancelIntent, clearDismiss, setOverlayAndLevels]);
 
   // ── Keyboard listener ──────────────────────────────────────────────────────
 
