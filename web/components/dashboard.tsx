@@ -3,6 +3,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { LineStyle, SeriesMarker, Time } from "lightweight-charts";
 import { CandlesChart, EmaConfig } from "@/components/candles-chart";
+import { TradingHotkeys } from "@/components/trading-hotkeys";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -2349,6 +2350,7 @@ export function Dashboard() {
   const [prevSetupContexts, setPrevSetupContexts] = useState<Record<string, SetupSessionContext | null>>({});
   const [riskState, setRiskState] = useState<RiskData | null>(null);
   const [clock, setClock] = useState("--:--:-- ET");
+  const [tradeLevels, setTradeLevels] = useState<{ entry: number; stop: number; target: number | null; action: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Backfill state
   const [backfillJob, setBackfillJob] = useState<BackfillJob | null>(null);
@@ -2991,8 +2993,19 @@ export function Dashboard() {
       }
     }
 
+    // Pre-trade intent levels (from TradingHotkeys preview)
+    if (tradeLevels) {
+      const isLong = tradeLevels.action === "open_long";
+      const entryColor = isLong ? "#22c55e" : "#ef4444";
+      overlays.push({ label: "ENTRY", price: tradeLevels.entry, color: entryColor, style: LineStyle.Solid });
+      overlays.push({ label: "STOP", price: tradeLevels.stop, color: "#ef4444", style: LineStyle.Dashed });
+      if (tradeLevels.target !== null) {
+        overlays.push({ label: "TARGET", price: tradeLevels.target, color: "#22c55e", style: LineStyle.Dashed });
+      }
+    }
+
     return overlays;
-  }, [currentContext, setups, currentSetupContext, selectedSetupId, activeSetupCtx]);
+  }, [currentContext, setups, currentSetupContext, selectedSetupId, activeSetupCtx, tradeLevels]);
 
   const historyMarkers = useMemo((): SeriesMarker<Time>[] => {
     return (activeSetupCtx?.setups ?? [])
@@ -3179,6 +3192,12 @@ export function Dashboard() {
 
           {selectedDate === null && <Pill color="green">{activeSetupCount} setups</Pill>}
           <Pill color="gray">{clock}</Pill>
+          <TradingHotkeys
+            symbol={selectedSymbol}
+            quote={quotes[selectedSymbol] ?? null}
+            isLive={selectedDate === null}
+            onPriceLevels={setTradeLevels}
+          />
         </div>
       </div>
 

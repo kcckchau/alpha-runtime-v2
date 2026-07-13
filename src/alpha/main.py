@@ -68,6 +68,11 @@ def run() -> None:
 
         await engine.initialize()
 
+        # Inject execution coordinator after initialize() so wire_execution() has run.
+        coordinator = getattr(engine, "_execution_coordinator", None)
+        if coordinator is not None:
+            api_app.state.execution_coordinator = coordinator
+
         import uvicorn
         config = uvicorn.Config(
             api_app,

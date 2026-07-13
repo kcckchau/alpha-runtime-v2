@@ -267,6 +267,14 @@ class BootstrapEngine(BaseEngine, SnapshotMixin):
             logger.info("Live feed started | replay_from=%s", replay_start.isoformat())
 
         await self._reconcile_active_setups()
+
+        # Execution subsystem: mark market data fresh after catchup has emitted
+        # bars through the pipeline and the MarketStateProjector has received at
+        # least one MarketStateEvent per symbol.
+        if hasattr(self, "_execution_coordinator") and self._execution_coordinator is not None:
+            self._execution_coordinator.update_readiness(market_data_fresh=True)
+            logger.info("Execution subsystem READY")
+
         logger.info("Bootstrap READY")
 
     def _cleanup_stale_tmp_files(self) -> None:
