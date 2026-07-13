@@ -194,14 +194,25 @@ class TimeInForce(StrEnum):
 
 
 class OrderStatus(StrEnum):
-    PENDING = "pending"
-    SUBMITTED = "submitted"
-    ACCEPTED = "accepted"
-    PARTIAL = "partial"
-    FILLED = "filled"
-    CANCELLED = "cancelled"
-    REJECTED = "rejected"
-    EXPIRED = "expired"
+    # Pre-submission
+    PENDING         = "pending"
+    SUBMITTED       = "submitted"
+    ACCEPTED        = "accepted"
+    # Execution
+    PARTIAL         = "partial"
+    FILLED          = "filled"
+    # Cancellation
+    CANCEL_PENDING  = "cancel_pending"   # cancel requested, awaiting broker ack
+    CANCELLED       = "cancelled"
+    # Replacement
+    REPLACE_PENDING = "replace_pending"  # modify requested, awaiting broker ack
+    REPLACED        = "replaced"         # superseded by a new order (child of replace)
+    # Terminal failures
+    REJECTED        = "rejected"         # rejected before acknowledgement (local validation)
+    BROKER_REJECTED = "broker_rejected"  # broker refused after acknowledgement
+    EXPIRED         = "expired"
+    # Reconciliation sentinel — never leave this state without querying the broker
+    UNKNOWN         = "unknown"
 
 
 class TakerSide(StrEnum):
@@ -222,9 +233,12 @@ class AccountType(StrEnum):
 
 
 class KillSwitchReason(StrEnum):
-    DAILY_LOSS_LIMIT = "daily_loss_limit"
-    PROFIT_PROTECTION = "profit_protection"
-    MANUAL = "manual"
+    DAILY_LOSS_LIMIT          = "daily_loss_limit"
+    PROFIT_PROTECTION         = "profit_protection"
+    PROTECTIVE_STOP_REJECTED  = "protective_stop_rejected"  # stop child rejected after entry filled
+    UNMANAGED_POSITION        = "unmanaged_position"        # position detected with no known stop
+    RECONCILIATION_FAILURE    = "reconciliation_failure"    # could not confirm broker state
+    MANUAL                    = "manual"
 
 
 class ThesisState(StrEnum):
@@ -255,3 +269,63 @@ class DataQualityState(StrEnum):
     DEGRADED   = "degraded"    # bar lag >250ms, silence >30s, or missed bar — signals blocked
     RECOVERING = "recovering"  # first clean bar seen after DEGRADED, waiting for confirmation
     FAILED     = "failed"      # silence >5min during RTH — signals blocked, needs investigation
+
+
+# ── Execution subsystem ───────────────────────────────────────────────────────
+
+class TradeAction(StrEnum):
+    """Semantically unambiguous user intent — not just BUY/SELL."""
+    OPEN_LONG     = "open_long"
+    OPEN_SHORT    = "open_short"
+    REDUCE_LONG   = "reduce_long"    # close part of long
+    REDUCE_SHORT  = "reduce_short"   # close part of short
+    FLATTEN       = "flatten"        # close entire position
+    REVERSE_LONG  = "reverse_long"   # flip from short to long
+    REVERSE_SHORT = "reverse_short"  # flip from long to short
+
+
+class PriceMode(StrEnum):
+    """Broker-agnostic execution policy — resolved to a concrete price by the backend."""
+    JOIN_BID        = "join_bid"       # post at current bid (passive buy)
+    JOIN_ASK        = "join_ask"       # post at current ask (passive sell)
+    CROSS_ONE_TICK  = "cross_one_tick" # one tick through the market (buy at ask+1, sell at bid-1)
+    MARKETABLE_LIMIT = "marketable_limit"  # limit at or through best opposite (aggressive, capped)
+    MIDPOINT        = "midpoint"       # (bid+ask)/2
+    PASSIVE_ONE_TICK = "passive_one_tick"  # one tick inside best (buy at bid+1, sell at ask-1)
+
+
+class IntentStatus(StrEnum):
+    """Full lifecycle of a TradeIntent through the execution subsystem."""
+    RECEIVED              = "received"
+    VALIDATING            = "validating"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"  # amber: warned, requires second keypress
+    CONFIRMED             = "confirmed"
+    PLANNING              = "planning"               # risk engine compiling TradePlan
+    PLAN_READY            = "plan_ready"
+    SUBMITTING            = "submitting"             # order API call in flight
+    ACTIVE                = "active"                 # at least one child order acknowledged
+    COMPLETED             = "completed"              # all orders terminal, position reconciled
+    CANCELLED             = "cancelled"              # user cancelled or timeout
+    EXPIRED               = "expired"                # confirmation window timed out
+    REJECTED              = "rejected"               # hard risk or validation failure
+    FAILED                = "failed"                 # unrecoverable: e.g. stop rejected after fill
+
+
+class RiskDecision(StrEnum):
+    APPROVED                  = "approved"
+    APPROVED_WITH_MODIFICATIONS = "approved_with_modifications"  # requires confirmation
+    REJECTED                  = "rejected"
+
+
+class OrderRole(StrEnum):
+    """Role of a PlannedOrder within a TradePlan bracket."""
+    ENTRY  = "entry"
+    STOP   = "stop"
+    TARGET = "target"
+
+
+class IntentSource(StrEnum):
+    HOTKEY   = "hotkey"    # keyboard shortcut on chart
+    API      = "api"       # external REST call
+    STRATEGY = "strategy"  # runtime strategy (future)
+    MANUAL   = "manual"    # direct override with explicit flag
