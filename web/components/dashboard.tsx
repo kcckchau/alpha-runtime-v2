@@ -3,6 +3,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { LineStyle, SeriesMarker, Time } from "lightweight-charts";
 import { CandlesChart, EmaConfig } from "@/components/candles-chart";
+import { TradingHotkeys } from "@/components/trading-hotkeys";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -3179,6 +3180,11 @@ export function Dashboard() {
 
           {selectedDate === null && <Pill color="green">{activeSetupCount} setups</Pill>}
           <Pill color="gray">{clock}</Pill>
+          <TradingHotkeys
+            symbol={selectedSymbol}
+            quote={quotes[selectedSymbol] ?? null}
+            isLive={selectedDate === null}
+          />
         </div>
       </div>
 
