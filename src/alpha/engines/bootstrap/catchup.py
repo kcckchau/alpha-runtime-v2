@@ -157,6 +157,17 @@ class CatchupService:
             logger.info("M1 fetched for %s | bars=%d | %s → %s",
                         symbol, len(m1_bars), m1_start.date(), m1_end.isoformat())
 
+            # Persist M1 bars to Parquet so the chart shows the full session on
+            # next open. Unlike H1/D1 (_load_or_fetch_bars handles their storage),
+            # M1 has no Parquet cache — it's always fetched fresh. Without this
+            # step the StorageEngine's is_replay skip means M1 catchup bars never
+            # land on disk, so the chart only shows data from when the live feed
+            # started rather than from the beginning of the session.
+            # Bars dedup on timestamp, so restarting overwrites stale rows cleanly.
+            for bar in m1_bars:
+                await self._storage.save_bar(bar)
+            await self._storage.flush()
+
             # ── H1/D1: Parquet cache with gap-fill ────────────────────────────
             hourly_bars = await self._load_or_fetch_bars(
                 symbol=symbol,

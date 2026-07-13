@@ -57,6 +57,12 @@ type CandlesChartProps = {
    * visually clear they belong to the previous session.
    */
   prevDayDate?: string;
+  /**
+   * When set, the chart's initial viewport pins to this ET epoch as the left
+   * edge instead of fitContent().  Used in live mode to open on the current
+   * CME session start (18:00 ET) rather than showing weeks of history.
+   */
+  sessionStartEpoch?: number;
 };
 
 // ─── ET timezone helpers ──────────────────────────────────────────────────────
@@ -340,6 +346,7 @@ export function CandlesChart({
   focusTime,
   is24h = false,
   prevDayDate,
+  sessionStartEpoch,
 }: CandlesChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -649,14 +656,26 @@ export function CandlesChart({
       }
 
       if (isViewportChange) {
-        chart.timeScale().fitContent();
+        // For 24h futures in live mode, pin the initial view to the current CME
+        // session start (18:00 ET) so the chart opens on today's action rather
+        // than showing days/weeks of history.  Fall back to fitContent() for
+        // historical mode and non-24h instruments.
+        if (sessionStartEpoch !== undefined && bars.length > 0) {
+          const latestT = getCachedEpoch(cache, bars[bars.length - 1].timestamp);
+          chart.timeScale().setVisibleRange({
+            from: sessionStartEpoch as Time,
+            to: (Math.max(latestT, sessionStartEpoch) + 3600) as Time,
+          });
+        } else {
+          chart.timeScale().fitContent();
+        }
         candle.priceScale().applyOptions({ autoScale: true });
         lastViewportKeyRef.current = viewportKey;
       }
     }
 
     prevBarsRef.current = bars;
-  }, [bars, emas, viewportKey, is24h, prevDayDate]);
+  }, [bars, emas, viewportKey, is24h, prevDayDate, sessionStartEpoch]);
 
   // Overlay / marker effect — price lines and markers update independently of bar data
   useEffect(() => {

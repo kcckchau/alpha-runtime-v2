@@ -309,12 +309,15 @@ function formatPnl(value: number | null | undefined): string {
 
 function historyStartDate(symbol: string, timeframe: Timeframe): string {
   // Limit rows returned per timeframe so the initial load stays fast.
-  // 1m = 2 days (~2880 bars for 24h futures), 5m/15m = 5 days, 1h/1d = 30 days.
+  // 5m/15m = 5 days, 1h/1d = 30 days.
+  // 1m for 24h futures (MNQ, ES, …): 5 days so the previous Friday session is
+  // always visible on Monday — a 2-day window only reaches Saturday and misses it.
+  // 1m for equities/other: 2 days is enough (no weekend session gap to bridge).
+  const is24hSymbol = /^(MNQ|NQ|ES|MES|RTY|M2K|YM|MYM|CL|GC|SI|NKD|EMD)/.test(symbol);
   const lookbackDays =
-    timeframe === "1m" ? 2
+    timeframe === "1m" ? (is24hSymbol ? 5 : 2)
     : timeframe === "5m" || timeframe === "15m" ? 5
     : 30;
-  void symbol; // symbol-specific overrides can go here in the future
   const start = new Date(Date.now() - lookbackDays * 864e5);
   return start.toISOString().slice(0, 10);
 }
@@ -3025,6 +3028,23 @@ export function Dashboard() {
     ? (() => { const d = new Date(selectedDate + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); })()
     : undefined;
 
+  // In live mode for 24h futures, compute the most recent 18:00 ET epoch so the
+  // chart opens on the current CME session rather than showing days of history.
+  // toETChartTime re-expresses UTC timestamps as "ET wall-clock as UTC", so we
+  // build the 18:00 ET boundary directly as UTC seconds.
+  const ET_OFFSET_SECONDS = 4 * 3600; // EDT (UTC-4); DST-aware correction not needed for chart init
+  const sessionStartEpoch = (!selectedDate && is24h)
+    ? (() => {
+        const nowUtc = Math.floor(Date.now() / 1000);
+        // 18:00 ET = 22:00 UTC (EDT). Express as ET wall-clock epoch (UTC - ET_OFFSET).
+        const nowET = nowUtc - ET_OFFSET_SECONDS;
+        const dayStart = nowET - (nowET % 86400); // midnight ET today
+        const todaySession = dayStart + 18 * 3600; // 18:00 ET today
+        // If we haven't reached today's 18:00 ET yet, step back to yesterday's
+        return nowET >= todaySession ? todaySession : todaySession - 86400;
+      })()
+    : undefined;
+
   // EMA indicator configs — computed from bar data as line series in the chart
   const emas = useMemo((): EmaConfig[] => {
     if (selectedTimeframe === "1m" || selectedTimeframe === "5m") {
@@ -3411,6 +3431,7 @@ export function Dashboard() {
             focusTime={focusTime}
             is24h={is24h}
             prevDayDate={prevDayDate}
+            sessionStartEpoch={sessionStartEpoch}
           />
 
           {/* Quote bar */}
