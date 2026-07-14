@@ -136,6 +136,42 @@ class ORBState(StrEnum):
     NOT_SET = "not_set"               # opening range not yet established
 
 
+class SetupFamily(StrEnum):
+    """High-level setup family — the tradeable structure, independent of anchor or direction."""
+    FAILED_AUCTION_REVERSAL = "failed_auction_reversal"  # sweep/wick failed to sustain; price recovers
+    FAILED_RECLAIM          = "failed_reclaim"           # attempted level reclaim that was rejected back
+    PULLBACK_CONTINUATION   = "pullback_continuation"    # with-trend pullback to a level, holds
+    BREAKOUT_CONTINUATION   = "breakout_continuation"    # level breakout accepted on the other side
+    RANGE_REVERSAL          = "range_reversal"           # reversal at a range boundary (double bottom/top)
+    EXHAUSTION_REVERSAL     = "exhaustion_reversal"      # capitulation candle + recovery
+
+
+class AnchorLevel(StrEnum):
+    """The reference level / coordinate the setup is primarily organized around."""
+    VWAP       = "vwap"
+    ONL        = "onl"
+    ONH        = "onh"
+    PDL        = "pdl"
+    PDH        = "pdh"
+    ORL        = "orl"        # opening range low
+    ORH        = "orh"        # opening range high
+    EMA9       = "ema9"
+    EMA21      = "ema21"
+    HOD        = "hod"        # high of day
+    LOD        = "lod"        # low of day
+    STRUCTURAL = "structural" # generic structural level (no single named coordinate)
+
+
+class LevelInteraction(StrEnum):
+    """How price interacted with the anchor level — the primitive catalyst."""
+    HOLD           = "hold"            # price tested level and held (bounced)
+    REJECT         = "reject"          # approached level, was turned back
+    RECLAIM        = "reclaim"         # lost level then closed back above/below it
+    SWEEP          = "sweep"           # brief wick penetration, body recovered
+    ACCEPT         = "accept"          # crossed level and is now accepting on the other side
+    FAILED_RECLAIM = "failed_reclaim"  # attempted reclaim that was rejected back
+
+
 class SetupType(StrEnum):
     VWAP_RECLAIM = "vwap_reclaim"
     VWAP_REJECTION = "vwap_rejection"

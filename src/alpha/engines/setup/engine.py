@@ -49,6 +49,7 @@ from alpha.models.enums import (
 from alpha.models.events import AnyEvent, BarBundleEvent, BarEvent, SetupEvent
 from alpha.models.market_state import MarketState
 from alpha.models.setup import SessionSetupContext, Setup, SetupHistoryEntry
+from alpha.models.setup_attrs import attrs_for
 from alpha.models.snapshot import BarSnapshot
 
 logger = logging.getLogger(__name__)
@@ -1390,6 +1391,7 @@ class SetupEngine(BaseEngine):
         # structural_grade is a detection-time hint for ScoringEngine.
         # grade is intentionally left None here — ScoringEngine produces the final grade.
         structural_grade = SetupGrade.SSS if setup_type in _SSS_TYPES else None
+        _attrs = attrs_for(setup_type)
         setup = Setup(
             setup_id=setup_id,
             symbol=symbol,
@@ -1400,6 +1402,10 @@ class SetupEngine(BaseEngine):
             market_state=market_state,
             bar_snapshot=snapshot,
             structural_grade=structural_grade,
+            family=_attrs.family if _attrs else None,
+            anchor=_attrs.anchor if _attrs else None,
+            interaction=_attrs.interaction if _attrs else None,
+            display_name=_attrs.display_name if _attrs else None,
         )
         self._active.setdefault(symbol, {})[setup.setup_id] = setup
         self._setups_detected += 1
@@ -2000,6 +2006,7 @@ class SetupEngine(BaseEngine):
             SetupState.INVALIDATED,
             SetupState.EXPIRED,
         } else None
+        _attrs = attrs_for(setup.setup_type)
         return SetupHistoryEntry(
             setup_id=setup.setup_id,
             setup_type=setup.setup_type,
@@ -2007,8 +2014,12 @@ class SetupEngine(BaseEngine):
             detected_at=setup.detected_at,
             updated_at=setup.updated_at,
             resolved_at=resolved_at,
-            side=SetupEngine._side_for_setup_type(setup.setup_type),
-            level_tag=SetupEngine._level_tag_for_setup_type(setup.setup_type),
+            side=_attrs.side if _attrs else SetupEngine._side_for_setup_type(setup.setup_type),
+            level_tag=_attrs.anchor.value if _attrs else SetupEngine._level_tag_for_setup_type(setup.setup_type),
+            family=_attrs.family if _attrs else None,
+            anchor=_attrs.anchor if _attrs else None,
+            interaction=_attrs.interaction if _attrs else None,
+            display_name=_attrs.display_name if _attrs else None,
             entry_trigger=setup.entry_trigger,
             stop_reference=setup.stop_reference,
             target_reference=setup.target_reference,
