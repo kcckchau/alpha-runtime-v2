@@ -5,7 +5,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
-from alpha.models.enums import AnchorLevel, LevelInteraction, OrderSide, SessionPhase, SetupFamily, SetupGrade, SetupState, SetupType
+from alpha.models.enums import OrderSide, SessionPhase, SetupGrade, SetupState, SetupType
 from alpha.models.market_state import MarketState
 from alpha.models.snapshot import BarSnapshot
 
@@ -27,12 +27,6 @@ class Setup(BaseModel):
     entry_trigger: Decimal | None = None      # price level that triggers entry
     stop_reference: Decimal | None = None     # initial stop reference
     target_reference: Decimal | None = None   # initial target reference
-
-    # ── Taxonomy attributes (populated at detection from setup_attrs mapping) ──
-    family:       SetupFamily      | None = None
-    anchor:       AnchorLevel      | None = None
-    interaction:  LevelInteraction | None = None
-    display_name: str              | None = None
 
     # ── Scoring (populated by Scoring Engine) ─────────────────────────────────
     score: float | None = None               # 0.0–100.0
@@ -87,11 +81,6 @@ class SetupHistoryEntry(BaseModel):
     resolved_at: datetime | None = None
     side: OrderSide
     level_tag: str
-    # Taxonomy attributes — mirrors Setup.family/anchor/interaction/display_name
-    family:       SetupFamily      | None = None
-    anchor:       AnchorLevel      | None = None
-    interaction:  LevelInteraction | None = None
-    display_name: str              | None = None
     entry_trigger: Decimal | None = None
     stop_reference: Decimal | None = None
     target_reference: Decimal | None = None
