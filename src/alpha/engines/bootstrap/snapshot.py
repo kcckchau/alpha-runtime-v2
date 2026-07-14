@@ -48,7 +48,7 @@ class SnapshotMixin:
             "engines": [self._serialize_engine(engine) for engine in self._engines],
             "quotes": self._serialize_quotes(),
             "bars": self._serialize_bars(),
-            "contexts": self._startup_context,
+            "contexts": self._serialize_contexts(),
             "market_states": self._serialize_market_states(),
             "setups": self._serialize_setups(),
             "thesis": self._serialize_thesis(),
@@ -59,6 +59,46 @@ class SnapshotMixin:
             "pipeline": self._serialize_pipeline_debug(),
             "feed_quality": self._serialize_feed_quality(),
         }
+
+    def _serialize_contexts(self) -> dict[str, Any]:
+        """Return live key levels from ContextEngine, falling back to static startup context."""
+        from alpha.engines.context.engine import ContextEngine
+        ctx_engine = getattr(self, "_context", None)
+        if not isinstance(ctx_engine, ContextEngine):
+            return self._startup_context
+
+        result: dict[str, Any] = {}
+        for symbol in self._settings.runtime.symbols:
+            startup = self._startup_context.get(symbol) or {}
+            ctx = ctx_engine.get_context(symbol)
+            if ctx is None:
+                result[symbol] = startup
+                continue
+
+            def _s(val: Any) -> str | None:
+                return str(val) if val is not None else None
+
+            levels = {
+                "previous_day_high":  _s(ctx.pdh),
+                "previous_day_low":   _s(ctx.pdl),
+                "previous_day_close": _s(ctx.prev_rth_close),
+                # ONH/ONL = full Globex window (18:00 ET prior day → 09:30 ET)
+                # exposed under both names so existing UI keys keep working
+                "overnight_high":     _s(ctx.onh),
+                "overnight_low":      _s(ctx.onl),
+                "premarket_high":     _s(ctx.onh),
+                "premarket_low":      _s(ctx.onl),
+                "rth_open":           _s(ctx.rth_open),
+                "gap_points":         _s(round(ctx.gap_points, 2)) if ctx.gap_points is not None else None,
+                "gap_pct":            _s(round(ctx.gap_pct, 4)) if ctx.gap_pct is not None else None,
+            }
+            result[symbol] = {
+                "symbol": symbol,
+                "bar_counts": startup.get("bar_counts"),
+                "ema_levels": startup.get("ema_levels"),
+                "levels": levels,
+            }
+        return result
 
     def _serialize_pipeline_debug(self) -> dict[str, Any]:
         """Per-symbol pipeline timestamps for UI staleness detection."""

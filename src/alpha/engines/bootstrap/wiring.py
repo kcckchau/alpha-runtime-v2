@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 def wire_all(engine: "BootstrapEngine") -> None:
     """Instantiate all engines and inject shared dependencies."""
+    from alpha.engines.context.engine import ContextEngine
     from alpha.engines.feature.engine import FeatureEngine
     from alpha.engines.historical.engine import HistoricalDataEngine
     from alpha.engines.live.engine import LiveIngestionEngine
@@ -45,13 +46,20 @@ def wire_all(engine: "BootstrapEngine") -> None:
     engine._feature = FeatureEngine(
         engine._settings, engine._event_bus, engine._registry, engine._calendar, engine._clock
     )
+    engine._context = ContextEngine(
+        engine._settings, engine._event_bus, engine._registry, engine._calendar, engine._clock
+    )
+    engine._context.set_feature_engine(engine._feature)
     engine._market_state = MarketStateEngine(engine._settings, engine._event_bus, engine._registry)
     engine._market_state.set_feature_engine(engine._feature)
+    engine._market_state.set_context_engine(engine._context)
     engine._setup = SetupEngine(engine._settings, engine._event_bus, engine._registry)
     engine._setup.set_feature_engine(engine._feature)
     engine._setup.set_market_state_engine(engine._market_state)
+    engine._setup.set_context_engine(engine._context)
     engine._thesis = ThesisEngine(engine._settings, engine._event_bus, engine._registry)
     engine._thesis.set_feature_engine(engine._feature)
+    engine._thesis.set_context_engine(engine._context)
     engine._scoring = ScoringEngine(engine._settings, engine._event_bus)
     engine._scoring.set_setup_engine(engine._setup)
     engine._scoring.set_feature_engine(engine._feature)
@@ -72,6 +80,7 @@ def wire_all(engine: "BootstrapEngine") -> None:
         engine._historical,
         engine._live,
         engine._feature,
+        engine._context,
         engine._market_state,
         engine._setup,
         engine._thesis,

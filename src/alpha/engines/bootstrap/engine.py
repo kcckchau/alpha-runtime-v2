@@ -50,6 +50,7 @@ from alpha.engines.bootstrap.snapshot import SnapshotMixin, _write_snapshot_sync
 from alpha.engines.bootstrap.wiring import wire_all
 
 if TYPE_CHECKING:
+    from alpha.engines.context.engine import ContextEngine
     from alpha.engines.feature.engine import FeatureEngine
     from alpha.engines.historical.engine import HistoricalDataEngine
     from alpha.engines.live.engine import LiveIngestionEngine
@@ -86,6 +87,7 @@ class BootstrapEngine(BaseEngine, SnapshotMixin):
         self._historical: HistoricalDataEngine | None = None
         self._live: LiveIngestionEngine | None = None
         self._feature: FeatureEngine | None = None
+        self._context: ContextEngine | None = None
         self._market_state: MarketStateEngine | None = None
         self._setup: SetupEngine | None = None
         self._thesis: ThesisEngine | None = None
