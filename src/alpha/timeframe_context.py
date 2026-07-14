@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -158,10 +158,16 @@ def _session_levels(
         "premarket_low": None,
     }
     if daily_bars:
-        today_et = datetime.now(tz=_ET).date()
+        # D1 bars are labeled with a UTC-midnight timestamp for the calendar
+        # date they represent (e.g. 2026-07-13T00:00:00+00:00 for the "07-13"
+        # bar). Converting that through .astimezone(_ET) shifts it back into
+        # the prior calendar day (ET is always behind UTC), so comparing
+        # against today's ET date here would never detect "this is today's
+        # still-forming bar" — compare the label's own UTC date instead.
+        today_utc = datetime.now(tz=timezone.utc).date()
         sorted_daily = sorted(daily_bars, key=lambda bar: bar.timestamp)
         previous_bar = sorted_daily[-1]
-        if previous_bar.timestamp.astimezone(_ET).date() == today_et and len(sorted_daily) > 1:
+        if previous_bar.timestamp.date() == today_utc and len(sorted_daily) > 1:
             previous_bar = sorted_daily[-2]
         levels["previous_day_high"] = str(previous_bar.high)
         levels["previous_day_low"] = str(previous_bar.low)

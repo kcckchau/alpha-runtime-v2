@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import uuid4
 
+from alpha.calendar.cme import CMEEqIndexCalendar
 from alpha.config.settings import AlphaSettings
 from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
@@ -84,6 +85,10 @@ class RiskEngine(BaseEngine):
         super().__init__()
         self._settings = settings
         self._event_bus = event_bus
+        # CME trading day rolls over at 18:00 ET, not UTC midnight — used to
+        # key the daily loss limit / kill-switch reset so it doesn't fire
+        # 1-2 hours into the new session (see _check_day_rollover).
+        self._calendar = CMEEqIndexCalendar()
         self._setup_engine: object | None = None
         self._order_engine: object | None = None
         self._broker_adapter: object | None = None
@@ -291,13 +296,16 @@ class RiskEngine(BaseEngine):
                 await asyncio.sleep(backoff)
 
     def _check_day_rollover(self) -> None:
-        """Reset each account's daily state when the calendar date changes.
+        """Reset each account's daily state when the CME trading day changes.
 
-        The engine may run continuously across midnight; without this reset the
-        daily loss limit, trade count, and kill-switch state would carry over
-        into the next trading session.
+        The engine may run continuously across the rollover; without this reset
+        the daily loss limit, trade count, and kill-switch state would carry
+        over into the next trading session. Keyed on CME's actual session
+        boundary (18:00 ET) rather than UTC midnight — UTC midnight falls 1-2
+        hours after the new session has already started, which would reset
+        the daily budget mid-session instead of at session open.
         """
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = self._calendar.session_date(datetime.now(timezone.utc)).isoformat()
         for account_id, ctx in self._accounts.items():
             if ctx.state.date == today:
                 continue
@@ -582,7 +590,7 @@ class RiskEngine(BaseEngine):
         from alpha.models.risk import AccountConfig as AC
 
         cfg = self._settings.risk
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = self._calendar.session_date(datetime.now(timezone.utc)).isoformat()
 
         raw_accounts: list[AccountConfig] = [
             a if isinstance(a, AC) else AC(**a)
