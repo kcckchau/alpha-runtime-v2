@@ -111,6 +111,9 @@ class BootstrapEngine(BaseEngine, SnapshotMixin):
         # Notifications
         self._telegram_notifier: object | None = None
 
+        # Shadow research pipeline (Phase 0) — not a BaseEngine, not in _engines
+        self._level_observer: object | None = None  # LevelObserver
+
         # Terminal setup cache: symbol → {setup_id_str → (setup_dict, bar_count_at_terminal)}
         # Keeps FAILED/INVALIDATED/EXPIRED setups visible in status.json for _TERMINAL_TTL_BARS bars.
         self._terminal_setups: dict[str, dict[str, tuple[dict, int]]] = {}
@@ -209,6 +212,10 @@ class BootstrapEngine(BaseEngine, SnapshotMixin):
             from alpha.notifications.telegram import TelegramNotifier
             if isinstance(self._telegram_notifier, TelegramNotifier):
                 await self._telegram_notifier.stop()
+        if self._level_observer is not None:
+            from alpha.research.level_observer import LevelObserver
+            if isinstance(self._level_observer, LevelObserver):
+                self._level_observer.flush()
         for engine in reversed(self._engines):
             await engine.stop()
         # Disconnect IBKR after engines stop (subscriptions are already cancelled

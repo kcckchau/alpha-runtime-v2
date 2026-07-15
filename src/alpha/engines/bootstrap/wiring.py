@@ -74,6 +74,7 @@ def wire_all(engine: "BootstrapEngine") -> None:
     engine._position_monitor = wire_position_monitor(engine)
     wire_notifications(engine)
     wire_execution(engine)
+    wire_level_observer(engine)
 
     engine._engines = [
         engine._storage,
@@ -237,6 +238,48 @@ def wire_notifications(engine: "BootstrapEngine") -> None:
     engine._telegram_notifier = TelegramNotifier(
         engine._settings.telegram, engine._event_bus
     )
+
+
+def wire_level_observer(engine: "BootstrapEngine") -> None:
+    """Wire the Phase 0 shadow LevelObserver.
+
+    The observer subscribes to PIPELINE_OUTPUT with drop_if_full=True so it
+    never back-pressures the main pipeline. It is not added to engine._engines
+    — it has no BaseEngine lifecycle and is flushed directly in _on_stop.
+    """
+    from pathlib import Path
+    from alpha.models.enums import RuntimeMode
+    from alpha.research.level_observer import LevelObserver, RunMode
+    from alpha.research.parquet_writer import LevelObservationWriter
+
+    mode = engine._settings.runtime.mode
+    if mode == RuntimeMode.LIVE or mode == RuntimeMode.PAPER:
+        run_mode = RunMode.LIVE
+    elif mode == RuntimeMode.REPLAY:
+        run_mode = RunMode.REPLAY
+    else:
+        run_mode = RunMode.BACKFILL
+
+    research_root = Path(engine._settings.storage.parquet_root).parent / "research"
+    writer = LevelObservationWriter(research_root=research_root)
+
+    from alpha.engines.live.monitor import IngestionMonitor
+    ingestion_monitor = (
+        engine._ingestion_monitor
+        if isinstance(engine._ingestion_monitor, IngestionMonitor)
+        else None
+    )
+
+    observer = LevelObserver(
+        event_bus=engine._event_bus,
+        registry=engine._registry,
+        writer=writer,
+        run_mode=run_mode,
+        ingestion_monitor=ingestion_monitor,
+    )
+    observer.attach()
+    engine._level_observer = observer
+    logger.info("LevelObserver wired (shadow research pipeline, Phase 0)")
 
 
 def wire_execution(engine: "BootstrapEngine") -> None:
