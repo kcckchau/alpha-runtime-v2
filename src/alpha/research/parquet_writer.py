@@ -111,12 +111,13 @@ class LevelObservationWriter:
     def __init__(
         self,
         research_root: Path,
-        run_id: str,
+        run_id: str | None = None,
         max_buffer_rows: int = 500,
         max_pending_rows: int = 10_000,
     ) -> None:
+        from uuid import uuid4
         self._root = research_root
-        self._run_id = run_id
+        self._run_id = run_id or f"auto-{uuid4().hex[:8]}"
         self._max_buffer = max_buffer_rows
         self._max_pending = max_pending_rows
 
