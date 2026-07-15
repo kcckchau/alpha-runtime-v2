@@ -11,8 +11,13 @@ the target date begins.
 Usage:
     python scripts/research_replay.py --symbol MNQ --date 2026-07-14
     python scripts/research_replay.py --symbol MNQ --date 2026-07-14 --warmup-days 5
+    python scripts/research_replay.py --symbol MNQ --date 2026-07-14 --fetch
 
-Prerequisites:
+With --fetch: missing dates are pulled from Databento and saved to Parquet
+before replay begins (requires DATABENTO_API_KEY in environment / .env).
+Fetched bars are persisted so subsequent runs do not re-fetch.
+
+Prerequisites (without --fetch):
     M1 bars for the target date and warmup days must exist in the production
     Parquet store (data/parquet/bars/1m/MNQ/year=.../month=.../day=.../data.parquet).
     Run the dashboard backfill (POST /runtime/backfill-date) first if they're missing.
@@ -30,7 +35,7 @@ import argparse
 import asyncio
 import logging
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 # Ensure src is on path when run directly
@@ -63,6 +68,7 @@ logger = logging.getLogger("research_replay")
 _FUTURES_TICKERS = frozenset({
     "MNQ", "NQ", "ES", "MES", "RTY", "M2K", "YM", "MYM",
 })
+_UTC = timezone.utc
 
 
 def _infer_symbol(ticker: str) -> Symbol:
@@ -72,7 +78,53 @@ def _infer_symbol(ticker: str) -> Symbol:
     return Symbol(ticker=ticker.upper(), exchange=exchange, asset_class=asset_class)
 
 
-async def replay(symbol: str, target_date: date, warmup_days: int) -> None:
+async def _fetch_and_save(
+    sym_obj: Symbol,
+    d: date,
+    storage: StorageEngine,
+    registry: SymbolRegistry,
+    settings,
+) -> list:
+    """Fetch M1 bars for one calendar date from Databento and save to Parquet.
+
+    CME futures sessions run 22:00 UTC previous day → 21:00 UTC.
+    Saved via StorageEngine so they land in the standard Parquet layout and
+    are available to all other tooling (dashboard, backtest, etc.).
+    """
+    from alpha.engines.historical.sources.databento import DatabentoHistoricalDataSource
+
+    start_utc = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=_UTC) - timedelta(hours=2)
+    end_utc = datetime(d.year, d.month, d.day, 21, 0, 0, tzinfo=_UTC)
+
+    source = DatabentoHistoricalDataSource(registry, settings.databento)
+    bars = []
+    async for bar in source.fetch_bars(sym_obj.ticker, BarTimeframe.M1, start_utc, end_utc):
+        bars.append(bar)
+        await storage.save_bar(bar)
+
+    bars.sort(key=lambda b: b.timestamp)
+    logger.info("Fetched %d M1 bars for %s from Databento → saved to Parquet", len(bars), d)
+    return bars
+
+
+async def _load_or_fetch(
+    sym_obj: Symbol,
+    d: date,
+    storage: StorageEngine,
+    registry: SymbolRegistry,
+    settings,
+    fetch: bool,
+) -> list:
+    bars = await storage.load_bar_events(sym_obj.ticker, BarTimeframe.M1, d, d)
+    if bars:
+        return bars
+    if not fetch:
+        return []
+    logger.info("No bars in Parquet for %s — fetching from Databento…", d)
+    return await _fetch_and_save(sym_obj, d, storage, registry, settings)
+
+
+async def replay(symbol: str, target_date: date, warmup_days: int, fetch: bool) -> None:
     settings = get_settings()
 
     sym_obj = _infer_symbol(symbol)
@@ -131,9 +183,9 @@ async def replay(symbol: str, target_date: date, warmup_days: int) -> None:
         warmup_dates.insert(0, prev)
 
     for wd in warmup_dates:
-        bars = await storage.load_bar_events(sym_obj.ticker, BarTimeframe.M1, wd, wd)
+        bars = await _load_or_fetch(sym_obj, wd, storage, registry, settings, fetch)
         if not bars:
-            logger.warning("No bars in Parquet for warmup date %s — skipping", wd)
+            logger.warning("No bars for warmup date %s — skipping", wd)
             continue
         bars.sort(key=lambda e: e.timestamp)
         logger.info("Warmup: %d bars for %s", len(bars), wd)
@@ -143,11 +195,11 @@ async def replay(symbol: str, target_date: date, warmup_days: int) -> None:
         await bus.flush()
 
     # ── Target date replay ────────────────────────────────────────────────────
-    bars = await storage.load_bar_events(sym_obj.ticker, BarTimeframe.M1, target_date, target_date)
+    bars = await _load_or_fetch(sym_obj, target_date, storage, registry, settings, fetch)
     if not bars:
         logger.error(
-            "No M1 bars in Parquet for %s %s.\n"
-            "Fetch them first via POST /runtime/backfill-date or the dashboard.",
+            "No M1 bars for %s %s.\n"
+            "Use --fetch to pull from Databento, or run POST /runtime/backfill-date first.",
             symbol, target_date,
         )
         await bus.stop()
@@ -187,10 +239,14 @@ def main() -> None:
     parser.add_argument("--symbol", required=True, help="Ticker, e.g. MNQ")
     parser.add_argument("--date", required=True, help="Target date YYYY-MM-DD")
     parser.add_argument("--warmup-days", type=int, default=5, help="Prior trading days to seed ATR/EMA (default 5)")
+    parser.add_argument(
+        "--fetch", action="store_true",
+        help="Fetch missing dates from Databento and save to Parquet before replaying",
+    )
     args = parser.parse_args()
 
     target_date = date.fromisoformat(args.date)
-    asyncio.run(replay(args.symbol, target_date, args.warmup_days))
+    asyncio.run(replay(args.symbol, target_date, args.warmup_days, args.fetch))
 
 
 if __name__ == "__main__":
