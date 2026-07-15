@@ -216,6 +216,10 @@ class BootstrapEngine(BaseEngine, SnapshotMixin):
             from alpha.research.level_observer import LevelObserver
             if isinstance(self._level_observer, LevelObserver):
                 self._level_observer.flush()
+        if hasattr(self, "_interaction_engine") and self._interaction_engine is not None:
+            from alpha.research.interaction.engine import LevelInteractionEngine
+            if isinstance(self._interaction_engine, LevelInteractionEngine):
+                self._interaction_engine.flush()
         for engine in reversed(self._engines):
             await engine.stop()
         # Disconnect IBKR after engines stop (subscriptions are already cancelled

@@ -56,6 +56,8 @@ from alpha.engines.storage.engine import StorageEngine
 from alpha.instruments import resolve_symbol
 from alpha.models.enums import AssetClass, BarTimeframe
 from alpha.models.symbol import Symbol
+from alpha.research.interaction.config import LevelDistanceConfig
+from alpha.research.interaction.engine import LevelInteractionEngine
 from alpha.research.level_observer import LevelObserver, RunMode
 from alpha.research.parquet_writer import LevelObservationWriter
 
@@ -169,9 +171,16 @@ async def replay(symbol: str, target_date: date, warmup_days: int, fetch: bool) 
     await market_state.initialize()
     await feature.start()
     await market_state.start()
+    interaction_engine = LevelInteractionEngine(
+        event_bus=bus,
+        registry=registry,
+        research_root=research_root,
+    )
+
     aggregator.attach()
     pipeline.attach()
     observer.attach()
+    interaction_engine.attach()
 
     storage = StorageEngine(settings, bus)
 
@@ -220,6 +229,12 @@ async def replay(symbol: str, target_date: date, warmup_days: int, fetch: bool) 
     await bus.stop()
 
     observer.flush()
+    interaction_engine.flush()
+    logger.info(
+        "Interaction episodes written: %d → %s",
+        interaction_engine.episodes_written,
+        research_root / "interaction",
+    )
 
     obs = writer.rows_written
     logger.info(

@@ -75,6 +75,7 @@ def wire_all(engine: "BootstrapEngine") -> None:
     wire_notifications(engine)
     wire_execution(engine)
     wire_level_observer(engine)
+    wire_interaction_engine(engine)
 
     engine._engines = [
         engine._storage,
@@ -280,6 +281,22 @@ def wire_level_observer(engine: "BootstrapEngine") -> None:
     observer.attach()
     engine._level_observer = observer
     logger.info("LevelObserver wired (shadow research pipeline, Phase 0)")
+
+
+def wire_interaction_engine(engine: "BootstrapEngine") -> None:
+    """Wire Phase 1 Level Interaction Engine as shadow research subscriber."""
+    from pathlib import Path
+    from alpha.research.interaction.engine import LevelInteractionEngine
+
+    research_root = Path(engine._settings.storage.parquet_root).parent / "research"
+    interaction_engine = LevelInteractionEngine(
+        event_bus=engine._event_bus,
+        registry=engine._registry,
+        research_root=research_root,
+    )
+    interaction_engine.attach()
+    engine._interaction_engine = interaction_engine
+    logger.info("LevelInteractionEngine wired (shadow research, Phase 1)")
 
 
 def wire_execution(engine: "BootstrapEngine") -> None:
