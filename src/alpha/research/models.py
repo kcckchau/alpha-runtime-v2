@@ -30,9 +30,10 @@ _LBO_NAMESPACE = uuid5(NAMESPACE_DNS, "alpha.research.level_bar_observation.v1")
 
 
 class ReferenceLevelType(StrEnum):
-    VWAP = "vwap"
-    ORH  = "orh"
-    ORL  = "orl"
+    VWAP     = "vwap"        # full-session VWAP (snap.vwap) — resets at 18:00 ET
+    RTH_VWAP = "rth_vwap"    # RTH-only VWAP (snap.rth_vwap) — resets at 09:30 ET, RTH phases only
+    ORH      = "orh"
+    ORL      = "orl"
     # ONH, ONL, PDH, PDL — Phase 1. Not implemented here.
 
 

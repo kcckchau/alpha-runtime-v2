@@ -59,6 +59,14 @@ _PROXIMITY_ATR_FACTOR = Decimal("0.20")   # 20% of ATR-14 defines the band
 _FALLBACK_PROXIMITY_TICKS = 10            # used when ATR is unavailable
 _DEFAULT_TICK_SIZE = Decimal("0.25")      # MNQ / MES / NQ / ES default
 
+# RTH VWAP is only a meaningful "active" level during RTH phases — after
+# 16:00 ET it freezes rather than continuing to accumulate. Mirrors the same
+# phase set used by LevelInteractionEngine._resolve_levels (Phase 1) so both
+# layers agree on when RTH VWAP is considered live. Kept as a local literal
+# set (rather than a shared import) since SessionPhase enum values are stable
+# and importing across research submodules here would create a cycle risk.
+_RTH_PHASES = frozenset({"opening_range", "early", "mid", "power_hour", "closing"})
+
 
 def _producer_version() -> str:
     """Return the current git commit SHA (first 8 chars), or 'dev' if unavailable."""
@@ -238,6 +246,14 @@ class LevelObserver:
 
         if snap.vwap is not None and snap.vwap > _ZERO:
             levels.append((ReferenceLevelType.VWAP, snap.vwap, True))
+
+        rth_vwap = snap.rth_vwap
+        if (
+            rth_vwap is not None
+            and rth_vwap > _ZERO
+            and str(snap.session_phase) in _RTH_PHASES
+        ):
+            levels.append((ReferenceLevelType.RTH_VWAP, rth_vwap, True))
 
         if snap.orb_high is not None:
             levels.append((ReferenceLevelType.ORH, snap.orb_high, False))

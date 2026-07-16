@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from alpha.api.connection_manager import ConnectionManager
-from alpha.api.routes import health, runtime, trade_intents, ws
+from alpha.api.routes import health, research, runtime, trade_intents, ws
 
 logger = structlog.get_logger(__name__)
 
@@ -64,6 +64,7 @@ def create_app() -> FastAPI:
     app.include_router(runtime.router)
     app.include_router(trade_intents.router)
     app.include_router(ws.router)
+    app.include_router(research.router)
 
     return app
 
