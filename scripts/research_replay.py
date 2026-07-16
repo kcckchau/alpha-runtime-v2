@@ -115,7 +115,7 @@ async def _load_or_fetch(
     return await _fetch_and_save(sym_obj, d, storage, registry, settings)
 
 
-async def replay(symbol: str, target_date: date, warmup_days: int, fetch: bool) -> None:
+async def replay(symbol: str, target_date: date, warmup_days: int, fetch: bool, clear: bool = True) -> None:
     settings = get_settings()
 
     sym_obj = resolve_symbol(symbol)
@@ -147,6 +147,22 @@ async def replay(symbol: str, target_date: date, warmup_days: int, fetch: bool) 
 
     # ── Wire LevelObserver ────────────────────────────────────────────────────
     research_root = settings.storage.parquet_root.parent / "research"
+
+    # Clear prior runs for this date so re-runs are idempotent (use --no-clear to append).
+    if clear:
+        date_str = target_date.isoformat()
+        ticker = sym_obj.ticker
+        _clear_dirs = [
+            research_root / "level_observations" / ticker / f"session_date={date_str}",
+            research_root / "interaction" / "episodes" / ticker / f"session_date={date_str}",
+            research_root / "interaction" / "episode_bars" / ticker / f"session_date={date_str}",
+        ]
+        import shutil
+        for d in _clear_dirs:
+            if d.exists():
+                shutil.rmtree(d)
+                logger.info("Cleared %s", d)
+
     writer = LevelObservationWriter(research_root=research_root)
     observer = LevelObserver(
         event_bus=bus,
@@ -247,10 +263,14 @@ def main() -> None:
         "--fetch", action="store_true",
         help="Fetch missing dates from Databento and save to Parquet before replaying",
     )
+    parser.add_argument(
+        "--no-clear", action="store_true",
+        help="Append to existing partition instead of clearing prior run data (default: clear)",
+    )
     args = parser.parse_args()
 
     target_date = date.fromisoformat(args.date)
-    asyncio.run(replay(args.symbol, target_date, args.warmup_days, args.fetch))
+    asyncio.run(replay(args.symbol, target_date, args.warmup_days, args.fetch, clear=not args.no_clear))
 
 
 if __name__ == "__main__":
