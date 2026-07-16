@@ -59,7 +59,30 @@ def _load_episode_bars(root: Path, symbol: str, date: str) -> pa.Table | None:
 
 # ── M1 reconstruction from level_observations ─────────────────────────────────
 
-def _build_m1_table(obs: pa.Table) -> pa.Table:
+def _build_rth_vwap_lookup(ep: pa.Table | None, ep_bars: pa.Table | None) -> dict[str, str]:
+    """
+    Build a {bar_timestamp_str → rth_vwap_value_str} lookup from episode_bars.
+
+    episode_bars does not carry session_scope; join via episode_id to the episodes
+    table to identify rth-scoped VWAP episodes. Coverage is bars within active rth
+    episodes — null between episodes. Sufficient to independently audit rth levels.
+    """
+    if ep is None or ep_bars is None:
+        return {}
+    rth_ep_ids = {
+        r["episode_id"]
+        for r in ep.to_pylist()
+        if r.get("session_scope") == "rth" and r.get("level_type") == "vwap"
+    }
+    lookup: dict[str, str] = {}
+    for b in ep_bars.to_pylist():
+        if b["episode_id"] in rth_ep_ids:
+            ts_str = str(b["bar_timestamp"])
+            lookup[ts_str] = str(b["level_value_at_timestamp"])
+    return lookup
+
+
+def _build_m1_table(obs: pa.Table, ep: pa.Table | None, ep_bars: pa.Table | None) -> pa.Table:
     """
     Reconstruct M1 bar series from level_observations.
 
@@ -67,8 +90,12 @@ def _build_m1_table(obs: pa.Table) -> pa.Table:
     OHLC is reconstructed from distance columns:
         price = Decimal(level_value) + distance_ticks * Decimal(tick_size)
 
-    orb_high and orb_low are filled from orh/orl rows at each timestamp.
-    When orb_state == 'not_set' (OR still accumulating), those columns are null.
+    Columns:
+      full_session_vwap  — running VWAP since CME session open (18:00 ET prior day);
+                           present for every bar. Source: level_observations level_type='vwap'.
+      rth_vwap           — running VWAP since RTH open (09:30 ET); null outside active rth
+                           episodes. Source: episode_bars joined to episodes on session_scope='rth'.
+      orb_high / orb_low — null while orb_state == 'not_set' (OR still accumulating).
     """
     rows = obs.to_pylist()
 
@@ -80,6 +107,8 @@ def _build_m1_table(obs: pa.Table) -> pa.Table:
         if ts not in by_ts:
             by_ts[ts] = {}
         by_ts[ts][lt] = r
+
+    rth_vwap_by_ts = _build_rth_vwap_lookup(ep, ep_bars)
 
     m1_rows = []
     for ts_str in sorted(by_ts.keys()):
@@ -112,7 +141,8 @@ def _build_m1_table(obs: pa.Table) -> pa.Table:
             "high":                 _price(vwap_row["high_distance_ticks"]),
             "low":                  _price(vwap_row["low_distance_ticks"]),
             "close":                _price(vwap_row["close_distance_ticks"]),
-            "vwap":                 vwap_row["level_value"],
+            "full_session_vwap":    vwap_row["level_value"],
+            "rth_vwap":             rth_vwap_by_ts.get(ts_str),
             "orb_high":             orh_row["level_value"] if (orh_row and orb_frozen) else None,
             "orb_low":              orl_row["level_value"] if (orl_row and orb_frozen) else None,
             "session_phase":        vwap_row["session_phase"],
@@ -127,7 +157,8 @@ def _build_m1_table(obs: pa.Table) -> pa.Table:
         pa.field("high",                 pa.string()),
         pa.field("low",                  pa.string()),
         pa.field("close",                pa.string()),
-        pa.field("vwap",                 pa.string()),
+        pa.field("full_session_vwap",    pa.string()),
+        pa.field("rth_vwap",             pa.string()),   # nullable — null outside rth episodes
         pa.field("orb_high",             pa.string()),   # nullable — null before OR closes
         pa.field("orb_low",              pa.string()),   # nullable
         pa.field("session_phase",        pa.string()),
@@ -184,7 +215,7 @@ def main() -> None:
     # ── M1 series ─────────────────────────────────────────────────────────────
     obs = _load_level_obs(root, args.symbol, args.date)
     if obs is not None and obs.num_rows > 0:
-        m1 = _build_m1_table(obs)
+        m1 = _build_m1_table(obs, ep, bars)
         _write(m1, out_dir / "m1_bars.parquet")
     else:
         print("  [warn] no level_observations found — m1_bars not written")

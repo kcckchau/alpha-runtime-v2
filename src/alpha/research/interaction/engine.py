@@ -227,9 +227,18 @@ class LevelInteractionEngine:
                 session_scope="full_session",
             ))
 
-        # RTH VWAP: resets at 09:30 ET; None before first RTH bar
+        # RTH VWAP: resets at 09:30 ET; only emitted during RTH phases.
+        # After RTH close (16:00 ET) the value freezes — do not continue resolving
+        # it as an active level during after_hours. Observing price vs the frozen
+        # RTH VWAP close in after_hours is a different research question that
+        # should use an explicitly named level when that work begins.
+        from alpha.models.enums import SessionPhase
+        _RTH_PHASES = {
+            SessionPhase.OPENING_RANGE, SessionPhase.EARLY, SessionPhase.MID,
+            SessionPhase.POWER_HOUR, SessionPhase.CLOSING,
+        }
         rth_vwap = snap.rth_vwap
-        if rth_vwap and rth_vwap > 0:
+        if rth_vwap and rth_vwap > 0 and snap.session_phase in _RTH_PHASES:
             levels.append(LevelSnapshot(
                 level_id=f"{symbol}:vwap:rth:{session_date}",
                 symbol=symbol,
@@ -242,8 +251,9 @@ class LevelInteractionEngine:
                 session_scope="rth",
             ))
 
-        # ORH/ORL: only after the opening range is fully established (frozen)
-        # ORBState.NOT_SET means the ORB window is still accumulating — levels are not yet fixed
+        # ORH/ORL: only after the opening range is fully established (frozen).
+        # ORBState.NOT_SET means the window is still accumulating — levels not yet fixed.
+        # Both ORH and ORL are RTH levels (defined by the US cash-session opening range).
         or_frozen = snap.orb_state != ORBState.NOT_SET
 
         if or_frozen and snap.orb_high is not None:
@@ -256,6 +266,7 @@ class LevelInteractionEngine:
                 tick_size=tick_size,
                 is_dynamic=False,
                 sampling_note="fixed_orb_high",
+                session_scope="rth",
             ))
 
         if or_frozen and snap.orb_low is not None:
@@ -268,6 +279,7 @@ class LevelInteractionEngine:
                 tick_size=tick_size,
                 is_dynamic=False,
                 sampling_note="fixed_orb_low",
+                session_scope="rth",
             ))
 
         return levels

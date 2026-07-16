@@ -705,3 +705,62 @@ def test_start_and_end_session_phase_captured():
     assert len(summaries) == 1
     assert summaries[0].start_session_phase == "early"
     assert summaries[0].end_session_phase == "mid"
+
+
+def test_orh_orl_session_scope_is_rth():
+    """ORH and ORL LevelSnapshots must carry session_scope='rth' — they are
+    defined by the US cash-session opening range, not the full CME session."""
+    orh = LevelSnapshot(
+        level_id=f"{SYMBOL}:orh:rth:{SESSION_DATE}",
+        symbol=SYMBOL,
+        session_id=SESSION_ID,
+        level_type="orh",
+        level_value=Decimal("21050.00"),
+        tick_size=TICK_SIZE,
+        is_dynamic=False,
+        sampling_note="fixed_orb_high",
+        session_scope="rth",
+    )
+    orl = LevelSnapshot(
+        level_id=f"{SYMBOL}:orl:rth:{SESSION_DATE}",
+        symbol=SYMBOL,
+        session_id=SESSION_ID,
+        level_type="orl",
+        level_value=Decimal("20950.00"),
+        tick_size=TICK_SIZE,
+        is_dynamic=False,
+        sampling_note="fixed_orb_low",
+        session_scope="rth",
+    )
+    assert orh.session_scope == "rth"
+    assert orl.session_scope == "rth"
+
+    # Episodes opened against ORH/ORL must inherit scope='rth'
+    summaries: list[EpisodeSummary] = []
+
+    def on_complete(s: EpisodeSummary, bars) -> None:
+        summaries.append(s)
+
+    mgr = InteractionEpisodeManager(config=_cfg(), on_episode_complete=on_complete)
+    # Proximity touch then 3 separation bars for ORH level
+    touch = InteractionFrame(
+        bar_timestamp=_ts(0), symbol=SYMBOL, session_id=SESSION_ID,
+        sequence_num=None,
+        open=Decimal("21052"), high=Decimal("21060"), low=Decimal("21048"), close=Decimal("21055"),
+        volume=1000, atr_14=ATR_14, session_phase="early", is_replay=True,
+        levels=(orh,),
+    )
+    sep = lambda t: InteractionFrame(
+        bar_timestamp=_ts(t), symbol=SYMBOL, session_id=SESSION_ID,
+        sequence_num=None,
+        open=Decimal("21080"), high=Decimal("21085"), low=Decimal("21078"), close=Decimal("21082"),
+        volume=1000, atr_14=ATR_14, session_phase="early", is_replay=True,
+        levels=(orh,),
+    )
+    for f in [touch, sep(1), sep(2), sep(3)]:
+        mgr.process(f)
+    mgr.flush()
+
+    assert len(summaries) == 1
+    assert summaries[0].session_scope == "rth"
+    assert summaries[0].level_type == "orh"
