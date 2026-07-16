@@ -38,6 +38,7 @@ class LevelDistanceConfig:
             "separation_atr_fraction": self.separation_atr_fraction,
             "min_separation_bars": self.min_separation_bars,
             "max_episode_bars": self.max_episode_bars,
+            "max_bar_gap_seconds": self.max_bar_gap_seconds,
             "fallback_proximity_ticks": self.fallback_proximity_ticks,
             "fallback_separation_ticks": self.fallback_separation_ticks,
         }

@@ -97,7 +97,18 @@ class LevelInteractionEngine:
         try:
             await self._process(event)
         except Exception:
-            logger.exception("LevelInteractionEngine: unhandled error — skipping bar")
+            logger.exception("LevelInteractionEngine: unhandled error — invalidating active episodes")
+            try:
+                from alpha.models.events import PipelineOutputEvent
+                if isinstance(event, PipelineOutputEvent):
+                    symbol = event.symbol
+                    bar_ts = event.timestamp
+                    snap = event.bar_snapshot
+                    if snap is not None and snap.bar is not None:
+                        bar_ts = snap.bar.timestamp
+                    self._manager.on_processing_error(symbol, bar_ts)
+            except Exception:
+                logger.exception("LevelInteractionEngine: on_processing_error also failed")
 
     async def _process(self, event) -> None:
         from alpha.models.events import PipelineOutputEvent
@@ -109,7 +120,7 @@ class LevelInteractionEngine:
             return
 
         symbol = event.symbol
-        bar_ts: datetime = event.timestamp
+        bar_ts: datetime = snap.bar.timestamp  # canonical market time, not event dispatch time
 
         # ── Session rollover detection (must run BEFORE gap detection) ────────
         # Normal session-to-session transitions are NOT data gaps — they are
@@ -194,7 +205,7 @@ class LevelInteractionEngine:
         (session_phase != OPENING_RANGE). During the OR window the levels are
         still accumulating and must not be treated as fixed interaction points.
         """
-        from alpha.models.enums import SessionPhase
+        from alpha.models.enums import ORBState
 
         tick_size = self._get_tick_size(symbol)
         # session_id = "{symbol}:{session_date}" — extract the date portion
@@ -213,8 +224,9 @@ class LevelInteractionEngine:
                 sampling_note="end_of_bar_cumulative_vwap",
             ))
 
-        # ORH/ORL: only after the opening range window has closed
-        or_frozen = snap.session_phase != SessionPhase.OPENING_RANGE
+        # ORH/ORL: only after the opening range is fully established (frozen)
+        # ORBState.NOT_SET means the ORB window is still accumulating — levels are not yet fixed
+        or_frozen = snap.orb_state != ORBState.NOT_SET
 
         if or_frozen and snap.orb_high is not None:
             levels.append(LevelSnapshot(

@@ -117,6 +117,12 @@ class InteractionEpisodeManager:
         for key in keys:
             self._close(key, timestamp, "gap_detected")
 
+    def on_processing_error(self, symbol: str, timestamp: datetime) -> None:
+        """Invalidate all active episodes for a symbol after an unhandled processing exception."""
+        keys = [k for k in self._active if k[0] == symbol]
+        for key in keys:
+            self._close(key, timestamp, "processing_error")
+
     def flush(self) -> None:
         """
         Close all remaining active episodes (called at engine shutdown).
@@ -146,12 +152,13 @@ class InteractionEpisodeManager:
         # Entry: bar range overlaps the proximity band
         # [level - prox*tick, level + prox*tick]
         prox = self._config.proximity_ticks(frame.atr_14, level.tick_size)
+        sep = self._config.separation_ticks(frame.atr_14, level.tick_size)
         enters_proximity = (
             geo.low_distance_ticks <= prox
             and geo.high_distance_ticks >= -prox
         )
         if enters_proximity:
-            self._open_episode(key, frame, level, geo, pre_close_side, pre_close_d)
+            self._open_episode(key, frame, level, geo, pre_close_side, pre_close_d, prox, sep)
 
     def _handle_active(
         self,
@@ -168,6 +175,10 @@ class InteractionEpisodeManager:
 
         # Update last-seen geo
         self._last_geo[key] = (geo.close_side, geo.close_distance_ticks)
+
+        # Compute effective thresholds for this bar
+        prox = self._config.proximity_ticks(frame.atr_14, level.tick_size)
+        sep = self._config.separation_ticks(frame.atr_14, level.tick_size)
 
         # Append bar record
         bar_seq = len(active.bar_records)
@@ -186,6 +197,9 @@ class InteractionEpisodeManager:
             low_distance_ticks=geo.low_distance_ticks,
             close_distance_ticks=geo.close_distance_ticks,
             level_value_at_timestamp=level.level_value,
+            atr_14=frame.atr_14,
+            proximity_ticks=prox,
+            separation_ticks=sep,
             sequence_num=frame.sequence_num,
         ))
 
@@ -205,7 +219,6 @@ class InteractionEpisodeManager:
         # ── Separation logic ─────────────────────────────────────────────────
         # Full bar range must be beyond the separation threshold on the same side
         # for the counter to accumulate. A direction change or wick-return resets.
-        sep = self._config.separation_ticks(frame.atr_14, level.tick_size)
         fully_separated_above = geo.low_distance_ticks > sep
         fully_separated_below = geo.high_distance_ticks < -sep
 
@@ -239,6 +252,8 @@ class InteractionEpisodeManager:
         geo: BarLevelGeometry,
         pre_close_side: str | None,
         pre_close_distance_ticks: int | None,
+        proximity_ticks: int,
+        separation_ticks: int,
     ) -> None:
         symbol, session_id, level_id = key
         session_date = _session_date_from_id(session_id)
@@ -296,6 +311,9 @@ class InteractionEpisodeManager:
             low_distance_ticks=geo.low_distance_ticks,
             close_distance_ticks=geo.close_distance_ticks,
             level_value_at_timestamp=level.level_value,
+            atr_14=frame.atr_14,
+            proximity_ticks=proximity_ticks,
+            separation_ticks=separation_ticks,
             sequence_num=frame.sequence_num,
         )
 
@@ -328,8 +346,8 @@ class InteractionEpisodeManager:
         s.close_side_flip_count, s.max_consecutive_closes_above, s.max_consecutive_closes_below = \
             _derive_close_sequence(active.bar_records)
 
-        # Mark invalid for gap episodes
-        if end_reason == "gap_detected":
+        # Mark invalid for data-quality or exception failures
+        if end_reason in ("gap_detected", "processing_error"):
             s.is_valid_for_research = False
 
         self._last_episode_id[key] = s.episode_id

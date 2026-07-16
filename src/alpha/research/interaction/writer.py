@@ -66,6 +66,9 @@ _BAR_SCHEMA = pa.schema([
     pa.field("low_distance_ticks",      pa.int32()),
     pa.field("close_distance_ticks",    pa.int32()),
     pa.field("level_value_at_timestamp", pa.string()),  # Decimal → str
+    pa.field("atr_14",                  pa.string()),   # Decimal → str, nullable
+    pa.field("proximity_ticks",         pa.int32()),
+    pa.field("separation_ticks",        pa.int32()),
     pa.field("sequence_num",            pa.int64()),    # nullable
 ])
 
@@ -187,5 +190,8 @@ def _bar_to_row(b: EpisodeBarRecord) -> dict:
         "low_distance_ticks":       b.low_distance_ticks,
         "close_distance_ticks":     b.close_distance_ticks,
         "level_value_at_timestamp": str(b.level_value_at_timestamp),
+        "atr_14":                   str(b.atr_14) if b.atr_14 is not None else None,
+        "proximity_ticks":          b.proximity_ticks,
+        "separation_ticks":         b.separation_ticks,
         "sequence_num":             b.sequence_num,
     }

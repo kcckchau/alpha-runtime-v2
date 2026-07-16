@@ -69,6 +69,11 @@ class EpisodeBarRecord:
     close_distance_ticks: int
     level_value_at_timestamp: Decimal
 
+    # Effective dynamic boundary inputs — for auditability of episode open/close decisions
+    atr_14: Decimal | None
+    proximity_ticks: int
+    separation_ticks: int
+
     sequence_num: int | None   # from EventMetadata.sequence_num, nullable
 
 
