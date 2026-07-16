@@ -259,7 +259,7 @@ async def replay(symbol: str, target_date: date, warmup_days: int, fetch: bool, 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Research replay: record LevelBarObservation from stored bars")
-    parser.add_argument("--symbol", required=True, help="Ticker, e.g. MNQ")
+    parser.add_argument("--symbol", default="MNQ-09", help="Ticker (default: MNQ-09). Must match the ticker used when bars were saved — check data/parquet/bars/1m/ for available tickers.")
     parser.add_argument("--date", required=True, help="Target date YYYY-MM-DD")
     parser.add_argument("--warmup-days", type=int, default=5, help="Prior trading days to seed ATR/EMA (default 5)")
     parser.add_argument(
