@@ -182,10 +182,9 @@ async def replay(symbol: str, target_date: date, warmup_days: int, fetch: bool, 
         research_root=research_root,
     )
 
+    # Only pipeline engines during warmup — research writers attach after.
     aggregator.attach()
     pipeline.attach()
-    observer.attach()
-    interaction_engine.attach()
 
     storage = StorageEngine(settings, bus)
 
@@ -207,6 +206,10 @@ async def replay(symbol: str, target_date: date, warmup_days: int, fetch: bool, 
             await bus.publish(bar)
             await asyncio.sleep(0)
         await bus.flush()
+
+    # ── Attach research writers now — target date only ───────────────────────
+    observer.attach()
+    interaction_engine.attach()
 
     # ── Target date replay ────────────────────────────────────────────────────
     bars = await _load_or_fetch(sym_obj, target_date, storage, registry, settings, fetch)
