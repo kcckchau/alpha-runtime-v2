@@ -118,7 +118,7 @@ async def _load_or_fetch(
 async def replay(symbol: str, target_date: date, warmup_days: int, fetch: bool, clear: bool = True) -> None:
     settings = get_settings()
 
-    sym_obj = resolve_symbol(symbol)
+    sym_obj = resolve_symbol(symbol, as_of=target_date)
     registry = SymbolRegistry()
     registry.register(sym_obj)
 
