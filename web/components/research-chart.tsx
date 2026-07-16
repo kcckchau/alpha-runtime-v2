@@ -2,7 +2,7 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import { LineStyle, SeriesMarker, Time } from "lightweight-charts";
-import { CandlesChart, ExtraLineSeries, toETEpoch } from "@/components/candles-chart";
+import { CandlesChart, EmaConfig, ExtraLineSeries, toETEpoch } from "@/components/candles-chart";
 
 // ─── API base (same resolution logic as dashboard.tsx) ────────────────────────
 
@@ -114,6 +114,12 @@ const LEVEL_STYLE: Record<string, { color: string; label: string; short: string 
   "orh:rth":            { color: "#f59e0b", label: "ORH", short: "H" },
   "orl:rth":            { color: "#3b82f6", label: "ORL", short: "L" },
 };
+
+// Keep the research view visually consistent with the live M1/5M chart.
+const RESEARCH_EMAS: EmaConfig[] = [
+  { period: 9, color: "#60a5fa" },   // blue
+  { period: 21, color: "#fbbf24" },  // amber/yellow
+];
 
 function styleFor(levelType: string, sessionScope: string) {
   return (
@@ -358,6 +364,7 @@ export function ResearchChart() {
             <CandlesChart
               bars={payload.bars}
               overlays={overlays}
+              emas={RESEARCH_EMAS}
               extraLines={extraLines}
               markers={markers}
               viewportKey={`${payload.symbol}:${payload.session_date}`}
@@ -371,6 +378,8 @@ export function ResearchChart() {
             <LegendDot color={LEVEL_STYLE["vwap:rth"].color} label="VWAP (RTH)" />
             <LegendDot color={LEVEL_STYLE["orh:rth"].color} label="ORH" />
             <LegendDot color={LEVEL_STYLE["orl:rth"].color} label="ORL" />
+            <LegendDot color="#60a5fa" label="EMA 9" />
+            <LegendDot color="#fbbf24" label="EMA 21" />
             <span>circle = episode open · square = episode close (click a marker for detail) · dotted = ±proximity band (entry threshold, narrower) · dashed = ±separation band (exit threshold, wider — must clear for 3 consecutive bars)</span>
           </div>
 
