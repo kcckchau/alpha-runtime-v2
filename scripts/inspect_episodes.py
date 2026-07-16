@@ -83,7 +83,12 @@ def _print_summary(ep: pa.Table, level_filter: str | None) -> None:
     print(f"\nEpisodes: {len(rows)}  |  Session dates: {', '.join(dates)}")
 
     from collections import Counter
-    by_level = Counter(r["level_id"].split(":")[1] if ":" in r["level_id"] else r["level_id"] for r in rows)
+    def _level_label(r: dict) -> str:
+        lt = r["level_id"].split(":")[1] if ":" in r["level_id"] else r["level_id"]
+        scope = r.get("session_scope", "")
+        return f"{lt}/{scope}" if scope else lt
+
+    by_level = Counter(_level_label(r) for r in rows)
     by_end = Counter(r["end_reason"] for r in rows)
     valid = sum(1 for r in rows if r["is_valid_for_research"])
     range_span_counts = [r["range_span_count"] for r in rows]
@@ -101,11 +106,11 @@ def _print_summary(ep: pa.Table, level_filter: str | None) -> None:
     # Per-date breakdown
     for date in dates:
         day_rows = [r for r in rows if r["session_date"] == date]
-        by_lt = Counter(r["level_id"].split(":")[1] if ":" in r["level_id"] else r["level_id"] for r in day_rows)
+        by_lt = Counter(_level_label(r) for r in day_rows)
         invalid = sum(1 for r in day_rows if not r["is_valid_for_research"])
         print(f"\n  {date}  ({len(day_rows)} episodes  invalid={invalid})")
-        for lt in ["vwap", "orh", "orl"]:
-            ep_lt = [r for r in day_rows if (r["level_id"].split(":")[1] if ":" in r["level_id"] else "") == lt]
+        for lt in ["vwap/full_session", "vwap/rth", "orh", "orl"]:
+            ep_lt = [r for r in day_rows if _level_label(r) == lt]
             if not ep_lt:
                 continue
             cc = [r["range_span_count"] for r in ep_lt]
@@ -121,7 +126,7 @@ def _print_summary(ep: pa.Table, level_filter: str | None) -> None:
     # Episode list
     print(f"\n{'idx':>4}  {'level':5}  {'cc':>3}  {'bars':>4}  {'flips':>5}  {'end_reason':12}  {'valid':5}  {'episode_id (prefix)'}")
     print("─" * 80)
-    rows_sorted = sorted(rows, key=lambda r: (r["session_date"], r["level_id"].split(":")[1] if ":" in r["level_id"] else r["level_id"], r["interaction_index"]))
+    rows_sorted = sorted(rows, key=lambda r: (r["session_date"], _level_label(r), r["interaction_index"]))
     prev_date = None
     for r in rows_sorted:
         if r["session_date"] != prev_date:
@@ -129,7 +134,7 @@ def _print_summary(ep: pa.Table, level_filter: str | None) -> None:
                 print()
             print(f"  ── {r['session_date']} ──")
             prev_date = r["session_date"]
-        lt = r["level_id"].split(":")[1] if ":" in r["level_id"] else r["level_id"]
+        lt = _level_label(r)
         eid = r["episode_id"][:16]
         valid_str = "✓" if r["is_valid_for_research"] else "✗"
         print(

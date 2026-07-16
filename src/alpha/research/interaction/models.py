@@ -15,6 +15,7 @@ class LevelSnapshot:
     tick_size: Decimal
     is_dynamic: bool       # True for VWAP (value changes), False for ORH/ORL
     sampling_note: str     # "end_of_bar_cumulative_vwap" or "fixed_orb_high" etc.
+    session_scope: str = "full_session"   # "full_session" | "rth" — explicit; do not parse from level_id
 
 
 @dataclass(frozen=True)
@@ -127,3 +128,8 @@ class EpisodeSummary:
     policy_version: str
     policy_config_hash: str
     geometry_version: str
+
+    # Level scope and session context
+    session_scope: str = "full_session"   # from the level's session_scope
+    start_session_phase: str = ""         # session_phase of the bar that opened the episode
+    end_session_phase: str | None = None  # session_phase of the bar that closed the episode

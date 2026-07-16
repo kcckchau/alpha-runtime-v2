@@ -212,16 +212,34 @@ class LevelInteractionEngine:
         session_date = session_id.split(":", 1)[1] if ":" in session_id else session_id
         levels: list[LevelSnapshot] = []
 
-        if snap.vwap and snap.vwap > 0:
+        # Full-session VWAP: resets at CME session boundary (18:00 ET prior day)
+        fs_vwap = snap.full_session_vwap
+        if fs_vwap and fs_vwap > 0:
+            levels.append(LevelSnapshot(
+                level_id=f"{symbol}:vwap:full_session:{session_date}",
+                symbol=symbol,
+                session_id=session_id,
+                level_type="vwap",
+                level_value=fs_vwap,
+                tick_size=tick_size,
+                is_dynamic=True,
+                sampling_note="end_of_bar_cumulative_vwap_full_session",
+                session_scope="full_session",
+            ))
+
+        # RTH VWAP: resets at 09:30 ET; None before first RTH bar
+        rth_vwap = snap.rth_vwap
+        if rth_vwap and rth_vwap > 0:
             levels.append(LevelSnapshot(
                 level_id=f"{symbol}:vwap:rth:{session_date}",
                 symbol=symbol,
                 session_id=session_id,
                 level_type="vwap",
-                level_value=snap.vwap,
+                level_value=rth_vwap,
                 tick_size=tick_size,
                 is_dynamic=True,
-                sampling_note="end_of_bar_cumulative_vwap",
+                sampling_note="end_of_bar_cumulative_vwap_rth",
+                session_scope="rth",
             ))
 
         # ORH/ORL: only after the opening range is fully established (frozen)

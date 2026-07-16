@@ -50,6 +50,9 @@ _EPISODE_SCHEMA = pa.schema([
     pa.field("policy_version",                  pa.string()),
     pa.field("policy_config_hash",              pa.string()),
     pa.field("geometry_version",                pa.string()),
+    pa.field("session_scope",                   pa.string()),
+    pa.field("start_session_phase",             pa.string()),
+    pa.field("end_session_phase",               pa.string()),    # nullable
 ])
 
 _BAR_SCHEMA = pa.schema([
@@ -172,6 +175,9 @@ def _summary_to_row(s: EpisodeSummary) -> dict:
         "policy_version":                  s.policy_version,
         "policy_config_hash":              s.policy_config_hash,
         "geometry_version":                s.geometry_version,
+        "session_scope":                   s.session_scope,
+        "start_session_phase":             s.start_session_phase,
+        "end_session_phase":               s.end_session_phase,
     }
 
 

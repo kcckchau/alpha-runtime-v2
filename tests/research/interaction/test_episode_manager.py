@@ -62,10 +62,15 @@ def _cfg(**kwargs) -> LevelDistanceConfig:
     return LevelDistanceConfig(**defaults)
 
 
-def _level(level_value: float = 21000.0, session_id: str = SESSION_ID) -> LevelSnapshot:
+def _level(
+    level_value: float = 21000.0,
+    session_id: str = SESSION_ID,
+    session_scope: str = "full_session",
+) -> LevelSnapshot:
     session_date = session_id.split(":", 1)[1]
+    scope_seg = session_scope  # "full_session" or "rth"
     return LevelSnapshot(
-        level_id=f"{SYMBOL}:vwap:rth:{session_date}",
+        level_id=f"{SYMBOL}:vwap:{scope_seg}:{session_date}",
         symbol=SYMBOL,
         session_id=session_id,
         level_type="vwap",
@@ -73,6 +78,7 @@ def _level(level_value: float = 21000.0, session_id: str = SESSION_ID) -> LevelS
         tick_size=TICK_SIZE,
         is_dynamic=True,
         sampling_note="end_of_bar_cumulative_vwap",
+        session_scope=session_scope,
     )
 
 
@@ -85,6 +91,8 @@ def _frame(
     level_value: float = 21000.0,
     atr_14: float = 50.0,
     session_id: str = SESSION_ID,
+    session_phase: str = "mid",
+    levels: tuple | None = None,
 ) -> InteractionFrame:
     return InteractionFrame(
         bar_timestamp=ts,
@@ -97,9 +105,9 @@ def _frame(
         close=Decimal(str(close_price)),
         volume=1000,
         atr_14=Decimal(str(atr_14)),
-        session_phase="mid",
+        session_phase=session_phase,
         is_replay=True,
-        levels=(_level(level_value, session_id),),
+        levels=levels if levels is not None else (_level(level_value, session_id),),
     )
 
 
@@ -263,7 +271,7 @@ def test_dynamic_vwap_level_id_stable():
 
     assert len(summaries) == 1, "VWAP drift must not create multiple episodes"
     s = summaries[0]
-    assert s.level_id == f"{SYMBOL}:vwap:rth:{SESSION_DATE}"
+    assert s.level_id == f"{SYMBOL}:vwap:full_session:{SESSION_DATE}"
 
 
 # ── Test 6: Timeout ───────────────────────────────────────────────────────────
@@ -533,3 +541,167 @@ def test_session_rollover_valid_gap_invalid():
     assert len(completions_gap) == 1
     assert completions_gap[0].end_reason == "gap_detected"
     assert completions_gap[0].is_valid_for_research is False
+
+
+# ── VWAP session scope tests ─────────────────────────────────────────────────
+
+def test_full_session_vwap_level_id_and_scope():
+    """full_session VWAP produces level_id with 'full_session' segment and correct scope."""
+    fs_level = _level(session_scope="full_session")
+    assert "full_session" in fs_level.level_id
+    assert fs_level.session_scope == "full_session"
+    assert fs_level.level_type == "vwap"
+
+
+def test_rth_vwap_level_id_and_scope():
+    """rth VWAP produces level_id with 'rth' segment and correct scope."""
+    rth_level = _level(session_scope="rth")
+    assert "rth" in rth_level.level_id
+    assert rth_level.session_scope == "rth"
+    assert rth_level.level_type == "vwap"
+
+
+def test_full_session_and_rth_have_distinct_level_ids():
+    """full_session and rth VWAP must produce distinct level_ids so they track separately."""
+    fs = _level(level_value=21000.0, session_scope="full_session")
+    rth = _level(level_value=21050.0, session_scope="rth")
+    assert fs.level_id != rth.level_id
+
+
+def test_episode_scope_matches_level_scope():
+    """EpisodeSummary.session_scope inherits from LevelSnapshot.session_scope."""
+    summaries: list[EpisodeSummary] = []
+
+    def on_complete(s: EpisodeSummary, bars) -> None:
+        summaries.append(s)
+
+    mgr = InteractionEpisodeManager(config=_cfg(), on_episode_complete=on_complete)
+    rth_level = _level(level_value=21000.0, session_scope="rth")
+
+    # One proximity bar, then 3 separation bars
+    frames = [
+        InteractionFrame(
+            bar_timestamp=_ts(0), symbol=SYMBOL, session_id=SESSION_ID,
+            sequence_num=None,
+            open=Decimal("21002"), high=Decimal("21010"), low=Decimal("20998"), close=Decimal("21005"),
+            volume=1000, atr_14=ATR_14, session_phase="opening_range", is_replay=True,
+            levels=(rth_level,),
+        ),
+        InteractionFrame(
+            bar_timestamp=_ts(1), symbol=SYMBOL, session_id=SESSION_ID,
+            sequence_num=None,
+            open=Decimal("21030"), high=Decimal("21035"), low=Decimal("21028"), close=Decimal("21032"),
+            volume=1000, atr_14=ATR_14, session_phase="early", is_replay=True,
+            levels=(rth_level,),
+        ),
+        InteractionFrame(
+            bar_timestamp=_ts(2), symbol=SYMBOL, session_id=SESSION_ID,
+            sequence_num=None,
+            open=Decimal("21030"), high=Decimal("21035"), low=Decimal("21028"), close=Decimal("21032"),
+            volume=1000, atr_14=ATR_14, session_phase="early", is_replay=True,
+            levels=(rth_level,),
+        ),
+        InteractionFrame(
+            bar_timestamp=_ts(3), symbol=SYMBOL, session_id=SESSION_ID,
+            sequence_num=None,
+            open=Decimal("21030"), high=Decimal("21035"), low=Decimal("21028"), close=Decimal("21032"),
+            volume=1000, atr_14=ATR_14, session_phase="mid", is_replay=True,
+            levels=(rth_level,),
+        ),
+    ]
+    for f in frames:
+        mgr.process(f)
+    mgr.flush()
+
+    assert len(summaries) == 1
+    assert summaries[0].session_scope == "rth"
+    assert summaries[0].start_session_phase == "opening_range"
+    assert summaries[0].end_session_phase == "mid"
+
+
+def test_full_session_episode_does_not_link_to_rth_episode():
+    """prior_episode_id chain must not cross scope: full_session and rth episodes are independent."""
+    fs_level = _level(level_value=21000.0, session_scope="full_session")
+    rth_level = _level(level_value=21000.0, session_scope="rth")
+
+    summaries: list[EpisodeSummary] = []
+
+    def on_complete(s: EpisodeSummary, bars) -> None:
+        summaries.append(s)
+
+    mgr = InteractionEpisodeManager(config=_cfg(), on_episode_complete=on_complete)
+
+    # Bar 0: touches proximity for BOTH levels → two episodes open
+    open_bar = InteractionFrame(
+        bar_timestamp=_ts(0), symbol=SYMBOL, session_id=SESSION_ID,
+        sequence_num=None,
+        open=Decimal("21002"), high=Decimal("21010"), low=Decimal("20998"), close=Decimal("21005"),
+        volume=1000, atr_14=ATR_14, session_phase="early", is_replay=True,
+        levels=(fs_level, rth_level),
+    )
+    # Bars 1-3: separate above for BOTH
+    sep_bar = lambda t: InteractionFrame(
+        bar_timestamp=_ts(t), symbol=SYMBOL, session_id=SESSION_ID,
+        sequence_num=None,
+        open=Decimal("21030"), high=Decimal("21035"), low=Decimal("21028"), close=Decimal("21032"),
+        volume=1000, atr_14=ATR_14, session_phase="early", is_replay=True,
+        levels=(fs_level, rth_level),
+    )
+    for f in [open_bar, sep_bar(1), sep_bar(2), sep_bar(3)]:
+        mgr.process(f)
+    mgr.flush()
+
+    assert len(summaries) == 2
+    by_scope = {s.session_scope: s for s in summaries}
+    assert "full_session" in by_scope
+    assert "rth" in by_scope
+
+    # Second round: re-approach and open new episodes
+    open_bar2 = InteractionFrame(
+        bar_timestamp=_ts(4), symbol=SYMBOL, session_id=SESSION_ID,
+        sequence_num=None,
+        open=Decimal("21002"), high=Decimal("21010"), low=Decimal("20998"), close=Decimal("21005"),
+        volume=1000, atr_14=ATR_14, session_phase="mid", is_replay=True,
+        levels=(fs_level, rth_level),
+    )
+    for f in [open_bar2, sep_bar(5), sep_bar(6), sep_bar(7)]:
+        mgr.process(f)
+    mgr.flush()
+
+    second_round = [s for s in summaries if s.interaction_index == 2]
+    assert len(second_round) == 2
+
+    fs2 = next(s for s in second_round if s.session_scope == "full_session")
+    rth2 = next(s for s in second_round if s.session_scope == "rth")
+
+    # Each scope's chain is isolated: fs2 links to fs1, rth2 links to rth1
+    fs1 = by_scope["full_session"]
+    rth1 = by_scope["rth"]
+    assert fs2.prior_episode_id == fs1.episode_id
+    assert rth2.prior_episode_id == rth1.episode_id
+    assert fs2.prior_episode_id != rth1.episode_id  # no cross-scope linking
+
+
+def test_start_and_end_session_phase_captured():
+    """start_session_phase and end_session_phase are set on EpisodeSummary."""
+    summaries: list[EpisodeSummary] = []
+
+    def on_complete(s: EpisodeSummary, bars) -> None:
+        summaries.append(s)
+
+    mgr = InteractionEpisodeManager(config=_cfg(), on_episode_complete=on_complete)
+    level = _level()
+
+    frames = [
+        _frame(_ts(0), 21002, 21010, 20998, 21005, session_phase="early"),
+        _frame(_ts(1), 21030, 21035, 21028, 21032, session_phase="early"),
+        _frame(_ts(2), 21030, 21035, 21028, 21032, session_phase="mid"),
+        _frame(_ts(3), 21030, 21035, 21028, 21032, session_phase="mid"),
+    ]
+    for f in frames:
+        mgr.process(f)
+    mgr.flush()
+
+    assert len(summaries) == 1
+    assert summaries[0].start_session_phase == "early"
+    assert summaries[0].end_session_phase == "mid"

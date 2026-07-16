@@ -57,6 +57,7 @@ class _ActiveEpisode:
     separation_direction: str | None = None  # "above" | "below" | None
     last_bar_ts: datetime | None = None      # timestamp of last bar seen
     atr_at_start_was_none: bool = False
+    last_session_phase: str | None = None  # phase of last bar seen; used as end_session_phase
 
 
 class InteractionEpisodeManager:
@@ -170,8 +171,9 @@ class InteractionEpisodeManager:
     ) -> None:
         s = active.summary
 
-        # Track latest bar timestamp for flush()
+        # Track latest bar timestamp and session phase for flush()
         active.last_bar_ts = frame.bar_timestamp
+        active.last_session_phase = frame.session_phase
 
         # Update last-seen geo
         self._last_geo[key] = (geo.close_side, geo.close_distance_ticks)
@@ -295,6 +297,9 @@ class InteractionEpisodeManager:
             policy_version=self.POLICY_VERSION,
             policy_config_hash=self._config.config_hash(),
             geometry_version=GEOMETRY_VERSION,
+            session_scope=level.session_scope,
+            start_session_phase=frame.session_phase,
+            end_session_phase=None,
         )
 
         bar_record = EpisodeBarRecord(
@@ -324,6 +329,7 @@ class InteractionEpisodeManager:
             separation_direction=None,
             last_bar_ts=frame.bar_timestamp,
             atr_at_start_was_none=atr_was_none,
+            last_session_phase=frame.session_phase,
         )
         self._active[key] = active
 
@@ -341,6 +347,7 @@ class InteractionEpisodeManager:
         s = active.summary
         s.ended_at = timestamp
         s.end_reason = end_reason
+        s.end_session_phase = active.last_session_phase or s.start_session_phase
 
         # Derive aggregate fields from bar sequence
         s.close_side_flip_count, s.max_consecutive_closes_above, s.max_consecutive_closes_below = \
