@@ -241,6 +241,49 @@ def wire_notifications(engine: "BootstrapEngine") -> None:
     )
 
 
+def _clear_research_partitions_for_today(research_root: "Path", engine: "BootstrapEngine") -> None:
+    """Clear today's research partitions for all registered symbols before wiring.
+
+    Called once at startup so that each backend run writes a clean, single-run_id
+    partition for the current session. Without this, every restart appends a new
+    run_id file to the same session_date directory, producing duplicate rows.
+
+    Only clears the current session date (determined per-symbol via the calendar).
+    Historical dates (replayed via research_replay.py) are left untouched.
+    """
+    import shutil
+    from datetime import datetime, timezone
+    from alpha.calendar.resolver import calendar_for_symbol
+
+    now_utc = datetime.now(tz=timezone.utc)
+
+    tables = [
+        research_root / "level_observations",
+        research_root / "interaction" / "episodes",
+        research_root / "interaction" / "episode_bars",
+    ]
+
+    cleared: list[str] = []
+    for sym in engine._registry.all():
+        try:
+            cal = calendar_for_symbol(sym)
+            session_date = cal.session_date(now_utc).isoformat()
+        except Exception:
+            session_date = now_utc.date().isoformat()  # fallback
+
+        for table in tables:
+            part_dir = table / sym.ticker / f"session_date={session_date}"
+            if part_dir.exists():
+                shutil.rmtree(part_dir)
+                cleared.append(str(part_dir))
+
+    if cleared:
+        for p in cleared:
+            logger.info("Cleared stale research partition: %s", p)
+    else:
+        logger.info("No stale research partitions to clear for today's session.")
+
+
 def wire_level_observer(engine: "BootstrapEngine") -> None:
     """Wire the Phase 0 shadow LevelObserver.
 
@@ -262,6 +305,7 @@ def wire_level_observer(engine: "BootstrapEngine") -> None:
         run_mode = RunMode.BACKFILL
 
     research_root = Path(engine._settings.storage.parquet_root).parent / "research"
+    _clear_research_partitions_for_today(research_root, engine)
     writer = LevelObservationWriter(research_root=research_root)
 
     from alpha.engines.live.monitor import IngestionMonitor
@@ -289,6 +333,7 @@ def wire_interaction_engine(engine: "BootstrapEngine") -> None:
     from alpha.research.interaction.engine import LevelInteractionEngine
 
     research_root = Path(engine._settings.storage.parquet_root).parent / "research"
+    # Partitions already cleared by wire_level_observer (called first).
     interaction_engine = LevelInteractionEngine(
         event_bus=engine._event_bus,
         registry=engine._registry,
