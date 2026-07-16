@@ -4,12 +4,26 @@ InteractionEpisodeManager: opens, tracks and closes interaction episodes.
 Episode identity: (symbol, session_id, level_id)
 One active episode per level per session at any time.
 
-Separation logic:
-- bars_at_separation counter increments when |close_distance_ticks| > separation_ticks
-- counter RESETS if price returns within separation distance (even one bar)
-- episode closes only after min_separation_bars consecutive bars at separation distance
+Entry rule:
+- Episode opens when the bar's range overlaps the proximity band:
+    low_distance_ticks <= proximity_ticks  AND  high_distance_ticks >= -proximity_ticks
+  This captures wick-touches and full bars within the band, regardless of close.
 
-This conservative reset prevents premature closure on noise.
+Separation logic:
+- A bar is "fully separated above" when low_distance_ticks > separation_ticks
+  (the ENTIRE bar range is beyond the threshold — wicks included).
+- A bar is "fully separated below" when high_distance_ticks < -separation_ticks.
+- Consecutive bars must remain on the SAME side. A direction change resets the
+  counter to 1 for the new direction. Alternating far-above/far-below never
+  accumulates toward closure.
+- Any bar that fails both tests (wick re-enters the gap between thresholds)
+  resets the counter to 0.
+- Episode closes after min_separation_bars consecutive fully-separated bars on
+  the same side.
+
+flush() end reason:
+- "replay_completed" — called at engine shutdown (research replay or live stop).
+- ended_at is set to the last bar's timestamp, NOT started_at.
 """
 from __future__ import annotations
 
@@ -40,6 +54,8 @@ class _ActiveEpisode:
     summary: EpisodeSummary
     bar_records: list[EpisodeBarRecord] = field(default_factory=list)
     bars_at_separation: int = 0
+    separation_direction: str | None = None  # "above" | "below" | None
+    last_bar_ts: datetime | None = None      # timestamp of last bar seen
     atr_at_start_was_none: bool = False
 
 
@@ -63,7 +79,7 @@ class InteractionEpisodeManager:
         # Active episodes
         self._active: dict[_EpisodeKey, _ActiveEpisode] = {}
 
-        # Last seen geometry per key (for pre_entry fields and approach_side)
+        # Last seen geometry per key (for pre_entry fields)
         self._last_geo: dict[_EpisodeKey, tuple[str, int]] = {}  # (close_side, close_distance_ticks)
 
         # Last completed episode_id per key (for prior_episode_id link)
@@ -83,16 +99,12 @@ class InteractionEpisodeManager:
             else:
                 self._handle_active(key, active, frame, level, geo)
 
-            # Update last-seen geometry AFTER episode logic (so pre_entry captures
-            # the bar before the episode opened, not the opening bar itself)
-            # Actually we update BEFORE episode start check — see _handle_outside
-
     def on_session_end(self, symbol: str, session_id: str, timestamp: datetime) -> None:
-        """Close all active episodes for a symbol+session."""
+        """Close all active episodes for a symbol+session with end_reason='session_ended'."""
         keys = [k for k in self._active if k[0] == symbol and k[1] == session_id]
         for key in keys:
             self._close(key, timestamp, "session_ended")
-        # Clear interaction index for this session
+        # Clear per-session state
         for key in list(self._interaction_index):
             if key[0] == symbol and key[1] == session_id:
                 del self._interaction_index[key]
@@ -100,17 +112,21 @@ class InteractionEpisodeManager:
                 self._last_geo.pop(key, None)
 
     def on_gap(self, symbol: str, session_id: str, timestamp: datetime) -> None:
-        """Invalidate all active episodes for a symbol+session due to data gap."""
+        """Invalidate all active episodes for a symbol+session due to within-session data gap."""
         keys = [k for k in self._active if k[0] == symbol and k[1] == session_id]
         for key in keys:
             self._close(key, timestamp, "gap_detected")
 
     def flush(self) -> None:
-        """Close all remaining active episodes (called at engine shutdown)."""
+        """
+        Close all remaining active episodes (called at engine shutdown).
+        Uses each episode's last_bar_ts as ended_at so duration is non-zero.
+        End reason: 'replay_completed'.
+        """
         for key in list(self._active.keys()):
             ep = self._active[key]
-            ts = ep.summary.started_at  # best we have
-            self._close(key, ts, "session_ended")
+            ts = ep.last_bar_ts or ep.summary.started_at
+            self._close(key, ts, "replay_completed")
 
     # ── Private ───────────────────────────────────────────────────────────────
 
@@ -121,17 +137,20 @@ class InteractionEpisodeManager:
         level: LevelSnapshot,
         geo: BarLevelGeometry,
     ) -> None:
-        # Capture pre-entry context BEFORE deciding to open
+        # Capture pre-entry context from the bar BEFORE this one
         pre_close_side, pre_close_d = self._last_geo.get(key, (None, None))
 
-        # Update last-seen geo
+        # Update last-seen geometry for next bar's pre-entry capture
         self._last_geo[key] = (geo.close_side, geo.close_distance_ticks)
 
-        # Check if episode should start
+        # Entry: bar range overlaps the proximity band
+        # [level - prox*tick, level + prox*tick]
         prox = self._config.proximity_ticks(frame.atr_14, level.tick_size)
-        dist = abs(geo.close_distance_ticks)
-
-        if dist <= prox or geo.range_spans_level:
+        enters_proximity = (
+            geo.low_distance_ticks <= prox
+            and geo.high_distance_ticks >= -prox
+        )
+        if enters_proximity:
             self._open_episode(key, frame, level, geo, pre_close_side, pre_close_d)
 
     def _handle_active(
@@ -143,6 +162,9 @@ class InteractionEpisodeManager:
         geo: BarLevelGeometry,
     ) -> None:
         s = active.summary
+
+        # Track latest bar timestamp for flush()
+        active.last_bar_ts = frame.bar_timestamp
 
         # Update last-seen geo
         self._last_geo[key] = (geo.close_side, geo.close_distance_ticks)
@@ -170,7 +192,7 @@ class InteractionEpisodeManager:
         # Update running aggregates
         s.bar_count += 1
         if geo.range_spans_level:
-            s.cross_count += 1
+            s.range_span_count += 1
         s.max_above_ticks = max(s.max_above_ticks, geo.high_distance_ticks)
         s.max_below_ticks = min(s.max_below_ticks, geo.low_distance_ticks)
         s.end_side = geo.close_side
@@ -180,14 +202,31 @@ class InteractionEpisodeManager:
             self._close(key, frame.bar_timestamp, "timeout")
             return
 
-        # Separation logic
+        # ── Separation logic ─────────────────────────────────────────────────
+        # Full bar range must be beyond the separation threshold on the same side
+        # for the counter to accumulate. A direction change or wick-return resets.
         sep = self._config.separation_ticks(frame.atr_14, level.tick_size)
-        dist = abs(geo.close_distance_ticks)
+        fully_separated_above = geo.low_distance_ticks > sep
+        fully_separated_below = geo.high_distance_ticks < -sep
 
-        if dist > sep:
-            active.bars_at_separation += 1
+        if fully_separated_above:
+            this_dir: str | None = "above"
+        elif fully_separated_below:
+            this_dir = "below"
         else:
-            active.bars_at_separation = 0  # reset on ANY return to proximity zone
+            this_dir = None
+
+        if this_dir is not None:
+            if this_dir == active.separation_direction:
+                active.bars_at_separation += 1
+            else:
+                # Direction changed — start fresh in new direction
+                active.bars_at_separation = 1
+                active.separation_direction = this_dir
+        else:
+            # Wick or close returned within the gap — full reset
+            active.bars_at_separation = 0
+            active.separation_direction = None
 
         if active.bars_at_separation >= self._config.min_separation_bars:
             self._close(key, frame.bar_timestamp, "separation")
@@ -229,7 +268,7 @@ class InteractionEpisodeManager:
             pre_entry_close_distance_ticks=pre_close_distance_ticks,
             approach_side=approach_side,
             bar_count=1,
-            cross_count=1 if geo.range_spans_level else 0,
+            range_span_count=1 if geo.range_spans_level else 0,
             max_above_ticks=geo.high_distance_ticks,
             max_below_ticks=geo.low_distance_ticks,
             end_side=geo.close_side,
@@ -264,13 +303,16 @@ class InteractionEpisodeManager:
             summary=summary,
             bar_records=[bar_record],
             bars_at_separation=0,
+            separation_direction=None,
+            last_bar_ts=frame.bar_timestamp,
             atr_at_start_was_none=atr_was_none,
         )
         self._active[key] = active
 
         logger.debug(
-            "Episode opened | %s %s #%d | approach=%s | prox_entry=dist%+d",
-            level.level_type, symbol, idx, approach_side, geo.close_distance_ticks,
+            "Episode opened | %s %s #%d | approach=%s | prox_entry=low%+d high%+d",
+            level.level_type, symbol, idx, approach_side,
+            geo.low_distance_ticks, geo.high_distance_ticks,
         )
 
     def _close(self, key: _EpisodeKey, timestamp: datetime, end_reason: str) -> None:
@@ -286,16 +328,16 @@ class InteractionEpisodeManager:
         s.close_side_flip_count, s.max_consecutive_closes_above, s.max_consecutive_closes_below = \
             _derive_close_sequence(active.bar_records)
 
-        # is_valid_for_research: False for gaps or ATR-unwarm episodes
+        # Mark invalid for gap episodes
         if end_reason == "gap_detected":
             s.is_valid_for_research = False
 
         self._last_episode_id[key] = s.episode_id
 
         logger.debug(
-            "Episode closed | %s %s #%d | bars=%d crosses=%d reason=%s valid=%s",
+            "Episode closed | %s %s #%d | bars=%d spans=%d reason=%s valid=%s",
             s.level_type, s.symbol, s.interaction_index,
-            s.bar_count, s.cross_count, end_reason, s.is_valid_for_research,
+            s.bar_count, s.range_span_count, end_reason, s.is_valid_for_research,
         )
 
         self._on_complete(s, active.bar_records)

@@ -38,7 +38,7 @@ _EPISODE_SCHEMA = pa.schema([
     pa.field("pre_entry_close_distance_ticks",  pa.int32()),       # nullable
     pa.field("approach_side",                   pa.string()),
     pa.field("bar_count",                       pa.int32()),
-    pa.field("cross_count",                     pa.int32()),
+    pa.field("range_span_count",                 pa.int32()),
     pa.field("max_above_ticks",                 pa.int32()),
     pa.field("max_below_ticks",                 pa.int32()),
     pa.field("end_side",                        pa.string()),      # nullable
@@ -157,7 +157,7 @@ def _summary_to_row(s: EpisodeSummary) -> dict:
         "pre_entry_close_distance_ticks":  s.pre_entry_close_distance_ticks,
         "approach_side":                   s.approach_side,
         "bar_count":                       s.bar_count,
-        "cross_count":                     s.cross_count,
+        "range_span_count":                s.range_span_count,
         "max_above_ticks":                 s.max_above_ticks,
         "max_below_ticks":                 s.max_below_ticks,
         "end_side":                        s.end_side,

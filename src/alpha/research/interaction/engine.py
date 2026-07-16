@@ -63,6 +63,8 @@ class LevelInteractionEngine:
 
         self._sub = None
         self._frames_processed = 0
+        # Separate counter for periodic flush (episodes_written only increments after flush)
+        self._completed_episode_count = 0
 
     def attach(self) -> None:
         self._sub = self._bus.subscribe(
@@ -109,24 +111,14 @@ class LevelInteractionEngine:
         symbol = event.symbol
         bar_ts: datetime = event.timestamp
 
-        # ── Gap detection ────────────────────────────────────────────────────
-        last_ts = self._last_bar_ts.get(symbol)
-        if last_ts is not None:
-            gap_seconds = (bar_ts - last_ts).total_seconds()
-            if gap_seconds > self._config.max_bar_gap_seconds:
-                session_id = self._build_session_id(symbol, snap)
-                logger.warning(
-                    "LevelInteractionEngine: gap detected for %s — %.0fs gap "
-                    "(threshold=%ds) — invalidating active episodes",
-                    symbol, gap_seconds, self._config.max_bar_gap_seconds,
-                )
-                self._manager.on_gap(symbol, session_id, bar_ts)
-        self._last_bar_ts[symbol] = bar_ts
-
-        # ── Session rollover detection ────────────────────────────────────────
+        # ── Session rollover detection (must run BEFORE gap detection) ────────
+        # Normal session-to-session transitions are NOT data gaps — they are
+        # expected overnight breaks. Checking rollover first prevents the gap
+        # detector from misclassifying them as missing data.
         session_id = self._build_session_id(symbol, snap)
         last_session = self._last_session_key.get(symbol)
-        if last_session is not None and session_id != last_session:
+        is_session_rollover = last_session is not None and session_id != last_session
+        if is_session_rollover:
             logger.info(
                 "LevelInteractionEngine: session rollover %s → %s for %s",
                 last_session, session_id, symbol,
@@ -134,6 +126,19 @@ class LevelInteractionEngine:
             self._manager.on_session_end(symbol, last_session, bar_ts)
             self._writer.flush()
         self._last_session_key[symbol] = session_id
+
+        # ── Gap detection (within-session only) ──────────────────────────────
+        last_ts = self._last_bar_ts.get(symbol)
+        if last_ts is not None and not is_session_rollover:
+            gap_seconds = (bar_ts - last_ts).total_seconds()
+            if gap_seconds > self._config.max_bar_gap_seconds:
+                logger.warning(
+                    "LevelInteractionEngine: gap detected for %s — %.0fs gap "
+                    "(threshold=%ds) — invalidating active episodes",
+                    symbol, gap_seconds, self._config.max_bar_gap_seconds,
+                )
+                self._manager.on_gap(symbol, session_id, bar_ts)
+        self._last_bar_ts[symbol] = bar_ts
 
         # ── Build InteractionFrame ────────────────────────────────────────────
         levels = self._resolve_levels(symbol, session_id, snap)
@@ -180,13 +185,25 @@ class LevelInteractionEngine:
         return f"{symbol}:{snap.bar.timestamp.date().isoformat()}"
 
     def _resolve_levels(self, symbol: str, session_id: str, snap) -> list[LevelSnapshot]:
-        """Extract registered levels from BarSnapshot for Phase 1: VWAP, ORH, ORL."""
+        """Extract registered levels from BarSnapshot for Phase 1: VWAP, ORH, ORL.
+
+        Level ID format: "{symbol}:{level_type}:rth:{session_date}"
+        e.g. "MNQ:vwap:rth:2026-07-10"
+
+        ORH/ORL are only registered after the opening range window has closed
+        (session_phase != OPENING_RANGE). During the OR window the levels are
+        still accumulating and must not be treated as fixed interaction points.
+        """
+        from alpha.models.enums import SessionPhase
+
         tick_size = self._get_tick_size(symbol)
+        # session_id = "{symbol}:{session_date}" — extract the date portion
+        session_date = session_id.split(":", 1)[1] if ":" in session_id else session_id
         levels: list[LevelSnapshot] = []
 
         if snap.vwap and snap.vwap > 0:
             levels.append(LevelSnapshot(
-                level_id=f"vwap:{symbol}:{session_id}",
+                level_id=f"{symbol}:vwap:rth:{session_date}",
                 symbol=symbol,
                 session_id=session_id,
                 level_type="vwap",
@@ -196,9 +213,12 @@ class LevelInteractionEngine:
                 sampling_note="end_of_bar_cumulative_vwap",
             ))
 
-        if snap.orb_high is not None:
+        # ORH/ORL: only after the opening range window has closed
+        or_frozen = snap.session_phase != SessionPhase.OPENING_RANGE
+
+        if or_frozen and snap.orb_high is not None:
             levels.append(LevelSnapshot(
-                level_id=f"orh:{symbol}:{session_id}",
+                level_id=f"{symbol}:orh:rth:{session_date}",
                 symbol=symbol,
                 session_id=session_id,
                 level_type="orh",
@@ -208,9 +228,9 @@ class LevelInteractionEngine:
                 sampling_note="fixed_orb_high",
             ))
 
-        if snap.orb_low is not None:
+        if or_frozen and snap.orb_low is not None:
             levels.append(LevelSnapshot(
-                level_id=f"orl:{symbol}:{session_id}",
+                level_id=f"{symbol}:orl:rth:{session_date}",
                 symbol=symbol,
                 session_id=session_id,
                 level_type="orl",
@@ -237,6 +257,9 @@ class LevelInteractionEngine:
 
     def _on_episode_complete(self, summary, bars) -> None:
         self._writer.write(summary, bars)
-        # Flush periodically (every 10 episodes)
-        if self._writer.episodes_written % 10 == 0:
+        self._completed_episode_count += 1
+        # Flush every 10 completed episodes.
+        # episodes_written only increments after flush(), so it cannot be used
+        # here directly — it would flush on episode 1 and then never again.
+        if self._completed_episode_count % 10 == 0:
             self._writer.flush()

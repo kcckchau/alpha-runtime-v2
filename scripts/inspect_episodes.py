@@ -73,7 +73,7 @@ def _load_bars(root: Path, symbol: str, date: str | None) -> pa.Table | None:
 def _print_summary(ep: pa.Table, level_filter: str | None) -> None:
     rows = ep.to_pylist()
     if level_filter:
-        rows = [r for r in rows if r["level_id"].startswith(level_filter)]
+        rows = [r for r in rows if (r["level_id"].split(":")[1] if ":" in r["level_id"] else "") == level_filter]
 
     if not rows:
         print("No episodes matched filters.")
@@ -83,15 +83,15 @@ def _print_summary(ep: pa.Table, level_filter: str | None) -> None:
     print(f"\nEpisodes: {len(rows)}  |  Session dates: {', '.join(dates)}")
 
     from collections import Counter
-    by_level = Counter(r["level_id"].split(":")[0] for r in rows)
+    by_level = Counter(r["level_id"].split(":")[1] if ":" in r["level_id"] else r["level_id"] for r in rows)
     by_end = Counter(r["end_reason"] for r in rows)
     valid = sum(1 for r in rows if r["is_valid_for_research"])
-    cross_counts = [r["cross_count"] for r in rows]
+    range_span_counts = [r["range_span_count"] for r in rows]
     bar_counts = [r["bar_count"] for r in rows]
     print(f"By level type:  {dict(by_level)}")
     print(f"End reasons:    {dict(by_end)}")
     print(f"Valid:          {valid}/{len(rows)}")
-    print(f"cross_count:    mean={sum(cross_counts)/len(cross_counts):.1f}  max={max(cross_counts)}")
+    print(f"range_span_count:    mean={sum(range_span_counts)/len(range_span_counts):.1f}  max={max(range_span_counts)}")
     print(f"bar_count:      mean={sum(bar_counts)/len(bar_counts):.1f}  max={max(bar_counts)}")
 
     # Policy hash
@@ -101,19 +101,19 @@ def _print_summary(ep: pa.Table, level_filter: str | None) -> None:
     # Per-date breakdown
     for date in dates:
         day_rows = [r for r in rows if r["session_date"] == date]
-        by_lt = Counter(r["level_id"].split(":")[0] for r in day_rows)
+        by_lt = Counter(r["level_id"].split(":")[1] if ":" in r["level_id"] else r["level_id"] for r in day_rows)
         invalid = sum(1 for r in day_rows if not r["is_valid_for_research"])
         print(f"\n  {date}  ({len(day_rows)} episodes  invalid={invalid})")
         for lt in ["vwap", "orh", "orl"]:
-            ep_lt = [r for r in day_rows if r["level_id"].startswith(lt)]
+            ep_lt = [r for r in day_rows if (r["level_id"].split(":")[1] if ":" in r["level_id"] else "") == lt]
             if not ep_lt:
                 continue
-            cc = [r["cross_count"] for r in ep_lt]
+            cc = [r["range_span_count"] for r in ep_lt]
             bc = [r["bar_count"] for r in ep_lt]
             ends = Counter(r["end_reason"] for r in ep_lt)
             print(
                 f"    {lt:4s}  episodes={len(ep_lt):3d}"
-                f"  cross_count avg={sum(cc)/len(cc):.1f} max={max(cc)}"
+                f"  range_span_count avg={sum(cc)/len(cc):.1f} max={max(cc)}"
                 f"  bars avg={sum(bc)/len(bc):.1f}"
                 f"  ends={dict(ends)}"
             )
@@ -121,7 +121,7 @@ def _print_summary(ep: pa.Table, level_filter: str | None) -> None:
     # Episode list
     print(f"\n{'idx':>4}  {'level':5}  {'cc':>3}  {'bars':>4}  {'flips':>5}  {'end_reason':12}  {'valid':5}  {'episode_id (prefix)'}")
     print("─" * 80)
-    rows_sorted = sorted(rows, key=lambda r: (r["session_date"], r["level_id"].split(":")[0], r["interaction_index"]))
+    rows_sorted = sorted(rows, key=lambda r: (r["session_date"], r["level_id"].split(":")[1] if ":" in r["level_id"] else r["level_id"], r["interaction_index"]))
     prev_date = None
     for r in rows_sorted:
         if r["session_date"] != prev_date:
@@ -129,11 +129,11 @@ def _print_summary(ep: pa.Table, level_filter: str | None) -> None:
                 print()
             print(f"  ── {r['session_date']} ──")
             prev_date = r["session_date"]
-        lt = r["level_id"].split(":")[0]
+        lt = r["level_id"].split(":")[1] if ":" in r["level_id"] else r["level_id"]
         eid = r["episode_id"][:16]
         valid_str = "✓" if r["is_valid_for_research"] else "✗"
         print(
-            f"  {r['interaction_index']:>4}  {lt:5}  {r['cross_count']:>3}  {r['bar_count']:>4}"
+            f"  {r['interaction_index']:>4}  {lt:5}  {r['range_span_count']:>3}  {r['bar_count']:>4}"
             f"  {r['close_side_flip_count']:>5}  {r['end_reason']:12}  {valid_str:5}  {eid}…"
         )
 
@@ -153,7 +153,7 @@ def _print_episode_bars(ep: pa.Table, bars: pa.Table, episode_prefix: str) -> No
     print(f"\nEpisode: {e['episode_id']}")
     print(f"  level_id={e['level_id']}")
     print(f"  session_date={e['session_date']}  interaction_index={e['interaction_index']}")
-    print(f"  cross_count={e['cross_count']}  bar_count={e['bar_count']}  end_reason={e['end_reason']}")
+    print(f"  range_span_count={e['range_span_count']}  bar_count={e['bar_count']}  end_reason={e['end_reason']}")
     print(f"  is_valid={e['is_valid_for_research']}  policy_hash={e['policy_config_hash']}")
     print(f"  close_side_flips={e['close_side_flip_count']}")
     print(f"  max_above_ticks={e['max_above_ticks']}  max_below_ticks={e['max_below_ticks']}")

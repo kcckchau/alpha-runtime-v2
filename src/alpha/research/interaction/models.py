@@ -7,7 +7,7 @@ from decimal import Decimal
 @dataclass(frozen=True)
 class LevelSnapshot:
     """Stable semantic identity for one market level at one bar."""
-    level_id: str          # "{level_type}:{symbol}:{session_id}" — stable across session
+    level_id: str          # "{symbol}:{level_type}:rth:{session_date}" — stable across session
     symbol: str
     session_id: str        # "{symbol}:{session_date_et}"
     level_type: str        # "vwap" | "orh" | "orl"
@@ -102,7 +102,7 @@ class EpisodeSummary:
     approach_side: str     # "from_above" | "from_below" | "unknown"
 
     bar_count: int
-    cross_count: int       # bars where range_spans_level is True
+    range_span_count: int  # bars where range_spans_level is True (NOT an ordered cross guarantee)
 
     # Intra-episode excursion only. NOT outcome labels.
     max_above_ticks: int   # max high_distance_ticks seen (positive = above level)
@@ -110,6 +110,7 @@ class EpisodeSummary:
 
     end_side: str | None   # close_side of the last bar
     end_reason: str        # "separation" | "timeout" | "session_ended" | "gap_detected"
+                           # | "replay_completed" | "engine_shutdown"
 
     # Derived from bar sequence at close time
     close_side_flip_count: int           # times close_side changed between consecutive bars
