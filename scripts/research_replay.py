@@ -54,8 +54,7 @@ from alpha.engines.flow.pipeline import BarPipeline
 from alpha.engines.market_state.engine import MarketStateEngine
 from alpha.engines.storage.engine import StorageEngine
 from alpha.instruments import resolve_symbol
-from alpha.models.enums import AssetClass, BarTimeframe
-from alpha.models.symbol import Symbol
+from alpha.models.enums import BarTimeframe
 from alpha.research.interaction.config import LevelDistanceConfig
 from alpha.research.interaction.engine import LevelInteractionEngine
 from alpha.research.level_observer import LevelObserver, RunMode
@@ -67,17 +66,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("research_replay")
 
-_FUTURES_TICKERS = frozenset({
-    "MNQ", "NQ", "ES", "MES", "RTY", "M2K", "YM", "MYM",
-})
 _UTC = timezone.utc
-
-
-def _infer_symbol(ticker: str) -> Symbol:
-    root = ticker.rstrip("0123456789").upper()
-    asset_class = AssetClass.FUTURE if root in _FUTURES_TICKERS else AssetClass.EQUITY
-    exchange = "CME" if asset_class == AssetClass.FUTURE else "NASDAQ"
-    return Symbol(ticker=ticker.upper(), exchange=exchange, asset_class=asset_class)
 
 
 async def _fetch_and_save(
@@ -129,7 +118,7 @@ async def _load_or_fetch(
 async def replay(symbol: str, target_date: date, warmup_days: int, fetch: bool) -> None:
     settings = get_settings()
 
-    sym_obj = _infer_symbol(symbol)
+    sym_obj = resolve_symbol(symbol)
     registry = SymbolRegistry()
     registry.register(sym_obj)
 
