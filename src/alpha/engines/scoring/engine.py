@@ -305,7 +305,7 @@ class ScoringEngine(BaseEngine):
 
         checks: dict[str, bool] = {
             "vwap_slope_down":     snap.vwap_slope_direction == "down",
-            "ema9_slope_down":     snap.ema_9_slope_direction == "down",
+            "ema9_slope_down":     snap.ema9_1m_slope_direction == "down",
             "ema20_slope_down":    snap.ema21_5m_slope_direction == "down",
             "recent_lower_low":    snap.recent_lower_low,
             "live_bias_bearish":   bearish_bias,

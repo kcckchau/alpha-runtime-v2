@@ -28,6 +28,11 @@ from alpha.core.clock import Clock
 from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
+from alpha.features.slope import (
+    SLOPE_FLAT_THRESHOLD_1M,
+    SLOPE_FLAT_THRESHOLD_5M,
+    classify_slope,
+)
 from alpha.models.enums import AssetClass, BarTimeframe, EventType, HealthStatus, SessionPhase
 from alpha.models.events import AnyEvent, BarBundleEvent, BarEvent, QuoteEvent
 from alpha.models.snapshot import BarSnapshot
@@ -113,9 +118,9 @@ class SymbolFeatureState:
         # ATR-30
         self.atr_30_buffer: Deque[Decimal] = deque(maxlen=30)
         self.atr_30: Decimal | None = None
-        # EMA9 slope acceleration
-        self.prev_ema_9_slope: float | None = None
-        self.ema_9_slope_accel: float | None = None
+        # EMA history for 3-bar ATR-normalized slope (norm3_v1)
+        self.ema9_1m_history: Deque[Decimal] = deque(maxlen=4)
+        self.ema21_1m_history: Deque[Decimal] = deque(maxlen=4)
         # RTH candle-range distribution (reset each RTH session)
         self.rth_ranges: list[Decimal] = []
         self.rth_median_1m_range: Decimal | None = None
@@ -169,8 +174,8 @@ class SymbolFeatureState:
         self.session_reject_high = None
         self.atr_30_buffer.clear()
         self.atr_30 = None
-        self.prev_ema_9_slope = None
-        self.ema_9_slope_accel = None
+        self.ema9_1m_history.clear()
+        self.ema21_1m_history.clear()
         self.rth_ranges = []
         self.rth_median_1m_range = None
         self.rth_p75_1m_range = None
@@ -211,6 +216,7 @@ class _HTFEMAState:
         track_ema20: bool = False,
         track_ema50: bool = False,
         track_sma200: bool = False,
+        track_atr30: bool = False,
     ) -> None:
         self.ema_9: Decimal | None = None
         self.ema_21: Decimal | None = None
@@ -234,6 +240,14 @@ class _HTFEMAState:
             deque(maxlen=200) if track_sma200 else None
         )
         self.sma_200: Decimal | None = None         # None until 200 bars seen
+        # ATR30 and norm3 slope state — populated when track_atr30=True (M5)
+        self._track_atr30 = track_atr30
+        self.prev_close: Decimal | None = None
+        self.atr30_buffer: deque[Decimal] = deque(maxlen=30)
+        self.atr30: Decimal | None = None
+        self.ema9_history: deque[Decimal] = deque(maxlen=4)
+        self.ema21_history: deque[Decimal] = deque(maxlen=4)
+        self.last_sealed_ts: datetime | None = None
 
 
 class FeatureEngine(BaseEngine):
@@ -268,6 +282,7 @@ class FeatureEngine(BaseEngine):
         self._h1_ema: dict[str, _HTFEMAState] = {}
         self._d1_ema: dict[str, _HTFEMAState] = {}
         self._pipeline_mode: bool = False  # set True by BarPipeline before engine.start()
+        self._pending_m5: dict[str, list[BarEvent]] = {}  # M5 bars buffered until process_bar flushes
 
     @property
     def name(self) -> str:
@@ -356,6 +371,10 @@ class FeatureEngine(BaseEngine):
         if bundle.timeframe != BarTimeframe.M1:
             return None
         bar = bundle.to_bar_event()
+        # Flush any buffered M5 bars first so HTF EMA reflects the sealed 5m bar
+        # that coincides with this M1 timestamp (deterministic M1/M5 ordering fix).
+        for m5_bar in self._pending_m5.pop(bar.symbol, []):
+            self._update_htf_ema(self._m5_ema, m5_bar, track_atr30=True)
         state = self._get_or_create(bar.symbol)
         self._update_state(state, bar)
         snapshot = self._build_snapshot(state, bar)
@@ -374,7 +393,12 @@ class FeatureEngine(BaseEngine):
             self._update_htf_ema(self._d1_ema, event, track_ema10=True, track_ema20=True)
             return
         if event.timeframe == BarTimeframe.M5:
-            self._update_htf_ema(self._m5_ema, event)
+            if self._pipeline_mode:
+                # Buffer until process_bar flushes — ensures M5 EMA is updated
+                # before the coincident M1 snapshot is built (ordering fix).
+                self._pending_m5.setdefault(event.symbol, []).append(event)
+                return
+            self._update_htf_ema(self._m5_ema, event, track_atr30=True)
             return
         if event.timeframe == BarTimeframe.H1:
             self._update_htf_ema(self._h1_ema, event, track_ema50=True, track_sma200=True)
@@ -612,6 +636,8 @@ class FeatureEngine(BaseEngine):
         state.ema_50 = self._ema(bar.close, state.ema_50, 50)
         state.prev_ema_9 = prev_ema_9
         state.prev_ema_20 = prev_ema_20
+        state.ema9_1m_history.append(state.ema_9)
+        state.ema21_1m_history.append(state.ema_21)
 
         if state.prev_close is not None:
             tr = max(
@@ -666,26 +692,33 @@ class FeatureEngine(BaseEngine):
             if state.latest_bid and state.latest_ask else None
         )
         spread_pct = float(spread / mid * 100) if spread and mid else None
-        m5 = self._m5_ema.get(bar.symbol)
         h1 = self._h1_ema.get(bar.symbol)
 
-        ema_9_slope: float | None = (
-            float((state.ema_9 - state.prev_ema_9) / state.prev_ema_9 * 100)
-            if state.ema_9 is not None and state.prev_ema_9 is not None and state.prev_ema_9 > _ZERO
-            else None
-        )
-        ema_9_slope_accel: float | None = None
-        if state.prev_ema_9_slope is not None and ema_9_slope is not None:
-            ema_9_slope_accel = ema_9_slope - state.prev_ema_9_slope
-        state.prev_ema_9_slope = ema_9_slope
-        state.ema_9_slope_accel = ema_9_slope_accel
+        # ── Norm3 slopes: (ema[t] - ema[t-3]) / (3 * atr30); units: ATR/bar ──
+        atr30_1m = state.atr_30
+        def _norm3_slope(history: "Deque[Decimal]", atr: "Decimal | None") -> "float | None":
+            if len(history) < 4 or atr is None or atr <= _ZERO:
+                return None
+            return float((history[-1] - history[0]) / (3 * atr))
+
+        ema9_1m_slope_norm_3 = _norm3_slope(state.ema9_1m_history, atr30_1m)
+        ema21_1m_slope_norm_3 = _norm3_slope(state.ema21_1m_history, atr30_1m)
+        ema9_1m_slope_direction = classify_slope(ema9_1m_slope_norm_3, SLOPE_FLAT_THRESHOLD_1M)
+        ema21_1m_slope_direction = classify_slope(ema21_1m_slope_norm_3, SLOPE_FLAT_THRESHOLD_1M)
+
         vwap_slope: float | None = (
             float((state.vwap - state.prev_vwap) / state.prev_vwap * 100)
             if state.prev_vwap is not None and state.prev_vwap > _ZERO
             else None
         )
-        ema_9_slope_direction = self._slope_direction(ema_9_slope, 0.005)
         vwap_slope_direction = self._slope_direction(vwap_slope, 0.002)
+
+        m5 = self._m5_ema.get(bar.symbol)
+        atr30_5m = m5.atr30 if m5 is not None else None
+        ema9_5m_slope_norm_3 = _norm3_slope(m5.ema9_history, atr30_5m) if m5 is not None else None
+        ema21_5m_slope_norm_3 = _norm3_slope(m5.ema21_history, atr30_5m) if m5 is not None else None
+        ema9_5m_slope_direction = classify_slope(ema9_5m_slope_norm_3, SLOPE_FLAT_THRESHOLD_5M)
+        ema21_5m_slope_direction = classify_slope(ema21_5m_slope_norm_3, SLOPE_FLAT_THRESHOLD_5M)
         recent_lower_low = state.bars_since_last_lower_low <= 10
 
         bar_range = bar.high - bar.low
@@ -742,10 +775,12 @@ class FeatureEngine(BaseEngine):
             ema_50=state.ema_50,
             ema9_5m=m5.ema_9 if m5 is not None else None,
             ema21_5m=m5.ema_21 if m5 is not None else None,
-            ema9_5m_slope=m5.ema_9_slope if m5 is not None else None,
-            ema9_5m_slope_direction=self._slope_direction(m5.ema_9_slope, 0.005) if m5 is not None else None,
-            ema21_5m_slope=m5.ema_21_slope if m5 is not None else None,
-            ema21_5m_slope_direction=self._slope_direction(m5.ema_21_slope, 0.005) if m5 is not None else None,
+            atr30_5m=m5.atr30 if m5 is not None else None,
+            ema9_5m_slope_norm_3=ema9_5m_slope_norm_3,
+            ema9_5m_slope_direction=ema9_5m_slope_direction,
+            ema21_5m_slope_norm_3=ema21_5m_slope_norm_3,
+            ema21_5m_slope_direction=ema21_5m_slope_direction,
+            htf_5m_watermark=m5.last_sealed_ts if m5 is not None else None,
             ema9_1h=h1.ema_9 if h1 is not None else None,
             ema21_1h=h1.ema_21 if h1 is not None else None,
             ema50_1h=h1.ema_50 if h1 is not None else None,
@@ -758,8 +793,10 @@ class FeatureEngine(BaseEngine):
             ema50_1h_slope_direction=self._slope_direction(h1.ema_50_slope, 0.005) if h1 is not None else None,
             ema10_1d=self._d1_ema[bar.symbol].ema_10 if bar.symbol in self._d1_ema else None,
             ema20_1d=self._d1_ema[bar.symbol].ema_20 if bar.symbol in self._d1_ema else None,
-            ema_9_slope=ema_9_slope,
-            ema_9_slope_direction=ema_9_slope_direction,
+            ema9_1m_slope_norm_3=ema9_1m_slope_norm_3,
+            ema9_1m_slope_direction=ema9_1m_slope_direction,
+            ema21_1m_slope_norm_3=ema21_1m_slope_norm_3,
+            ema21_1m_slope_direction=ema21_1m_slope_direction,
             vwap_slope=vwap_slope,
             vwap_slope_direction=vwap_slope_direction,
             atr_14=atr,
@@ -791,7 +828,6 @@ class FeatureEngine(BaseEngine):
             swept_below_vwap=swept_below,
             swept_or_low=swept_or_low,
             atr_30=state.atr_30,
-            ema_9_slope_accel=state.ema_9_slope_accel,
             rth_median_1m_range=state.rth_median_1m_range,
             rth_p75_1m_range=state.rth_p75_1m_range,
             rth_p90_1m_range=state.rth_p90_1m_range,
@@ -807,8 +843,9 @@ class FeatureEngine(BaseEngine):
         track_ema20: bool = False,
         track_ema50: bool = False,
         track_sma200: bool = False,
+        track_atr30: bool = False,
     ) -> None:
-        """Update EMA9/EMA21 (and optionally EMA10/EMA20/EMA50/SMA200) for a HTF bar."""
+        """Update EMA9/EMA21 (and optionally EMA10/EMA20/EMA50/SMA200/ATR30) for a HTF bar."""
         sym = bar.symbol
         if sym not in store:
             store[sym] = _HTFEMAState(
@@ -816,6 +853,7 @@ class FeatureEngine(BaseEngine):
                 track_ema20=track_ema20,
                 track_ema50=track_ema50,
                 track_sma200=track_sma200,
+                track_atr30=track_atr30,
             )
         s = store[sym]
         s.prev_ema_9 = s.ema_9
@@ -840,6 +878,21 @@ class FeatureEngine(BaseEngine):
         s.ema_10_slope = self._pct_slope(s.ema_10, s.prev_ema_10)
         s.ema_20_slope = self._pct_slope(s.ema_20, s.prev_ema_20)
         s.ema_50_slope = self._pct_slope(s.ema_50, s.prev_ema_50)
+        # Append to history deques for norm3 slope computation
+        s.ema9_history.append(s.ema_9)
+        s.ema21_history.append(s.ema_21)
+        s.last_sealed_ts = bar.timestamp
+        # ATR30 for this timeframe (used to normalize 5m slopes)
+        if s._track_atr30 and s.prev_close is not None:
+            tr = max(
+                bar.high - bar.low,
+                abs(bar.high - s.prev_close),
+                abs(bar.low - s.prev_close),
+            )
+            s.atr30_buffer.append(tr)
+            s.atr30 = sum(s.atr30_buffer) / len(s.atr30_buffer)
+        if s._track_atr30:
+            s.prev_close = bar.close
 
     @staticmethod
     def _ema(price: Decimal, prev: Decimal | None, period: int) -> Decimal:

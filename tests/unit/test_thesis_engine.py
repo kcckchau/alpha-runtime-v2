@@ -66,7 +66,7 @@ def _snap(
     vwap_cross_down: bool = False,
     swept_below_vwap: bool = False,
     close_position: float = 0.5,
-    ema_9_slope: float = 0.0,
+    ema9_1m_slope_norm_3: float = 0.0,
     is_lower_high: bool = False,
     is_lower_low: bool = False,
     is_higher_high: bool = False,
@@ -101,7 +101,7 @@ def _snap(
         vwap_cross_down=vwap_cross_down,
         swept_below_vwap=swept_below_vwap,
         bar_close_position_pct=close_position,
-        ema_9_slope=ema_9_slope,
+        ema9_1m_slope_norm_3=ema9_1m_slope_norm_3,
         is_lower_high=is_lower_high,
         is_lower_low=is_lower_low,
         is_higher_high=is_higher_high,
@@ -216,7 +216,7 @@ class TestFakeBreakdownReclaimLong:
             is_above_vwap=True,
             bars_above_vwap=1,
             close_position=0.72,
-            ema_9_slope=0.008,
+            ema9_1m_slope_norm_3=0.08,
         )
         level = _level(last_vwap_outcome="swept", bars_since=1)
         tick = _tick(sell_ratio=0.25, vol_accel=0.55)  # selling dried up
@@ -384,7 +384,7 @@ class TestVWAPFailedReclaimShort:
             is_above_vwap=False,
             bars_below_vwap=1,
             close_position=0.20,
-            ema_9_slope=-0.008,
+            ema9_1m_slope_norm_3=-0.08,
             is_lower_high=True,
         )
         level = _level(last_vwap_outcome="rejected", bars_since=1, current_side="below")

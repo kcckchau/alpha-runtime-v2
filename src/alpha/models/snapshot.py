@@ -43,18 +43,22 @@ class BarSnapshot(BaseModel):
     ema_9: Decimal | None = None
     ema_21: Decimal | None = None             # EMA21 (user's primary 1m fast EMA)
     ema_50: Decimal | None = None
-    ema_9_slope: float | None = None          # % rate-of-change of EMA9 vs prior bar (positive = rising)
-    ema_9_slope_direction: str | None = None  # "up" / "flat" / "down"  (flat = |slope| ≤ 0.005%)
+    ema9_1m_slope_norm_3: float | None = None   # (EMA9[t] - EMA9[t-3]) / (3 * atr30_1m); ATR/bar; None until 4 EMA values
+    ema9_1m_slope_direction: str | None = None  # "up" / "flat" / "down" (classify_slope, norm3_v1)
+    ema21_1m_slope_norm_3: float | None = None  # (EMA21[t] - EMA21[t-3]) / (3 * atr30_1m)
+    ema21_1m_slope_direction: str | None = None
     vwap_slope: float | None = None           # % rate-of-change of VWAP vs prior bar
     vwap_slope_direction: str | None = None   # "up" / "flat" / "down"  (flat = |slope| ≤ 0.002%)
 
     # ── Trend indicators — 5m (carry-forward: updated on each M5 bar) ────────
     ema9_5m: Decimal | None = None            # 5m EMA9
     ema21_5m: Decimal | None = None           # 5m EMA21
-    ema9_5m_slope: float | None = None        # % rate-of-change of 5m EMA9 vs prior 5m bar
+    atr30_5m: Decimal | None = None           # 5m ATR30; None until 2 completed 5m bars
+    ema9_5m_slope_norm_3: float | None = None   # (EMA9[t] - EMA9[t-3]) / (3 * atr30_5m); ATR/bar
     ema9_5m_slope_direction: str | None = None
-    ema21_5m_slope: float | None = None       # % rate-of-change of 5m EMA21 vs prior 5m bar
+    ema21_5m_slope_norm_3: float | None = None  # (EMA21[t] - EMA21[t-3]) / (3 * atr30_5m)
     ema21_5m_slope_direction: str | None = None
+    htf_5m_watermark: datetime | None = None  # sealed 5m bar timestamp reflected in this snapshot (PIT audit)
 
     # ── Trend indicators — 1h (carry-forward: updated on each H1 bar) ────────
     # SMA200 requires 200 H1 bars (~8.5 trading days); will be None until warm.
@@ -120,7 +124,6 @@ class BarSnapshot(BaseModel):
     # ── Additional volatility ─────────────────────────────────────────────────
     vwap_distance_atr: float | None = None   # (close - vwap) / atr_30; None until atr_30 warms
     atr_30: Decimal | None = None           # M1 30-period ATR
-    ema_9_slope_accel: float | None = None  # slope acceleration (d²EMA9/dt²)
 
     # ── RTH candle-range distribution (so far today, RTH bars only) ───────────
     rth_median_1m_range: Decimal | None = None  # median 1m bar range this RTH session

@@ -408,8 +408,8 @@ class ReplayResultSaver:
                 "is_new_lod": snap.is_new_lod,
                 "is_lower_high": snap.is_lower_high,
                 "bar_close_position_pct": round(snap.bar_close_position_pct, 3) if snap.bar_close_position_pct is not None else None,
-                "ema9_slope": round(snap.ema_9_slope, 6) if snap.ema_9_slope is not None else None,
-                "ema9_slope_direction": snap.ema_9_slope_direction,
+                "ema9_slope_norm3": round(snap.ema9_1m_slope_norm_3, 6) if snap.ema9_1m_slope_norm_3 is not None else None,
+                "ema9_slope_direction": snap.ema9_1m_slope_direction,
             }
 
         # ── thesis ────────────────────────────────────────────────────────────

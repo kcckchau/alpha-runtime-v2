@@ -180,9 +180,8 @@ async def test_vwap_rejection_requires_bearish_alignment() -> None:
             "vwap_deviation_pct": -0.12,
             "bar_close_position_pct": 0.2,
             "ema_9": Decimal("101"),
-            "ema_20": Decimal("102"),
-            "ema_9_slope": 0.03,
-            "ema_20_slope": -0.01,
+            "ema_21": Decimal("102"),
+            "ema9_1m_slope_norm_3": 0.06,
         }
     )
 

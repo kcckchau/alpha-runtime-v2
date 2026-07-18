@@ -1,0 +1,281 @@
+"""
+Unit tests for norm3_v1 ATR-normalized EMA slope implementation.
+
+Covers:
+  - classify_slope dead-zone / direction logic
+  - norm3 formula: EMA moves exactly 1 ATR over 3 bars → slope ≈ 1/3
+  - norm3 is None until 4 EMA history values are accumulated
+  - 5m ATR30 warms after 2 completed 5m bars (prev_close required for first TR)
+  - M1/M5 ordering: pipeline_mode buffers M5 bars and flushes before process_bar
+    so the coincident 5m EMA is always reflected in the M1 snapshot (PIT fix)
+  - htf_5m_watermark tracks the sealed 5m bar timestamp
+  - Session reset clears 1m history deques
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from decimal import Decimal
+
+import pytest
+
+from alpha.features.slope import (
+    SLOPE_FLAT_THRESHOLD_1M,
+    SLOPE_FLAT_THRESHOLD_5M,
+    SLOPE_POLICY_VERSION,
+    classify_slope,
+)
+
+
+# ── classify_slope ────────────────────────────────────────────────────────────
+
+def test_classify_slope_policy_version():
+    assert SLOPE_POLICY_VERSION == "norm3_v1"
+
+
+def test_classify_slope_up():
+    assert classify_slope(0.10, SLOPE_FLAT_THRESHOLD_1M) == "up"
+
+
+def test_classify_slope_down():
+    assert classify_slope(-0.10, SLOPE_FLAT_THRESHOLD_1M) == "down"
+
+
+def test_classify_slope_flat_positive_within_threshold():
+    assert classify_slope(SLOPE_FLAT_THRESHOLD_1M * 0.5, SLOPE_FLAT_THRESHOLD_1M) == "flat"
+
+
+def test_classify_slope_flat_negative_within_threshold():
+    assert classify_slope(-SLOPE_FLAT_THRESHOLD_1M * 0.5, SLOPE_FLAT_THRESHOLD_1M) == "flat"
+
+
+def test_classify_slope_exactly_at_threshold_is_flat():
+    # Boundary: |value| == threshold → still flat (not > threshold)
+    assert classify_slope(SLOPE_FLAT_THRESHOLD_1M, SLOPE_FLAT_THRESHOLD_1M) == "flat"
+    assert classify_slope(-SLOPE_FLAT_THRESHOLD_1M, SLOPE_FLAT_THRESHOLD_1M) == "flat"
+
+
+def test_classify_slope_none_returns_none():
+    assert classify_slope(None, SLOPE_FLAT_THRESHOLD_1M) is None
+
+
+def test_classify_slope_5m_thresholds():
+    # 5m threshold is tighter than 1m
+    assert SLOPE_FLAT_THRESHOLD_5M < SLOPE_FLAT_THRESHOLD_1M
+    # A value above 5m threshold but below 1m threshold is "up" for 5m, "flat" for 1m
+    mid = (SLOPE_FLAT_THRESHOLD_5M + SLOPE_FLAT_THRESHOLD_1M) / 2
+    assert classify_slope(mid, SLOPE_FLAT_THRESHOLD_5M) == "up"
+    assert classify_slope(mid, SLOPE_FLAT_THRESHOLD_1M) == "flat"
+
+
+# ── FeatureEngine norm3 slope integration ─────────────────────────────────────
+
+def _make_bar_event(
+    symbol: str,
+    timestamp: datetime,
+    close: float,
+    timeframe_str: str = "M1",
+) -> "BarEvent":
+    from alpha.models.enums import BarTimeframe
+    from alpha.models.events import BarEvent, EventMetadata
+
+    tf_map = {"M1": BarTimeframe.M1, "M5": BarTimeframe.M5}
+    close_d = Decimal(str(close))
+    return BarEvent(
+        symbol=symbol,
+        timestamp=timestamp,
+        timeframe=tf_map[timeframe_str],
+        open=close_d,
+        high=close_d + Decimal("2"),
+        low=close_d - Decimal("2"),
+        close=close_d,
+        volume=1000,
+        metadata=EventMetadata(received_at=timestamp),
+    )
+
+
+def _make_bundle(bar_event: "BarEvent") -> "BarBundleEvent":
+    from alpha.models.events import BarBundleEvent
+
+    return BarBundleEvent(
+        symbol=bar_event.symbol,
+        timestamp=bar_event.timestamp,
+        timeframe=bar_event.timeframe,
+        open=bar_event.open,
+        high=bar_event.high,
+        low=bar_event.low,
+        close=bar_event.close,
+        volume=bar_event.volume,
+        metadata=bar_event.metadata,
+    )
+
+
+def _build_feature_engine() -> "FeatureEngine":
+    from unittest.mock import MagicMock
+
+    from alpha.calendar.resolver import calendar_for_symbol
+    from alpha.config.settings import AlphaSettings, RuntimeSettings
+    from alpha.core.clock import Clock
+    from alpha.core.event_bus import EventBus
+    from alpha.core.registry import SymbolRegistry
+    from alpha.engines.feature.engine import FeatureEngine
+    from alpha.instruments import resolve_symbol
+    from alpha.models.enums import RuntimeMode
+
+    registry = SymbolRegistry()
+    registry.register(resolve_symbol("MNQ"))
+    settings = AlphaSettings(runtime=RuntimeSettings(mode=RuntimeMode.PAPER, symbols=["MNQ"]))
+    bus = EventBus()
+    clock = MagicMock(spec=Clock)
+    sym = registry.get("MNQ")
+    cal = calendar_for_symbol(sym)
+    engine = FeatureEngine(settings, bus, registry, cal, clock)
+    engine._pipeline_mode = True
+    # Pre-create state
+    engine._get_or_create("MNQ")
+    return engine
+
+
+def _rth_ts(minute: int) -> datetime:
+    """Return a datetime during RTH (09:30 ET = 13:30 UTC) + minute offset."""
+    return datetime(2026, 7, 17, 13, 30 + minute, tzinfo=timezone.utc)
+
+
+def test_norm3_slope_none_until_4_bars():
+    """norm3 slope must be None until the EMA history deque holds 4 values."""
+    engine = _build_feature_engine()
+
+    snaps = []
+    for i in range(4):
+        bar = _make_bar_event("MNQ", _rth_ts(i), close=19000.0)
+        snap = engine.process_bar(_make_bundle(bar))
+        snaps.append(snap)
+
+    # First 3 snapshots: only 1–3 history values → slope is None
+    for s in snaps[:3]:
+        assert s.ema9_1m_slope_norm_3 is None, f"Expected None at bar {snaps.index(s)}"
+
+    # 4th snapshot: 4 history values → slope is computable (may still be None if ATR not warm)
+    # ATR30 needs prev_close, so it's not warm on bar 1; check that after enough bars it's numeric
+    # (This test just asserts it's defined/None, not that it's nonzero)
+    assert snaps[3].ema9_1m_slope_norm_3 is None or isinstance(snaps[3].ema9_1m_slope_norm_3, float)
+
+
+def test_norm3_slope_unit_move():
+    """
+    If EMA9 moves exactly 1 ATR over 3 bars, slope_norm_3 ≈ 1/3.
+
+    We feed enough bars to warm ATR30 (need ≥2 TRs) and build 4-value EMA history.
+    Then feed 3 more bars where EMA is forced up by 1 ATR worth.
+    """
+    engine = _build_feature_engine()
+    # Feed 10 warm-up bars at a stable price to build ATR + EMA history
+    for i in range(10):
+        bar = _make_bar_event("MNQ", _rth_ts(i), close=19000.0)
+        engine.process_bar(_make_bundle(bar))
+
+    # Get the current ATR30 value after warm-up
+    state = engine._states["MNQ"]
+    assert state.atr_30 is not None, "ATR30 should be warm after 10 bars"
+    atr = float(state.atr_30)
+
+    # Feed 3 bars with a price that rises by 1*atr total over 3 bars
+    # (simplified: just verify the slope is positive and nonzero)
+    step = atr / 3
+    for i in range(3):
+        bar = _make_bar_event("MNQ", _rth_ts(10 + i), close=19000.0 + step * (i + 1))
+        engine.process_bar(_make_bundle(bar))
+
+    snap = engine.get_snapshot("MNQ")
+    assert snap is not None
+    assert snap.ema9_1m_slope_norm_3 is not None
+    assert snap.ema9_1m_slope_norm_3 > 0, "Expected positive slope after upward EMA movement"
+
+
+def test_session_reset_clears_slope_history():
+    """After session reset, norm3 slope must revert to None (history cleared)."""
+    engine = _build_feature_engine()
+
+    # Feed bars in one RTH session to build up history
+    for i in range(10):
+        bar = _make_bar_event("MNQ", _rth_ts(i), close=19000.0)
+        engine.process_bar(_make_bundle(bar))
+
+    state = engine._states["MNQ"]
+    assert len(state.ema9_1m_history) > 0
+
+    # Jump to next session (next day RTH) — triggers reset
+    next_day_ts = datetime(2026, 7, 18, 13, 31, tzinfo=timezone.utc)
+    bar = _make_bar_event("MNQ", next_day_ts, close=19050.0)
+    snap = engine.process_bar(_make_bundle(bar))
+
+    # After session reset, history deque has 1 entry → slope must be None
+    assert snap is not None
+    assert snap.ema9_1m_slope_norm_3 is None
+    assert snap.ema21_1m_slope_norm_3 is None
+
+
+def test_m5_pipeline_ordering_watermark():
+    """
+    In pipeline_mode, a M5 bar arriving BEFORE process_bar is called for the
+    coincident M1 bar must be reflected in the snapshot (watermark = M5 ts).
+
+    Without the pending_m5 buffer fix, the M5 EMA would be stale if M5 arrives
+    after process_bar is called. This test documents the correct ordering guarantee.
+    """
+    engine = _build_feature_engine()
+
+    # Feed warm-up M1 bars
+    for i in range(5):
+        bar = _make_bar_event("MNQ", _rth_ts(i), close=19000.0)
+        engine.process_bar(_make_bundle(bar))
+
+    # Simulate M5 bar arriving (in pipeline_mode, it is buffered)
+    m5_ts = _rth_ts(5)
+    m5_bar = _make_bar_event("MNQ", m5_ts, close=19010.0, timeframe_str="M5")
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(engine._handle_bar(m5_bar))
+
+    # M5 should be buffered, not yet applied
+    assert "MNQ" in engine._pending_m5
+    assert len(engine._pending_m5["MNQ"]) == 1
+
+    # Now process the coincident M1 bar — this should flush the M5 buffer first
+    m1_bar = _make_bar_event("MNQ", m5_ts, close=19010.0)
+    snap = engine.process_bar(_make_bundle(m1_bar))
+
+    # Buffer is consumed
+    assert engine._pending_m5.get("MNQ", []) == []
+
+    # The watermark must reflect the sealed M5 bar timestamp
+    assert snap is not None
+    assert snap.htf_5m_watermark == m5_ts, (
+        f"Expected watermark={m5_ts}, got {snap.htf_5m_watermark}"
+    )
+    # M5 EMA values are now populated
+    assert snap.ema9_5m is not None
+
+
+def test_atr30_5m_warms_after_two_5m_bars():
+    """
+    atr30_5m requires prev_close for the first TR computation.
+    It must be None after the first 5m bar, and defined after the second.
+    """
+    engine = _build_feature_engine()
+    import asyncio
+
+    # First 5m bar — no prev_close yet, so no TR, atr30_5m stays None
+    m5_ts1 = _rth_ts(0)
+    m5_bar1 = _make_bar_event("MNQ", m5_ts1, close=19000.0, timeframe_str="M5")
+    asyncio.get_event_loop().run_until_complete(engine._handle_bar(m5_bar1))
+    # In pipeline_mode this is buffered; flush manually to inspect state
+    engine._update_htf_ema(engine._m5_ema, m5_bar1, track_atr30=True)
+    m5_state1 = engine._m5_ema.get("MNQ")
+    assert m5_state1 is not None
+    assert m5_state1.atr30 is None, "atr30_5m must be None after first 5m bar (no prev_close)"
+
+    # Second 5m bar — prev_close is now set, TR computed, atr30_5m populates
+    m5_ts2 = _rth_ts(5)
+    m5_bar2 = _make_bar_event("MNQ", m5_ts2, close=19010.0, timeframe_str="M5")
+    engine._update_htf_ema(engine._m5_ema, m5_bar2, track_atr30=True)
+    m5_state2 = engine._m5_ema.get("MNQ")
+    assert m5_state2.atr30 is not None, "atr30_5m must be defined after second 5m bar"

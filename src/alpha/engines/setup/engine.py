@@ -569,7 +569,7 @@ class SetupEngine(BaseEngine):
         if snap.vwap_slope_direction == "up":
             return "vwap_slope_rising"
         # Guard: if EMA9 is actively rising AND price closed above it, V-reclaim is likely
-        if snap.ema_9_slope_direction == "up" and snap.ema_9 is not None and snap.bar.close >= snap.ema_9:
+        if snap.ema9_1m_slope_direction == "up" and snap.ema_9 is not None and snap.bar.close >= snap.ema_9:
             return "ema9_curling_up_close_above_ema9"
         return None
 
@@ -595,7 +595,7 @@ class SetupEngine(BaseEngine):
         if snap.ema_9 >= snap.ema_21:
             return "ema9_not_below_ema20"
         # EMA9 must not be rising — flat or down only
-        if snap.ema_9_slope_direction == "up":
+        if snap.ema9_1m_slope_direction == "up":
             return "ema9_slope_rising"
         # EMA21 must not be rising — trend must have real momentum, not just short-term dip
         if snap.ema21_5m_slope_direction == "up":
@@ -927,7 +927,7 @@ class SetupEngine(BaseEngine):
             return "close_not_below_ema9"
         if snap.ema_21 is not None and snap.bar.close >= snap.ema_21:
             return "close_not_below_ema20"
-        if snap.ema_9_slope is not None and snap.ema_9_slope >= 0:
+        if snap.ema9_1m_slope_norm_3 is not None and snap.ema9_1m_slope_norm_3 >= 0:
             return "ema9_slope_not_down"
         if snap.ema9_5m is not None and snap.ema21_5m is not None and snap.ema9_5m > snap.ema21_5m:
             return "five_min_stack_still_bullish"
