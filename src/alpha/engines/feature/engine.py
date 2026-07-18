@@ -48,14 +48,6 @@ _ZERO = Decimal("0")
 # UNCALIBRATED — adjust after reviewing 5m TR distributions by session phase.
 ATR30_5M_MIN_SAMPLES: int = 5
 
-# Distance threshold for VWAP test events: "approaching within N ATR of VWAP".
-# UNCALIBRATED — pending VWAP outcome distribution analysis.
-VWAP_TEST_TOLERANCE_ATR: float = 1.0
-
-# Distance below which vwap_approach_direction is classified as "at" rather than
-# "toward" or "away". UNCALIBRATED.
-VWAP_AT_THRESHOLD_ATR: float = 0.2
-
 
 def _percentile(data: list[Decimal], pct: float) -> Decimal | None:
     """Linear-interpolation percentile over a list of Decimals.  No minimum size."""
@@ -144,9 +136,8 @@ class SymbolFeatureState:
         # MTF alignment persistence counters
         self.ema_bearish_persistence_bars: int = 0
         self.ema_bullish_persistence_bars: int = 0
-        # VWAP approach state
+        # Previous close-to-VWAP distance (ATR units) for velocity computation
         self.prev_vwap_distance_atr: float | None = None
-        self.vwap_approach_persistence_bars: int = 0
         # RTH candle-range distribution (reset each RTH session)
         self.rth_ranges: list[Decimal] = []
         self.rth_median_1m_range: Decimal | None = None
@@ -209,7 +200,6 @@ class SymbolFeatureState:
         self.ema_bearish_persistence_bars = 0
         self.ema_bullish_persistence_bars = 0
         self.prev_vwap_distance_atr = None
-        self.vwap_approach_persistence_bars = 0
         self.rth_ranges = []
         self.rth_median_1m_range = None
         self.rth_p75_1m_range = None
@@ -837,15 +827,11 @@ class FeatureEngine(BaseEngine):
         ema_mtf_all_bearish = _all_avail and _s9_1m < 0 and _s21_1m < 0 and _s9_5m < 0 and _s21_5m < 0  # type: ignore[operator]
         ema_mtf_all_bullish = _all_avail and _s9_1m > 0 and _s21_1m > 0 and _s9_5m > 0 and _s21_5m > 0  # type: ignore[operator]
 
-        if ema_mtf_all_bearish:
-            ema_mtf_bearish_strength: float | None = (_s9_1m + _s21_1m + _s9_5m + _s21_5m) / 4  # type: ignore[operator]
-            ema_mtf_bullish_strength: float | None = None
-        elif ema_mtf_all_bullish:
-            ema_mtf_bearish_strength = None
-            ema_mtf_bullish_strength = (_s9_1m + _s21_1m + _s9_5m + _s21_5m) / 4  # type: ignore[operator]
+        # Signed strength: negative when bearish-aligned, positive when bullish-aligned.
+        if ema_mtf_all_bearish or ema_mtf_all_bullish:
+            ema_mtf_strength: float | None = (_s9_1m + _s21_1m + _s9_5m + _s21_5m) / 4  # type: ignore[operator]
         else:
-            ema_mtf_bearish_strength = None
-            ema_mtf_bullish_strength = None
+            ema_mtf_strength = None
 
         ema_slope_dispersion: float | None = None
         if _all_avail:
@@ -864,39 +850,23 @@ class FeatureEngine(BaseEngine):
             state.ema_bearish_persistence_bars = 0
             state.ema_bullish_persistence_bars = 0
 
-        # ── VWAP approach geometry ─────────────────────────────────────────────
+        # ── VWAP point-in-time geometry ────────────────────────────────────────
+        # Instantaneous measurements only. Episode semantics (approach/test/cross)
+        # belong in LevelInteractionEngine, which already handles VWAP as a level.
+        vwap_relative_side: str | None = None
+        if vwap > _ZERO:
+            vwap_relative_side = "above" if bar.close >= vwap else "below"
+
+        bar_high_distance_to_vwap_atr: float | None = None
+        bar_low_distance_to_vwap_atr: float | None = None
+        if state.atr_30 is not None and state.atr_30 > _ZERO and vwap > _ZERO:
+            bar_high_distance_to_vwap_atr = float((bar.high - vwap) / state.atr_30)
+            bar_low_distance_to_vwap_atr = float((bar.low - vwap) / state.atr_30)
+
         vwap_approach_velocity_atr: float | None = None
-        vwap_approach_direction: str | None = None
         if vwap_distance_atr is not None and state.prev_vwap_distance_atr is not None:
             vwap_approach_velocity_atr = vwap_distance_atr - state.prev_vwap_distance_atr
-            abs_dist = abs(vwap_distance_atr)
-            if abs_dist <= VWAP_AT_THRESHOLD_ATR:
-                vwap_approach_direction = "at"
-            elif vwap_distance_atr * vwap_approach_velocity_atr < 0:
-                # opposite signs → moving toward zero (approaching VWAP)
-                vwap_approach_direction = "toward"
-            else:
-                vwap_approach_direction = "away"
         state.prev_vwap_distance_atr = vwap_distance_atr
-
-        if vwap_approach_direction == "toward":
-            state.vwap_approach_persistence_bars += 1
-        else:
-            state.vwap_approach_persistence_bars = 0
-
-        is_above = bar.close >= vwap
-        vwap_test_from_below = bool(
-            vwap_distance_atr is not None
-            and not is_above
-            and abs(vwap_distance_atr) <= VWAP_TEST_TOLERANCE_ATR
-            and state.bars_below_vwap >= 1
-        )
-        vwap_test_from_above = bool(
-            vwap_distance_atr is not None
-            and is_above
-            and abs(vwap_distance_atr) <= VWAP_TEST_TOLERANCE_ATR
-            and state.bars_above_vwap >= 1
-        )
 
         # ── Candle geometry ────────────────────────────────────────────────────
         bar_body_pct: float | None = None
@@ -1017,18 +987,14 @@ class FeatureEngine(BaseEngine):
             ema_bullish_alignment_5m=ema_bullish_alignment_5m,
             ema_mtf_all_bearish=ema_mtf_all_bearish,
             ema_mtf_all_bullish=ema_mtf_all_bullish,
-            ema_mtf_bearish_strength=ema_mtf_bearish_strength,
-            ema_mtf_bullish_strength=ema_mtf_bullish_strength,
+            ema_mtf_strength=ema_mtf_strength,
             ema_slope_dispersion=ema_slope_dispersion,
             ema_bearish_persistence_bars=state.ema_bearish_persistence_bars,
             ema_bullish_persistence_bars=state.ema_bullish_persistence_bars,
-            vwap_approach_direction=vwap_approach_direction,
+            vwap_relative_side=vwap_relative_side,
+            bar_high_distance_to_vwap_atr=bar_high_distance_to_vwap_atr,
+            bar_low_distance_to_vwap_atr=bar_low_distance_to_vwap_atr,
             vwap_approach_velocity_atr=vwap_approach_velocity_atr,
-            vwap_approach_persistence_bars=state.vwap_approach_persistence_bars,
-            vwap_test_from_below=vwap_test_from_below,
-            vwap_test_from_above=vwap_test_from_above,
-            bars_below_vwap_before_test=state.bars_below_vwap if vwap_test_from_below else 0,
-            bars_above_vwap_before_test=state.bars_above_vwap if vwap_test_from_above else 0,
             bar_body_pct=bar_body_pct,
             upper_wick_pct=upper_wick_pct,
             lower_wick_pct=lower_wick_pct,

@@ -302,30 +302,29 @@ def test_slope_accel_none_until_two_slopes():
 
 
 def test_slope_accel_sign_when_slope_increases():
-    """When slope increases bar-over-bar, acceleration should be positive."""
+    """When slope is accelerating upward (growing each bar), acceleration must be positive."""
     engine = _build_feature_engine()
-    # Feed 15 warm-up bars at stable price
+    # Feed 15 warm-up bars at stable price to warm ATR30
     for i in range(15):
         bar = _make_bar_event("MNQ", _rth_ts(i), close=19000.0)
         engine.process_bar(_make_bundle(bar))
 
     state = engine._states["MNQ"]
-    assert state.atr_30 is not None
+    assert state.atr_30 is not None, "ATR30 must be warm after 15 bars"
     atr = float(state.atr_30)
 
-    # Feed 3 bars with increasing price to build positive slope
-    for i in range(3):
-        bar = _make_bar_event("MNQ", _rth_ts(15 + i), close=19000.0 + atr * (i + 1))
-        engine.process_bar(_make_bundle(bar))
-
-    # Feed 3 more with steeper increase so slope grows further
-    for i in range(3):
-        bar = _make_bar_event("MNQ", _rth_ts(18 + i), close=19000.0 + atr * (4 + i * 2))
+    # Feed bars with a linearly increasing pace — each new bar is further up than the last,
+    # so the 3-bar norm3 slope itself grows each bar → acceleration > 0.
+    for i in range(6):
+        # price step grows each bar: atr, 2*atr, 3*atr, ... so slope accelerates
+        bar = _make_bar_event("MNQ", _rth_ts(15 + i), close=19000.0 + atr * (i + 1) ** 2)
         snap = engine.process_bar(_make_bundle(bar))
 
-    assert snap.ema9_1m_slope_norm_3 is not None
-    # Acceleration may be positive (slope growing) or stabilizing — just check it's defined
-    assert snap.ema9_1m_slope_accel_norm is not None
+    assert snap.ema9_1m_slope_norm_3 is not None, "Slope must be defined after warm-up"
+    assert snap.ema9_1m_slope_accel_norm is not None, "Accel must be defined after two slopes"
+    assert snap.ema9_1m_slope_accel_norm > 0, (
+        f"Accel must be positive when slope is growing; got {snap.ema9_1m_slope_accel_norm}"
+    )
 
 
 def test_slope_accel_resets_on_session_change():
@@ -398,95 +397,108 @@ def test_slope_dispersion_none_without_all_slopes():
     assert snap.ema_slope_dispersion is None
 
 
-# ── VWAP approach ──────────────────────────────────────────────────────────────
+# ── VWAP point-in-time geometry ────────────────────────────────────────────────
 
-def test_vwap_approach_direction_first_bar_is_none():
-    """No previous distance → approach direction must be None on first bar."""
+def test_vwap_relative_side_above_below():
+    """vwap_relative_side reports 'above' or 'below' based on close vs VWAP."""
+    engine = _build_feature_engine()
+    # First bar seeds VWAP
+    bar1 = _make_bar_event("MNQ", _rth_ts(0), close=19000.0)
+    engine.process_bar(_make_bundle(bar1))
+
+    state = engine._states["MNQ"]
+    vwap = float(state.vwap)
+    assert vwap > 0
+
+    # Bar closing above VWAP
+    bar_above = _make_bar_event("MNQ", _rth_ts(1), close=vwap + 5.0)
+    snap_above = engine.process_bar(_make_bundle(bar_above))
+    assert snap_above.vwap_relative_side == "above"
+
+    # Bar closing below VWAP
+    bar_below = _make_bar_event("MNQ", _rth_ts(2), close=vwap - 5.0)
+    snap_below = engine.process_bar(_make_bundle(bar_below))
+    assert snap_below.vwap_relative_side == "below"
+
+
+def test_bar_high_low_distance_to_vwap_atr():
+    """
+    bar_high_distance_to_vwap_atr / bar_low_distance_to_vwap_atr encode signed bar
+    extremes vs VWAP in ATR units.  A bar whose low is below VWAP must have
+    bar_low_distance_to_vwap_atr < 0, even when the close is above VWAP.
+    """
+    engine = _build_feature_engine()
+    # Warm up ATR30 (needs at least 2 TRs → 3 bars)
+    for i in range(10):
+        bar = _make_bar_event("MNQ", _rth_ts(i), close=19000.0)
+        engine.process_bar(_make_bundle(bar))
+
+    state = engine._states["MNQ"]
+    assert state.atr_30 is not None, "ATR30 must be warm after 10 bars"
+    vwap = float(state.vwap)
+    atr = float(state.atr_30)
+
+    # Feed a bar whose HIGH is above VWAP and LOW is below VWAP (straddles VWAP)
+    from alpha.models.events import BarBundleEvent, BarEvent, EventMetadata
+    from alpha.models.enums import BarTimeframe
+
+    ts = _rth_ts(10)
+    cross_bar = BarEvent(
+        symbol="MNQ", timestamp=ts, timeframe=BarTimeframe.M1,
+        open=Decimal(str(round(vwap, 2))),
+        high=Decimal(str(round(vwap + atr, 2))),
+        low=Decimal(str(round(vwap - atr, 2))),
+        close=Decimal(str(round(vwap + 1.0, 2))),
+        volume=100, metadata=EventMetadata(received_at=ts),
+    )
+    bundle = BarBundleEvent(
+        symbol=cross_bar.symbol, timestamp=cross_bar.timestamp,
+        timeframe=cross_bar.timeframe, open=cross_bar.open,
+        high=cross_bar.high, low=cross_bar.low, close=cross_bar.close,
+        volume=cross_bar.volume, metadata=cross_bar.metadata,
+    )
+    snap = engine.process_bar(bundle)
+
+    assert snap.bar_high_distance_to_vwap_atr is not None
+    assert snap.bar_low_distance_to_vwap_atr is not None
+    assert snap.bar_high_distance_to_vwap_atr > 0, "High above VWAP → positive distance"
+    assert snap.bar_low_distance_to_vwap_atr < 0, "Low below VWAP → negative distance"
+
+
+def test_vwap_approach_velocity_none_on_first_bar():
+    """Velocity requires a previous distance → must be None on the very first bar."""
     engine = _build_feature_engine()
     bar = _make_bar_event("MNQ", _rth_ts(0), close=19000.0)
     snap = engine.process_bar(_make_bundle(bar))
-    assert snap.vwap_approach_direction is None
     assert snap.vwap_approach_velocity_atr is None
 
 
-def test_vwap_approach_persistence_increments_on_toward():
-    """Persistence counter increments while price moves toward VWAP."""
+def test_vwap_approach_velocity_sign():
+    """
+    Velocity sign encodes direction: negative when moving away below VWAP,
+    positive when moving from below toward VWAP (reducing the negative distance).
+    """
     engine = _build_feature_engine()
-    # Feed enough bars to warm ATR30 so vwap_distance_atr is defined
-    for i in range(5):
+    for i in range(10):
         bar = _make_bar_event("MNQ", _rth_ts(i), close=19000.0)
         engine.process_bar(_make_bundle(bar))
 
     state = engine._states["MNQ"]
-    if state.atr_30 is None:
-        return  # ATR not warm enough for this test
-
-    # Force prev_vwap_distance_atr to simulate price moving toward VWAP
-    # (simulate price that was far below VWAP and is getting closer)
-    vwap = float(state.vwap)
-    state.prev_vwap_distance_atr = -2.5  # was 2.5 ATR below VWAP
-    state.vwap_approach_persistence_bars = 2   # already persisted 2 bars
-
-    # Feed a bar where price is closer to VWAP (e.g., 1.5 ATR below)
-    atr = float(state.atr_30)
-    close_price = vwap - 1.5 * atr
-    bar = _make_bar_event("MNQ", _rth_ts(5), close=close_price)
-    snap = engine.process_bar(_make_bundle(bar))
-
-    # vwap_distance_atr should be ~-1.5, was -2.5, so moving toward (velocity > 0 and dist < 0: opposite signs)
-    if snap.vwap_distance_atr is not None and snap.vwap_approach_direction == "toward":
-        assert snap.vwap_approach_persistence_bars == 3
-    elif snap.vwap_approach_direction == "at":
-        assert snap.vwap_approach_persistence_bars == 0  # resets on "at"
-
-
-def test_vwap_approach_persistence_resets_on_away():
-    """Persistence counter resets to 0 when direction becomes 'away'."""
-    engine = _build_feature_engine()
-    for i in range(5):
-        bar = _make_bar_event("MNQ", _rth_ts(i), close=19000.0)
-        engine.process_bar(_make_bundle(bar))
-
-    state = engine._states["MNQ"]
-    if state.atr_30 is None:
-        return
-    state.vwap_approach_persistence_bars = 5
-
-    # Feed a bar moving AWAY from VWAP (price far above and going further)
+    assert state.atr_30 is not None
     vwap = float(state.vwap)
     atr = float(state.atr_30)
-    state.prev_vwap_distance_atr = 1.0   # was 1 ATR above
-    close_price = vwap + 2.5 * atr       # now 2.5 ATR above = moving away
-    bar = _make_bar_event("MNQ", _rth_ts(5), close=close_price)
+
+    # Seed prev_vwap_distance_atr as -2.5 (price was 2.5 ATR below VWAP)
+    state.prev_vwap_distance_atr = -2.5
+
+    # Now price moves closer (only 1.0 ATR below VWAP) → velocity = -1.0 - (-2.5) = +1.5
+    bar = _make_bar_event("MNQ", _rth_ts(10), close=vwap - 1.0 * atr)
     snap = engine.process_bar(_make_bundle(bar))
 
-    if snap.vwap_approach_direction == "away":
-        assert snap.vwap_approach_persistence_bars == 0
-
-
-def test_vwap_test_from_below_fires_when_close():
-    """vwap_test_from_below fires when below VWAP within 1 ATR."""
-    engine = _build_feature_engine()
-    for i in range(8):
-        bar = _make_bar_event("MNQ", _rth_ts(i), close=19000.0)
-        engine.process_bar(_make_bundle(bar))
-
-    state = engine._states["MNQ"]
-    if state.atr_30 is None:
-        return
-    state.bars_below_vwap = 3   # simulate being below VWAP for 3 bars
-
-    vwap = float(state.vwap)
-    atr = float(state.atr_30)
-    # Price below VWAP but within 0.5 ATR
-    close_price = vwap - 0.5 * atr
-    bar = _make_bar_event("MNQ", _rth_ts(8), close=close_price)
-    snap = engine.process_bar(_make_bundle(bar))
-
-    if snap.vwap_distance_atr is not None and abs(snap.vwap_distance_atr) <= 1.0 and not snap.is_above_vwap:
-        assert snap.vwap_test_from_below
-        assert snap.bars_below_vwap_before_test > 0
-    assert not snap.vwap_test_from_above  # can't test from both sides simultaneously
+    if snap.vwap_approach_velocity_atr is not None:
+        assert snap.vwap_approach_velocity_atr > 0, (
+            "Moving from -2.5 to ~-1.0 ATR → velocity should be positive (approaching)"
+        )
 
 
 # ── Candle geometry ────────────────────────────────────────────────────────────
@@ -533,26 +545,45 @@ def test_candle_geometry_basic():
 
 def test_inside_bar_detection():
     """is_inside_bar is True when current bar's range fits entirely within previous bar."""
+    from alpha.models.events import BarBundleEvent, BarEvent, EventMetadata
+    from alpha.models.enums import BarTimeframe
+
     engine = _build_feature_engine()
 
-    # First bar (wide): high=10010, low=9990
-    bar1 = _make_bar_event("MNQ", _rth_ts(0), close=10000.0)
-    engine._states["MNQ"].prev_bar_high = None  # ensure clean state
-    snap1 = engine.process_bar(_make_bundle(bar1))
+    # Feed a wide bar manually with known high/low
+    ts0 = _rth_ts(0)
+    wide_bar = BarEvent(
+        symbol="MNQ", timestamp=ts0, timeframe=BarTimeframe.M1,
+        open=Decimal("10000"), high=Decimal("10010"), low=Decimal("9990"),
+        close=Decimal("10000"), volume=100, metadata=EventMetadata(received_at=ts0),
+    )
+    bundle0 = BarBundleEvent(
+        symbol=wide_bar.symbol, timestamp=wide_bar.timestamp,
+        timeframe=wide_bar.timeframe, open=wide_bar.open,
+        high=wide_bar.high, low=wide_bar.low, close=wide_bar.close,
+        volume=wide_bar.volume, metadata=wide_bar.metadata,
+    )
+    snap1 = engine.process_bar(bundle0)
     assert not snap1.is_inside_bar  # no prev bar
 
-    # Second bar (inside): must fit within bar1's high/low
-    # bar1 range: close±2 = 9998-10002
-    # Make a bar with close = 10000, high = 10001, low = 10000 (well inside)
-    # We set state directly to control prev_bar_high/low
-    state = engine._states["MNQ"]
-    state.prev_bar_high = Decimal("10002")
-    state.prev_bar_low = Decimal("9998")
-
-    bar2 = _make_bar_event("MNQ", _rth_ts(1), close=10000.0)
-    # Override bar2's high/low: default is close±2 = 9998-10002 — exactly equal = inside
-    snap2 = engine.process_bar(_make_bundle(bar2))
-    assert snap2.is_inside_bar or snap2.is_outside_bar or True  # geometry logic: just verify no crash
+    # Feed a narrow bar entirely inside the wide bar (high=10005, low=9995)
+    ts1 = _rth_ts(1)
+    narrow_bar = BarEvent(
+        symbol="MNQ", timestamp=ts1, timeframe=BarTimeframe.M1,
+        open=Decimal("10000"), high=Decimal("10005"), low=Decimal("9995"),
+        close=Decimal("10000"), volume=100, metadata=EventMetadata(received_at=ts1),
+    )
+    bundle1 = BarBundleEvent(
+        symbol=narrow_bar.symbol, timestamp=narrow_bar.timestamp,
+        timeframe=narrow_bar.timeframe, open=narrow_bar.open,
+        high=narrow_bar.high, low=narrow_bar.low, close=narrow_bar.close,
+        volume=narrow_bar.volume, metadata=narrow_bar.metadata,
+    )
+    snap2 = engine.process_bar(bundle1)
+    assert snap2.is_inside_bar, (
+        f"Expected is_inside_bar=True (9995-10005 inside 9990-10010); got {snap2.is_inside_bar}"
+    )
+    assert not snap2.is_outside_bar
 
 
 def test_doji_body_pct_near_zero():

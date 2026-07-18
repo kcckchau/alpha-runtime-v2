@@ -135,19 +135,22 @@ class BarSnapshot(BaseModel):
     ema21_5m_slope_accel_norm: float | None = None
 
     # ── EMA multi-timeframe alignment ─────────────────────────────────────────
-    # Based on raw slope sign (< 0 / > 0), not the classified direction.
+    # Raw sign primitive (< 0 / > 0), NOT the calibrated direction from classify_slope.
+    # A tiny negative slope triggers bearish_alignment — does NOT imply meaningful
+    # directional conviction. Use ema_mtf_strength + ema_slope_dispersion for that.
     # None-safe: flags are False when any required slope is None.
-    ema_bearish_alignment_1m: bool = False   # ema9_1m < 0 and ema21_1m < 0
-    ema_bearish_alignment_5m: bool = False   # ema9_5m < 0 and ema21_5m < 0
+    ema_bearish_alignment_1m: bool = False   # ema9_1m_slope < 0 and ema21_1m_slope < 0
+    ema_bearish_alignment_5m: bool = False   # ema9_5m_slope < 0 and ema21_5m_slope < 0
     ema_bullish_alignment_1m: bool = False
     ema_bullish_alignment_5m: bool = False
     ema_mtf_all_bearish: bool = False        # all 4 norm3 slopes negative
     ema_mtf_all_bullish: bool = False        # all 4 norm3 slopes positive
 
     # ── EMA MTF directional strength ──────────────────────────────────────────
-    # Mean of all 4 slopes when fully aligned; None when not all same sign or any is None.
-    ema_mtf_bearish_strength: float | None = None   # negative mean (more negative = stronger)
-    ema_mtf_bullish_strength: float | None = None   # positive mean
+    # Signed mean of all 4 norm3 slopes when fully aligned (ema_mtf_all_bearish/bullish).
+    # Negative = bearish alignment, positive = bullish alignment.
+    # None when not fully aligned or any slope is None.
+    ema_mtf_strength: float | None = None
 
     # ── EMA slope dispersion ──────────────────────────────────────────────────
     # Population std dev of the 4 norm3 slopes; None if any is None.
@@ -159,19 +162,13 @@ class BarSnapshot(BaseModel):
     ema_bearish_persistence_bars: int = 0
     ema_bullish_persistence_bars: int = 0
 
-    # ── VWAP approach geometry ────────────────────────────────────────────────
-    # Based on change in vwap_distance_atr (signed ATR distance) bar-over-bar.
-    vwap_approach_direction: str | None = None      # "toward" | "away" | "at" | None (first bar)
-    vwap_approach_velocity_atr: float | None = None # vwap_dist_atr[t] - vwap_dist_atr[t-1]; ATR/bar
-    vwap_approach_persistence_bars: int = 0         # consecutive "toward" bars
-
-    # ── VWAP test events ──────────────────────────────────────────────────────
-    # Fires when price approaches VWAP from one side (within VWAP_TEST_TOLERANCE_ATR).
-    # UNCALIBRATED tolerance; see ATR constant in feature engine.
-    vwap_test_from_below: bool = False              # below VWAP, within tolerance, bars_below >= 1
-    vwap_test_from_above: bool = False              # above VWAP, within tolerance, bars_above >= 1
-    bars_below_vwap_before_test: int = 0            # bars_below_vwap at time of vwap_test_from_below
-    bars_above_vwap_before_test: int = 0            # bars_above_vwap at time of vwap_test_from_above
+    # ── VWAP point-in-time geometry ───────────────────────────────────────────
+    # Instantaneous bar measurements — no episode state machine here.
+    # Approach/test/cross episode semantics belong in LevelInteractionEngine.
+    vwap_relative_side: str | None = None               # "above" | "below" | None (vwap not yet warm)
+    bar_high_distance_to_vwap_atr: float | None = None  # (high - vwap) / atr_30; positive = bar top above VWAP
+    bar_low_distance_to_vwap_atr: float | None = None   # (low - vwap) / atr_30; negative = bar bottom below VWAP
+    vwap_approach_velocity_atr: float | None = None     # vwap_dist_atr[t] - vwap_dist_atr[t-1]; ATR/bar; None first bar
 
     # ── Candle geometry ───────────────────────────────────────────────────────
     bar_body_pct: float | None = None               # |close - open| / (high - low); 0 = doji, 1 = no wicks
