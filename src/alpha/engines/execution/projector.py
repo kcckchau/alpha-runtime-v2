@@ -118,8 +118,8 @@ class MarketStateProjector:
             bars_since_vwap_cross=0,   # not tracked per-event in V1
             ema9=bar_snap.ema_9 if bar_snap else None,
             ema21=bar_snap.ema_21 if bar_snap else None,
-            opening_range_high=bar_snap.orb_high if bar_snap else None,
-            opening_range_low=bar_snap.orb_low if bar_snap else None,
+            opening_range_high=bar_snap.or_high if bar_snap else None,
+            opening_range_low=bar_snap.or_low if bar_snap else None,
             rvol=bar_snap.relative_volume if bar_snap else None,
             signal_freshness_ms=0,
             data_quality=DataQualityState.CLEAN,

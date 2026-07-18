@@ -41,7 +41,6 @@ from alpha.models.enums import (
     EventType,
     HealthStatus,
     LiveBias,
-    ORBState,
     TrendState,
     VWAPState,
 )
@@ -189,7 +188,7 @@ class MarketStateEngine(BaseEngine):
             trend_strength=min(1.0, abs(snap.vwap_deviation_pct) / 5.0),
             trend_bars=trend_bars,
             vwap_state=vwap_state,
-            orb_state=snap.orb_state,
+            or_position=snap.or_position,
             session_phase=snap.session_phase,
             is_extended=snap.is_extended,
             structure_score=structure_score,
@@ -222,30 +221,26 @@ class MarketStateEngine(BaseEngine):
         if symbol in self._day_types:
             return self._day_types[symbol]
 
-        # Gate: need ORB established and enough RTH bars
-        if snap.orb_state == ORBState.NOT_SET or snap.bars_since_open < _DAY_TYPE_MIN_BARS:
+        # Gate: need OR established and enough RTH bars
+        if not snap.or_established or snap.bars_since_open < _DAY_TYPE_MIN_BARS:
             return DayType.UNKNOWN
 
-        # Determine candidate using ORB direction, VWAP alignment, and trend
+        # Determine candidate using OR direction, VWAP alignment, and trend
         above_vwap = vwap_state in {VWAPState.ABOVE, VWAPState.RECLAIMING}
         below_vwap = vwap_state in {VWAPState.BELOW, VWAPState.REJECTING}
 
-        if snap.orb_state == ORBState.BREAKOUT_UP:
+        if snap.or_position == "ABOVE":
             if above_vwap and trend == TrendState.TRENDING_UP:
                 candidate = DayType.TREND_UP
             else:
-                # ORB broke up but VWAP or trend not yet aligned — inconclusive
+                # OR broke up but VWAP or trend not yet aligned — inconclusive
                 candidate = DayType.BALANCED
-        elif snap.orb_state == ORBState.BREAKOUT_DOWN:
+        elif snap.or_position == "BELOW":
             if below_vwap and trend == TrendState.TRENDING_DOWN:
                 candidate = DayType.TREND_DOWN
             else:
                 candidate = DayType.BALANCED
-        elif snap.orb_state in {
-            ORBState.INSIDE,
-            ORBState.FAILED_BREAKOUT_UP,
-            ORBState.FAILED_BREAKOUT_DOWN,
-        }:
+        elif snap.or_established and snap.or_position == "INSIDE":
             candidate = DayType.RANGE
         else:
             candidate = DayType.BALANCED
@@ -262,7 +257,7 @@ class MarketStateEngine(BaseEngine):
             self._day_type_candidates.pop(symbol, None)
             logger.info(
                 "Day type locked: %s → %s (orb=%s trend=%s vwap=%s bars=%d)",
-                symbol, day_type, snap.orb_state, trend, vwap_state, snap.bars_since_open,
+                symbol, day_type, snap.or_position, trend, vwap_state, snap.bars_since_open,
             )
             return day_type
 
@@ -272,11 +267,11 @@ class MarketStateEngine(BaseEngine):
 
     @staticmethod
     def _classify_trend(snap: BarSnapshot) -> TrendState:
-        if snap.ema_9 is None or snap.ema_20 is None:
+        if snap.ema_9 is None or snap.ema_21 is None:
             return TrendState.UNKNOWN
-        if snap.ema_9 > snap.ema_20 and snap.bar.close > snap.ema_9:
+        if snap.ema_9 > snap.ema_21 and snap.bar.close > snap.ema_9:
             return TrendState.TRENDING_UP
-        if snap.ema_9 < snap.ema_20 and snap.bar.close < snap.ema_9:
+        if snap.ema_9 < snap.ema_21 and snap.bar.close < snap.ema_9:
             return TrendState.TRENDING_DOWN
         return TrendState.CHOPPY
 
@@ -382,7 +377,7 @@ class MarketStateEngine(BaseEngine):
             score = 0.0
             if trend == TrendState.CHOPPY:
                 score += 0.40
-            if snap.orb_state == ORBState.INSIDE:
+            if snap.or_established and snap.or_position == "INSIDE":
                 score += 0.35
             # Tight VWAP deviation suggests range-bound
             score += 0.25 * max(0.0, 1.0 - abs(snap.vwap_deviation_pct) / 3.0)

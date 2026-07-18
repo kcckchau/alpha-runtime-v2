@@ -78,15 +78,15 @@ def _bar(
 def _mock_feat_snap(
     vwap: float = 20000.0,
     ema21_5m: float | None = None,
-    orb_high: float | None = None,
-    orb_low: float | None = None,
+    or_high: float | None = None,
+    or_low: float | None = None,
     or_mid: float | None = None,
 ) -> MagicMock:
     snap = MagicMock(spec=BarSnapshot)
     snap.vwap = Decimal(str(vwap))
     snap.ema21_5m = Decimal(str(ema21_5m)) if ema21_5m is not None else None
-    snap.orb_high = Decimal(str(orb_high)) if orb_high is not None else None
-    snap.orb_low = Decimal(str(orb_low)) if orb_low is not None else None
+    snap.or_high = Decimal(str(or_high)) if or_high is not None else None
+    snap.or_low = Decimal(str(or_low)) if or_low is not None else None
     snap.or_mid = Decimal(str(or_mid)) if or_mid is not None else None
     return snap
 
@@ -401,7 +401,7 @@ def test_nearest_war_zone_none_when_no_levels():
 
 def test_signed_distances_price_above_all_levels():
     """All dist_to_* values are positive when price is above every level."""
-    feat = _mock_feat_snap(vwap=19800, ema21_5m=19750, orb_high=19850, orb_low=19700)
+    feat = _mock_feat_snap(vwap=19800, ema21_5m=19750, or_high=19850, or_low=19700)
     engine = _make_engine(feat_snap=feat)
 
     state = engine._states[SYM]
@@ -431,7 +431,7 @@ def test_signed_distances_price_above_all_levels():
 
 def test_signed_distances_price_below_all_levels():
     """All dist_to_* values are negative when price is below every level."""
-    feat = _mock_feat_snap(vwap=20200, ema21_5m=20250, orb_high=20300, orb_low=20150)
+    feat = _mock_feat_snap(vwap=20200, ema21_5m=20250, or_high=20300, or_low=20150)
     engine = _make_engine(feat_snap=feat)
 
     state = engine._states[SYM]

@@ -11,7 +11,7 @@ from alpha.core.registry import SymbolRegistry
 from alpha.engines.setup.engine import SetupEngine
 from alpha.instruments import resolve_symbol
 from alpha.models.bar import Bar
-from alpha.models.enums import AssetClass, BarTimeframe, EventType, ORBState, RuntimeMode, SessionPhase, SetupState, SetupType
+from alpha.models.enums import AssetClass, BarTimeframe, EventType, RuntimeMode, SessionPhase, SetupState, SetupType
 from alpha.models.events import BarEvent, EventMetadata
 from alpha.models.market_state import MarketState
 from alpha.models.setup import Setup
@@ -35,7 +35,7 @@ def _snapshot(timestamp: datetime) -> BarSnapshot:
         timeframe=BarTimeframe.M1,
         bar=bar,
         vwap=Decimal("100"),
-        orb_state=ORBState.INSIDE,
+        or_established=True, or_position="INSIDE",
         session_phase=SessionPhase.EARLY,
         is_above_vwap=True,
     )
@@ -154,7 +154,7 @@ async def test_equities_remain_limited_to_rth_detection() -> None:
         timeframe=BarTimeframe.M1,
         bar=bar,
         vwap=Decimal("100"),
-        orb_state=ORBState.INSIDE,
+        or_established=True, or_position="INSIDE",
         session_phase=SessionPhase.PRE_MARKET,
         is_above_vwap=True,
     )
@@ -215,9 +215,9 @@ async def test_orb_breakout_detector_is_live() -> None:
         timeframe=BarTimeframe.M1,
         bar=bar,
         vwap=Decimal("101"),
-        orb_high=Decimal("101.5"),
-        orb_low=Decimal("99.5"),
-        orb_state=ORBState.BREAKOUT_UP,
+        or_high=Decimal("101.5"),
+        or_low=Decimal("99.5"),
+        or_established=True, or_position="ABOVE",
         session_phase=SessionPhase.EARLY,
         is_above_vwap=True,
     )

@@ -20,7 +20,6 @@ from alpha.models.enums import (
     EventType,
     OrderSide,
     OrderStatus,
-    ORBState,
     SetupGrade,
     SetupState,
     SetupType,

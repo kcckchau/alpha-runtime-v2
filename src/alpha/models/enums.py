@@ -127,14 +127,6 @@ class VWAPState(StrEnum):
     REJECTING = "rejecting"           # price crossed from above, failing
 
 
-class ORBState(StrEnum):
-    INSIDE = "inside"
-    BREAKOUT_UP = "breakout_up"
-    BREAKOUT_DOWN = "breakout_down"
-    FAILED_BREAKOUT_UP = "failed_breakout_up"
-    FAILED_BREAKOUT_DOWN = "failed_breakout_down"
-    NOT_SET = "not_set"               # opening range not yet established
-
 
 class SetupType(StrEnum):
     VWAP_RECLAIM = "vwap_reclaim"

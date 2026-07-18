@@ -572,13 +572,13 @@ class ThesisEngine(BaseEngine):
                 delta -= 0.08
                 evidence.append(EvidenceItem("EMA9 strongly declining", positive=False, weight=0.08))
 
-        if snap.ema_20_slope is not None:
-            if snap.ema_20_slope > 0.002:
+        if snap.ema21_5m_slope is not None:
+            if snap.ema21_5m_slope > 0.002:
                 delta += 0.05
-                evidence.append(EvidenceItem("EMA20 flattening/rising", positive=True, weight=0.05))
-            elif snap.ema_20_slope < -0.010:
+                evidence.append(EvidenceItem("EMA21 flattening/rising", positive=True, weight=0.05))
+            elif snap.ema21_5m_slope < -0.010:
                 delta -= 0.05
-                evidence.append(EvidenceItem("EMA20 declining", positive=False, weight=0.05))
+                evidence.append(EvidenceItem("EMA21 declining", positive=False, weight=0.05))
 
         # Tick flow: did selling dry up?
         if tick.sell_tps_10s is not None and tick.session_avg_tps > 0:
@@ -723,10 +723,10 @@ class ThesisEngine(BaseEngine):
                 delta -= 0.08
                 evidence.append(EvidenceItem("EMA9 still rising — bearish thesis weakened", positive=False, weight=0.08))
 
-        if snap.ema_20_slope is not None:
-            if snap.ema_20_slope < -0.002:
+        if snap.ema21_5m_slope is not None:
+            if snap.ema21_5m_slope < -0.002:
                 delta += 0.05
-                evidence.append(EvidenceItem("EMA20 declining", positive=True, weight=0.05))
+                evidence.append(EvidenceItem("EMA21 declining", positive=True, weight=0.05))
 
         # Tick flow: buying faded?
         if tick.buy_tps_10s is not None and tick.session_avg_tps > 0:

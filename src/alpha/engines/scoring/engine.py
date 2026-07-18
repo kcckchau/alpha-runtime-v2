@@ -140,7 +140,7 @@ _LONG_BASE: int = 3
 _LONG_ADD_ONS: list[tuple[str, int, str]] = [
     ("trend_aligned_bullish",    1, "trend aligned bullish above VWAP"),
     ("price_above_vwap",         1, "price above VWAP"),
-    ("price_above_ema20",        1, "price above EMA20"),
+    ("price_above_ema21",        1, "price above EMA21"),
     ("live_bias_bullish",        1, "live bias bullish"),
     ("rvol_above_1_0",           1, "RVOL ≥ 1.0"),
     ("rvol_above_1_5",           1, "RVOL ≥ 1.5"),   # stacks with rvol_above_1_0 for +2 total
@@ -306,7 +306,7 @@ class ScoringEngine(BaseEngine):
         checks: dict[str, bool] = {
             "vwap_slope_down":     snap.vwap_slope_direction == "down",
             "ema9_slope_down":     snap.ema_9_slope_direction == "down",
-            "ema20_slope_down":    snap.ema_20_slope_direction == "down",
+            "ema20_slope_down":    snap.ema21_5m_slope_direction == "down",
             "recent_lower_low":    snap.recent_lower_low,
             "live_bias_bearish":   bearish_bias,
             "trend_down":          ms.trend == TrendState.TRENDING_DOWN,
@@ -327,7 +327,7 @@ class ScoringEngine(BaseEngine):
 
         pen_checks: dict[str, bool] = {
             "vwap_slope_rising":  snap.vwap_slope_direction == "up",
-            "ema20_slope_rising": snap.ema_20_slope_direction == "up",
+            "ema20_slope_rising": snap.ema21_5m_slope_direction == "up",
             "live_bias_bullish":  bullish_bias,
             "chasing_extension":  snap.vwap_deviation_pct < -0.50,
             "market_not_bearish": not bearish_bias,
@@ -371,7 +371,7 @@ class ScoringEngine(BaseEngine):
                 ms.trend == TrendState.TRENDING_UP and snap.is_above_vwap
             ),
             "price_above_vwap":      snap.is_above_vwap,
-            "price_above_ema20":     bool(snap.is_above_ema20),
+            "price_above_ema21":     snap.ema_21 is not None and snap.bar.close >= snap.ema_21,
             "live_bias_bullish":     bullish_bias,
             "rvol_above_1_0":        rvol is not None and rvol >= 1.0,
             "rvol_above_1_5":        rvol is not None and rvol >= 1.5,

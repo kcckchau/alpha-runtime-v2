@@ -4,7 +4,7 @@ from decimal import Decimal
 from pydantic import BaseModel
 
 from alpha.models.bar import Bar
-from alpha.models.enums import BarTimeframe, ORBState, SessionPhase
+from alpha.models.enums import BarTimeframe, SessionPhase
 from alpha.models.flow import BarFlowContext
 
 
@@ -28,11 +28,12 @@ class BarSnapshot(BaseModel):
     cumulative_volume: int = 0
     relative_volume: float | None = None        # vs historical avg at same time-of-day
 
-    # ── Opening Range (ORB) ───────────────────────────────────────────────────
-    orb_high: Decimal | None = None
-    orb_low: Decimal | None = None
-    orb_range: Decimal | None = None
-    orb_state: ORBState = ORBState.NOT_SET
+    # ── Opening Range ─────────────────────────────────────────────────────────────
+    or_high: Decimal | None = None
+    or_low: Decimal | None = None
+    or_range: Decimal | None = None
+    or_established: bool = False          # True once the opening range window has closed
+    or_position: str | None = None        # "ABOVE" | "INSIDE" | "BELOW" — where price is relative to OR
 
     # ── Session context ──────────────────────────────────────────────────────
     session_phase: SessionPhase = SessionPhase.CLOSED
@@ -40,13 +41,10 @@ class BarSnapshot(BaseModel):
 
     # ── Trend indicators — 1m ────────────────────────────────────────────────
     ema_9: Decimal | None = None
-    ema_20: Decimal | None = None
     ema_21: Decimal | None = None             # EMA21 (user's primary 1m fast EMA)
     ema_50: Decimal | None = None
     ema_9_slope: float | None = None          # % rate-of-change of EMA9 vs prior bar (positive = rising)
     ema_9_slope_direction: str | None = None  # "up" / "flat" / "down"  (flat = |slope| ≤ 0.005%)
-    ema_20_slope: float | None = None         # % rate-of-change of EMA20 vs prior bar
-    ema_20_slope_direction: str | None = None  # "up" / "flat" / "down"
     vwap_slope: float | None = None           # % rate-of-change of VWAP vs prior bar
     vwap_slope_direction: str | None = None   # "up" / "flat" / "down"  (flat = |slope| ≤ 0.002%)
 
@@ -57,8 +55,6 @@ class BarSnapshot(BaseModel):
     ema9_5m_slope_direction: str | None = None
     ema21_5m_slope: float | None = None       # % rate-of-change of 5m EMA21 vs prior 5m bar
     ema21_5m_slope_direction: str | None = None
-    is_bull_stack_5m: bool | None = None      # EMA9 > EMA21
-    is_bear_stack_5m: bool | None = None      # EMA9 < EMA21
 
     # ── Trend indicators — 1h (carry-forward: updated on each H1 bar) ────────
     # SMA200 requires 200 H1 bars (~8.5 trading days); will be None until warm.
@@ -72,8 +68,6 @@ class BarSnapshot(BaseModel):
     ema21_1h_slope_direction: str | None = None
     ema50_1h_slope: float | None = None       # % rate-of-change of 1h EMA50 vs prior 1h bar
     ema50_1h_slope_direction: str | None = None
-    is_bull_stack_1h: bool | None = None      # EMA9 > EMA21 > EMA50 (and > SMA200 when warmed)
-    is_bear_stack_1h: bool | None = None      # EMA9 < EMA21 < EMA50 (and < SMA200 when warmed)
 
     # ── Trend indicators — 1D (carry-forward: updated on each D1 bar) ────────
     ema10_1d: Decimal | None = None           # 1d EMA10
@@ -94,8 +88,7 @@ class BarSnapshot(BaseModel):
 
     # ── Computed flags ────────────────────────────────────────────────────────
     is_above_vwap: bool = False
-    is_above_ema20: bool | None = None
-    is_extended: bool = False                   # price far from VWAP (>2 std dev)
+    is_extended: bool = False                   # price far from VWAP (>2 ATR)
 
     # ── Setup detection features ──────────────────────────────────────────────
     bars_above_vwap: int = 0                    # consecutive bars closing above VWAP
@@ -115,21 +108,17 @@ class BarSnapshot(BaseModel):
     is_lower_low: bool = False                  # this bar's low < prior bar's low
     is_lower_high: bool = False                 # this bar's high < prior bar's high
     recent_lower_low: bool = False              # a lower low was made within the last 10 bars (session)
-    or_mid: Decimal | None = None               # (orb_high + orb_low) / 2
+    or_mid: Decimal | None = None               # (or_high + or_low) / 2
     swept_below_vwap: bool = False              # low < vwap but close >= vwap
-    swept_orl: bool = False                     # low < orb_low
+    swept_or_low: bool = False                  # low < or_low
 
-    # ── ORB cross flags (populated by Feature Engine) ─────────────────────────
-    orb_cross_down: bool = False               # first bar that closes below orb_low (one-time trigger)
-    orb_cross_up: bool = False                 # first bar that closes back above orb_low after breakdown
-    bars_since_orb_breakdown: int = 0          # bars elapsed since initial orb_cross_down (0 = not yet broken)
-
-    # ── VWAP interaction memory ───────────────────────────────────────────────
-    vwap_touch_count: int = 0              # VWAP cross/sweep events this session
-    last_vwap_outcome: str | None = None   # "swept","reclaimed","broken","rejected"
-    bars_since_last_vwap_touch: int = 0
+    # ── OR cross flags (populated by Feature Engine) ──────────────────────────
+    or_cross_down: bool = False               # first bar that closes below or_low (one-time trigger)
+    or_cross_up: bool = False                 # first bar that closes back above or_low after breakdown
+    bars_since_or_breakdown: int = 0          # bars elapsed since initial or_cross_down (0 = not yet broken)
 
     # ── Additional volatility ─────────────────────────────────────────────────
+    vwap_distance_atr: float | None = None   # (close - vwap) / atr_30; None until atr_30 warms
     atr_30: Decimal | None = None           # M1 30-period ATR
     ema_9_slope_accel: float | None = None  # slope acceleration (d²EMA9/dt²)
 

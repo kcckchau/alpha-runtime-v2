@@ -242,8 +242,8 @@ class ContextEngine(BaseEngine):
         # Pull live indicators from FeatureEngine snapshot
         vwap    = feat.vwap if feat else None
         m5_21   = feat.ema21_5m if feat else None
-        orb_h   = feat.orb_high if feat else None
-        orb_l   = feat.orb_low if feat else None
+        orb_h   = feat.or_high if feat else None
+        orb_l   = feat.or_low if feat else None
         or_mid  = feat.or_mid if feat else None
 
         # ── War zone candidates ───────────────────────────────────────────────

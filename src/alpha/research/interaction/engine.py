@@ -205,8 +205,6 @@ class LevelInteractionEngine:
         (session_phase != OPENING_RANGE). During the OR window the levels are
         still accumulating and must not be treated as fixed interaction points.
         """
-        from alpha.models.enums import ORBState
-
         tick_size = self._get_tick_size(symbol)
         # session_id = "{symbol}:{session_date}" — extract the date portion
         session_date = session_id.split(":", 1)[1] if ":" in session_id else session_id
@@ -252,30 +250,30 @@ class LevelInteractionEngine:
             ))
 
         # ORH/ORL: only after the opening range is fully established (frozen).
-        # ORBState.NOT_SET means the window is still accumulating — levels not yet fixed.
+        # or_established=False means the window is still accumulating — levels not yet fixed.
         # Both ORH and ORL are RTH levels (defined by the US cash-session opening range).
-        or_frozen = snap.orb_state != ORBState.NOT_SET
+        or_frozen = snap.or_established
 
-        if or_frozen and snap.orb_high is not None:
+        if or_frozen and snap.or_high is not None:
             levels.append(LevelSnapshot(
                 level_id=f"{symbol}:orh:rth:{session_date}",
                 symbol=symbol,
                 session_id=session_id,
                 level_type="orh",
-                level_value=snap.orb_high,
+                level_value=snap.or_high,
                 tick_size=tick_size,
                 is_dynamic=False,
                 sampling_note="fixed_orb_high",
                 session_scope="rth",
             ))
 
-        if or_frozen and snap.orb_low is not None:
+        if or_frozen and snap.or_low is not None:
             levels.append(LevelSnapshot(
                 level_id=f"{symbol}:orl:rth:{session_date}",
                 symbol=symbol,
                 session_id=session_id,
                 level_type="orl",
-                level_value=snap.orb_low,
+                level_value=snap.or_low,
                 tick_size=tick_size,
                 is_dynamic=False,
                 sampling_note="fixed_orb_low",

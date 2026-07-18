@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from alpha.models.enums import DayType, DayTypeStatus, LiveBias, ORBState, SessionPhase, TrendState, VWAPState
+from alpha.models.enums import DayType, DayTypeStatus, LiveBias, SessionPhase, TrendState, VWAPState
 
 
 class MarketState(BaseModel):
@@ -21,8 +21,8 @@ class MarketState(BaseModel):
     vwap_tests: int = 0                   # # of times price tested VWAP today
     vwap_holds: int = 0                   # # of times price held at VWAP
 
-    # ── ORB regime ────────────────────────────────────────────────────────────
-    orb_state: ORBState = ORBState.NOT_SET
+    # ── OR regime ─────────────────────────────────────────────────────────────
+    or_position: str | None = None        # "ABOVE" | "INSIDE" | "BELOW" — where price is relative to OR
     orb_breakout_clean: bool = False      # single-bar clean break
     orb_volume_confirmed: bool = False
 

@@ -67,14 +67,10 @@ def _snap(
     swept_below_vwap: bool = False,
     close_position: float = 0.5,
     ema_9_slope: float = 0.0,
-    ema_20_slope: float = 0.0,
     is_lower_high: bool = False,
     is_lower_low: bool = False,
     is_higher_high: bool = False,
     atr_14: float = 15.0,
-    last_vwap_outcome: str | None = None,
-    bars_since_last_vwap_touch: int = 0,
-    vwap_touch_count: int = 0,
     session_phase: str = "early",
     offset_minutes: int = 0,
 ) -> BarSnapshot:
@@ -91,7 +87,7 @@ def _snap(
         close=close_d,
         volume=1000,
     )
-    from alpha.models.enums import SessionPhase, ORBState
+    from alpha.models.enums import SessionPhase
     return BarSnapshot(
         symbol=SYM,
         timestamp=_ts(offset_minutes),
@@ -106,16 +102,12 @@ def _snap(
         swept_below_vwap=swept_below_vwap,
         bar_close_position_pct=close_position,
         ema_9_slope=ema_9_slope,
-        ema_20_slope=ema_20_slope,
         is_lower_high=is_lower_high,
         is_lower_low=is_lower_low,
         is_higher_high=is_higher_high,
         atr_14=Decimal(str(atr_14)),
-        last_vwap_outcome=last_vwap_outcome,
-        bars_since_last_vwap_touch=bars_since_last_vwap_touch,
-        vwap_touch_count=vwap_touch_count,
         session_phase=SessionPhase.EARLY,
-        orb_state=ORBState.NOT_SET,
+        or_established=False,
     )
 
 

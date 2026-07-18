@@ -39,7 +39,6 @@ from alpha.models.enums import (
     BarTimeframe,
     EventType,
     HealthStatus,
-    ORBState,
     OrderSide,
     SessionPhase,
     SetupGrade,
@@ -391,9 +390,9 @@ class SetupEngine(BaseEngine):
         FORMING: swept OR low (wick below) but closed back above it.
         Looser than FAKE_BREAKDOWN — VWAP reclaim not required yet.
         """
-        if not snap.swept_orl:
+        if not snap.swept_or_low:
             return "or_low_not_swept"
-        if snap.orb_low is None or snap.bar.close <= snap.orb_low:
+        if snap.or_low is None or snap.bar.close <= snap.or_low:
             return "close_not_above_orb_low"
         if snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.50:
             return "close_in_lower_half"
@@ -401,9 +400,9 @@ class SetupEngine(BaseEngine):
             return "relative_volume_lt_1_1"
         # Block strongly bearish EMA alignment (both EMAs sloping down, price below both)
         if (
-            snap.ema_9 is not None and snap.ema_20 is not None
-            and snap.bar.close < snap.ema_9 and snap.bar.close < snap.ema_20
-            and snap.ema_9 < snap.ema_20
+            snap.ema_9 is not None and snap.ema_21 is not None
+            and snap.bar.close < snap.ema_9 and snap.bar.close < snap.ema_21
+            and snap.ema_9 < snap.ema_21
         ):
             return "strongly_bearish_ema_alignment"
         return None
@@ -426,12 +425,12 @@ class SetupEngine(BaseEngine):
         # just an aggressive flush from above, not a fake breakdown.
         if snap.bars_below_vwap < 1:
             return "price_never_lost_vwap_before_sweep"
-        if not snap.swept_orl:
+        if not snap.swept_or_low:
             return "or_low_not_swept"
-        if snap.orb_low is None or snap.bar.close <= snap.orb_low:
+        if snap.or_low is None or snap.bar.close <= snap.or_low:
             return "close_not_above_orb_low"
         # Depth limit: sweep ≤0.3% below OR low — deeper is a real breakdown
-        if snap.bar.low < snap.orb_low * Decimal("0.997"):
+        if snap.bar.low < snap.or_low * Decimal("0.997"):
             return "sweep_too_deep_gt_0_3pct"
         if snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.55:
             return "close_not_in_upper_45pct"
@@ -476,13 +475,13 @@ class SetupEngine(BaseEngine):
         FORMING: higher highs, within 0.2% of intraday high.
         MNQ opposed → blocked (skipped until MNQ lead is wired).
         """
-        # ORB must be established
-        if snap.orb_state == ORBState.NOT_SET or snap.orb_high is None:
+        # OR must be established
+        if not snap.or_established or snap.or_high is None:
             return False
         if snap.intraday_high is None:
             return False
         # Prereq: session high already above the OR high
-        if snap.intraday_high <= snap.orb_high:
+        if snap.intraday_high <= snap.or_high:
             return False
         # Prereq: price above VWAP
         if not snap.is_above_vwap:
@@ -497,11 +496,11 @@ class SetupEngine(BaseEngine):
         return True
 
     def _reason_hod_breakout(self, snap: BarSnapshot, ms: MarketState) -> str | None:
-        if snap.orb_state == ORBState.NOT_SET or snap.orb_high is None:
+        if not snap.or_established or snap.or_high is None:
             return "orb_not_set"
         if snap.intraday_high is None:
             return "intraday_high_missing"
-        if snap.intraday_high <= snap.orb_high:
+        if snap.intraday_high <= snap.or_high:
             return "intraday_high_not_above_orb_high"
         if not snap.is_above_vwap:
             return "not_above_vwap"
@@ -563,8 +562,8 @@ class SetupEngine(BaseEngine):
         # Weak close = rejection conviction (close in lower half of bar)
         if snap.bar_close_position_pct is not None and snap.bar_close_position_pct > 0.5:
             return "close_in_upper_half"
-        # EMA9 must be ≤ EMA20 — bearish alignment (sellers have structural control)
-        if snap.ema_9 is not None and snap.ema_20 is not None and snap.ema_9 > snap.ema_20:
+        # EMA9 must be ≤ EMA21 — bearish alignment (sellers have structural control)
+        if snap.ema_9 is not None and snap.ema_21 is not None and snap.ema_9 > snap.ema_21:
             return "ema9_above_ema20_not_bearish"
         # VWAP must not be rising — a rising VWAP means cumulative buying, short risk high
         if snap.vwap_slope_direction == "up":
@@ -590,16 +589,16 @@ class SetupEngine(BaseEngine):
         """
         if snap.bars_below_vwap < 5:
             return "bars_below_vwap_lt_5"
-        if snap.ema_9 is None or snap.ema_20 is None:
+        if snap.ema_9 is None or snap.ema_21 is None:
             return "ema_not_available"
         # Bearish EMA alignment required
-        if snap.ema_9 >= snap.ema_20:
+        if snap.ema_9 >= snap.ema_21:
             return "ema9_not_below_ema20"
         # EMA9 must not be rising — flat or down only
         if snap.ema_9_slope_direction == "up":
             return "ema9_slope_rising"
-        # EMA20 must not be rising — trend must have real momentum, not just short-term dip
-        if snap.ema_20_slope_direction == "up":
+        # EMA21 must not be rising — trend must have real momentum, not just short-term dip
+        if snap.ema21_5m_slope_direction == "up":
             return "ema20_slope_rising"
         # A lower low must have been made recently — confirms this is a real downtrend,
         # not VWAP-area chop. Without this, any 5-bar below-VWAP drift + EMA9 touch qualifies.
@@ -788,7 +787,7 @@ class SetupEngine(BaseEngine):
 
             if snap.vwap_cross_up:
                 return setup.transition(SetupState.INVALIDATED, "vwap_cross_up", bar_time=snap.timestamp), ""
-            if snap.ema_20 is not None and snap.bar.close >= snap.ema_20:
+            if snap.ema_21 is not None and snap.bar.close >= snap.ema_21:
                 return setup.transition(SetupState.INVALIDATED, "close_above_ema20", bar_time=snap.timestamp), ""
             if bars > 8:
                 return setup.transition(SetupState.INVALIDATED, "forming_timeout_gt_8_bars", bar_time=snap.timestamp), ""
@@ -798,7 +797,7 @@ class SetupEngine(BaseEngine):
             lower_high = snap.bar.high < setup.bar_snapshot.bar.high
             broke_forming_low = snap.bar.low < setup.bar_snapshot.bar.low
             below_ema9 = snap.ema_9 is None or snap.bar.close < snap.ema_9
-            below_ema20 = snap.ema_20 is None or snap.bar.close < snap.ema_20
+            below_ema20 = snap.ema_21 is None or snap.bar.close < snap.ema_21
             if lower_high and broke_forming_low and not snap.is_above_vwap and below_ema9 and below_ema20:
                 rvol_ok = snap.relative_volume is None or snap.relative_volume >= 0.8
                 if rvol_ok:
@@ -841,33 +840,33 @@ class SetupEngine(BaseEngine):
                 self._forming_bars.get(setup.setup_id, 0) + 1
             )
             # Invalidation: OR low reclaimed (first cross back up, or close above level)
-            if snap.orb_cross_up:
+            if snap.or_cross_up:
                 return setup.transition(SetupState.INVALIDATED, "orb_low_reclaimed_cross_up", bar_time=snap.timestamp), ""
-            if snap.orb_low is not None and snap.bar.close > snap.orb_low:
+            if snap.or_low is not None and snap.bar.close > snap.or_low:
                 return setup.transition(SetupState.INVALIDATED, "orb_low_reclaimed_close_above", bar_time=snap.timestamp), ""
             if snap.is_above_vwap:
                 return setup.transition(SetupState.INVALIDATED, "reclaimed_vwap_while_forming", bar_time=snap.timestamp), ""
-            # Confirm: hold below ORB low on next bar + rvol ≥ 1.0
-            if snap.orb_low is not None and snap.bar.close < snap.orb_low:
+            # Confirm: hold below OR low on next bar + rvol ≥ 1.0
+            if snap.or_low is not None and snap.bar.close < snap.or_low:
                 rvol_ok = snap.relative_volume is None or snap.relative_volume >= 1.0
                 if rvol_ok:
                     # Entry: forming bar's close — where price was when the breakdown
-                    # was first detected (an actionable fill price, not the stale ORB level).
+                    # was first detected (an actionable fill price, not the stale OR level).
                     entry = setup.bar_snapshot.bar.close
-                    # Stop: just above ORB low — the structural level; if price reclaims
+                    # Stop: just above OR low — the structural level; if price reclaims
                     # it the breakdown has failed.
-                    stop = snap.orb_low * Decimal("1.001")
+                    stop = snap.or_low * Decimal("1.001")
                     rw_reason = self._risk_width_rejection(entry, stop, snap)
                     if rw_reason:
                         return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
-                    orb_range = (
-                        (snap.orb_high - snap.orb_low)
-                        if snap.orb_high and snap.orb_low else None
+                    or_range = (
+                        (snap.or_high - snap.or_low)
+                        if snap.or_high and snap.or_low else None
                     )
                     mult = self._target_mult("sell", ms)
                     target = (
-                        entry - orb_range * mult
-                        if orb_range else entry - (stop - entry) * mult
+                        entry - or_range * mult
+                        if or_range else entry - (stop - entry) * mult
                     )
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
@@ -884,10 +883,10 @@ class SetupEngine(BaseEngine):
                     return confirmed, "confirmed"
 
         elif setup.state == SetupState.CONFIRMED:
-            # Invalidation: price reclaims ORB low (close above or first orb_cross_up)
-            if snap.orb_cross_up:
+            # Invalidation: price reclaims OR low (close above or first or_cross_up)
+            if snap.or_cross_up:
                 return setup.transition(SetupState.INVALIDATED, "orb_low_reclaimed_cross_up", bar_time=snap.timestamp), ""
-            if snap.orb_low is not None and snap.bar.close > snap.orb_low:
+            if snap.or_low is not None and snap.bar.close > snap.or_low:
                 return setup.transition(SetupState.INVALIDATED, "orb_low_reclaimed_close_above", bar_time=snap.timestamp), ""
             if setup.entry_trigger and snap.bar.low <= setup.entry_trigger:
                 return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"
@@ -926,13 +925,11 @@ class SetupEngine(BaseEngine):
     def _vwap_rejection_alignment_reason(snap: BarSnapshot) -> str | None:
         if snap.ema_9 is not None and snap.bar.close >= snap.ema_9:
             return "close_not_below_ema9"
-        if snap.ema_20 is not None and snap.bar.close >= snap.ema_20:
+        if snap.ema_21 is not None and snap.bar.close >= snap.ema_21:
             return "close_not_below_ema20"
         if snap.ema_9_slope is not None and snap.ema_9_slope >= 0:
             return "ema9_slope_not_down"
-        if snap.ema_20_slope is not None and snap.ema_20_slope >= 0:
-            return "ema20_slope_not_down"
-        if snap.is_bull_stack_5m is True:
+        if snap.ema9_5m is not None and snap.ema21_5m is not None and snap.ema9_5m > snap.ema21_5m:
             return "five_min_stack_still_bullish"
         if snap.ema9_5m_slope_direction == "up" or snap.ema21_5m_slope_direction == "up":
             return "five_min_slope_not_bearish"
@@ -977,28 +974,28 @@ class SetupEngine(BaseEngine):
         return None
 
     def _detect_orb_breakout(self, snap: BarSnapshot, ms: MarketState) -> bool:
-        if snap.orb_high is None:
+        if snap.or_high is None:
             return False
-        if snap.orb_state != ORBState.BREAKOUT_UP:
+        if snap.or_position != "ABOVE":
             return False
         if not snap.is_above_vwap:
             return False
-        if snap.bar.close <= snap.orb_high:
+        if snap.bar.close <= snap.or_high:
             return False
-        if snap.bar.open > snap.orb_high and snap.bar.low > snap.orb_high:
+        if snap.bar.open > snap.or_high and snap.bar.low > snap.or_high:
             return False
         return True
 
     def _reason_orb_breakout(self, snap: BarSnapshot, ms: MarketState) -> str | None:
-        if snap.orb_high is None:
+        if snap.or_high is None:
             return "no_orb_high_set"
-        if snap.orb_state != ORBState.BREAKOUT_UP:
+        if snap.or_position != "ABOVE":
             return "not_orb_breakout_up"
         if not snap.is_above_vwap:
             return "below_vwap"
-        if snap.bar.close <= snap.orb_high:
+        if snap.bar.close <= snap.or_high:
             return "close_not_above_orb_high"
-        if snap.bar.open > snap.orb_high and snap.bar.low > snap.orb_high:
+        if snap.bar.open > snap.or_high and snap.bar.low > snap.or_high:
             return "already_extended_above_orb_high"
         return None
 
@@ -1012,24 +1009,24 @@ class SetupEngine(BaseEngine):
         is_new_lod as the primary trigger would fire on every subsequent new low,
         not just the initial break.
         """
-        if snap.orb_low is None:
+        if snap.or_low is None:
             return False
-        if not snap.orb_cross_down:
+        if not snap.or_cross_down:
             return False
         if snap.is_above_vwap:
             return False
-        if snap.bar.close >= snap.orb_low:
+        if snap.bar.close >= snap.or_low:
             return False
         return True
 
     def _reason_orb_breakdown(self, snap: BarSnapshot, ms: MarketState) -> str | None:
-        if snap.orb_low is None:
+        if snap.or_low is None:
             return "no_orb_low_set"
-        if not snap.orb_cross_down:
+        if not snap.or_cross_down:
             return "not_initial_orb_cross_down"
         if snap.is_above_vwap:
             return "above_vwap"
-        if snap.bar.close >= snap.orb_low:
+        if snap.bar.close >= snap.or_low:
             return "close_not_below_orb_low"
         return None
 
@@ -1616,7 +1613,7 @@ class SetupEngine(BaseEngine):
                 return setup.transition(SetupState.INVALIDATED, "forming timeout >5 bars", bar_time=snap.timestamp), ""
 
             # Confirm: holding above OR low, structure recovering
-            if snap.orb_low is not None and snap.bar.close > snap.orb_low:
+            if snap.or_low is not None and snap.bar.close > snap.or_low:
                 no_lower_low = not snap.is_lower_low
                 recovering = snap.vwap_deviation_shrinking or snap.is_above_vwap
                 rvol_ok = snap.relative_volume is None or snap.relative_volume >= 0.8
@@ -1804,26 +1801,26 @@ class SetupEngine(BaseEngine):
             self._forming_bars[setup.setup_id] = (
                 self._forming_bars.get(setup.setup_id, 0) + 1
             )
-            if snap.orb_high is not None and snap.bar.close < snap.orb_high:
+            if snap.or_high is not None and snap.bar.close < snap.or_high:
                 return setup.transition(SetupState.INVALIDATED, "fell_back_below_orb_high", bar_time=snap.timestamp), ""
             if not snap.is_above_vwap:
                 return setup.transition(SetupState.INVALIDATED, "lost_vwap_while_forming", bar_time=snap.timestamp), ""
-            if snap.orb_high is not None and snap.bar.close > snap.orb_high:
+            if snap.or_high is not None and snap.bar.close > snap.or_high:
                 rvol_ok = snap.relative_volume is None or snap.relative_volume >= 1.0
                 if rvol_ok:
                     entry = setup.bar_snapshot.bar.close
-                    stop = snap.orb_high * Decimal("0.999")
+                    stop = snap.or_high * Decimal("0.999")
                     rw_reason = self._risk_width_rejection(entry, stop, snap)
                     if rw_reason:
                         return setup.transition(SetupState.INVALIDATED, rw_reason, bar_time=snap.timestamp), ""
-                    orb_range = (
-                        (snap.orb_high - snap.orb_low)
-                        if snap.orb_high and snap.orb_low else None
+                    or_range = (
+                        (snap.or_high - snap.or_low)
+                        if snap.or_high and snap.or_low else None
                     )
                     mult = self._target_mult("buy", ms)
                     target = (
-                        entry + orb_range * mult
-                        if orb_range else entry + (entry - stop) * mult
+                        entry + or_range * mult
+                        if or_range else entry + (entry - stop) * mult
                     )
                     confirmed = setup.transition(SetupState.CONFIRMED, bar_time=snap.timestamp).model_copy(
                         update={
@@ -1840,7 +1837,7 @@ class SetupEngine(BaseEngine):
                     return confirmed, "confirmed"
 
         elif setup.state == SetupState.CONFIRMED:
-            if snap.orb_high is not None and snap.bar.close < snap.orb_high:
+            if snap.or_high is not None and snap.bar.close < snap.or_high:
                 return setup.transition(SetupState.INVALIDATED, "fell_back_below_orb_high", bar_time=snap.timestamp), ""
             if setup.entry_trigger and snap.bar.high >= setup.entry_trigger:
                 return setup.transition(SetupState.TRIGGERED, bar_time=snap.timestamp), "triggered"

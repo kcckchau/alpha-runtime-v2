@@ -31,7 +31,7 @@ import pytest
 import pyarrow.parquet as pq
 
 from alpha.models.bar import Bar
-from alpha.models.enums import BarTimeframe, DataSourceId, ORBState, SessionPhase
+from alpha.models.enums import BarTimeframe, DataSourceId, SessionPhase
 from alpha.models.events import EventMetadata, PipelineOutputEvent
 from alpha.models.snapshot import BarSnapshot
 from alpha.research.level_observer import (
@@ -82,11 +82,11 @@ def _make_bar(
 def _make_snap(
     bar: Bar,
     vwap: float | None = 5812.00,
-    orb_high: float | None = None,
-    orb_low: float | None = None,
+    or_high: float | None = None,
+    or_low: float | None = None,
     atr_14: float | None = 10.0,
     session_phase: SessionPhase = SessionPhase.EARLY,
-    orb_state: ORBState = ORBState.NOT_SET,
+    or_established: bool = False,
 ) -> BarSnapshot:
     return BarSnapshot(
         symbol=SYM,
@@ -94,11 +94,11 @@ def _make_snap(
         timeframe=BarTimeframe.M1,
         bar=bar,
         vwap=Decimal(str(vwap)) if vwap is not None else Decimal("0"),
-        orb_high=Decimal(str(orb_high)) if orb_high is not None else None,
-        orb_low=Decimal(str(orb_low)) if orb_low is not None else None,
+        or_high=Decimal(str(or_high)) if or_high is not None else None,
+        or_low=Decimal(str(or_low)) if or_low is not None else None,
         atr_14=Decimal(str(atr_14)) if atr_14 is not None else None,
         session_phase=session_phase,
-        orb_state=orb_state,
+        or_established=or_established,
     )
 
 
@@ -214,7 +214,7 @@ def test_proximity_band_atr_none_uses_fallback():
 async def test_basic_observation_above_level(tmp_path):
     """Bar entirely above ORL produces correct positive tick distances."""
     bar = _make_bar(open=5815.00, high=5817.00, low=5814.00, close=5816.00)
-    snap = _make_snap(bar, vwap=None, orb_low=5812.00, orb_state=ORBState.INSIDE)
+    snap = _make_snap(bar, vwap=None, or_low=5812.00, or_established=True)
     event = _make_event(snap)
 
     observer, writer = _make_observer(tmp_path)
@@ -238,7 +238,7 @@ async def test_basic_observation_above_level(tmp_path):
 async def test_overlap_detection(tmp_path):
     """Bar where low < level < high produces bar_overlaps_level=True."""
     bar = _make_bar(open=5813.00, high=5814.00, low=5810.00, close=5813.50)
-    snap = _make_snap(bar, vwap=None, orb_low=5812.00, orb_state=ORBState.INSIDE)
+    snap = _make_snap(bar, vwap=None, or_low=5812.00, or_established=True)
     event = _make_event(snap)
 
     observer, writer = _make_observer(tmp_path)
@@ -256,7 +256,7 @@ async def test_overlap_detection(tmp_path):
 async def test_cross_close_above_open_below(tmp_path):
     """open_side=BELOW, close_side=ABOVE captured correctly."""
     bar = _make_bar(open=5810.00, high=5815.00, low=5809.00, close=5813.00)
-    snap = _make_snap(bar, vwap=None, orb_low=5812.00, orb_state=ORBState.INSIDE)
+    snap = _make_snap(bar, vwap=None, or_low=5812.00, or_established=True)
     event = _make_event(snap)
 
     observer, writer = _make_observer(tmp_path)
@@ -274,8 +274,8 @@ async def test_vwap_uses_value_at_bar_time(tmp_path):
     bar1 = _make_bar(open=5813.00, high=5815.00, low=5812.00, close=5814.00, ts=_ts(0))
     bar2 = _make_bar(open=5816.00, high=5818.00, low=5815.00, close=5817.00, ts=_ts(45))
 
-    snap1 = _make_snap(bar1, vwap=5810.00, orb_high=None, orb_low=None)
-    snap2 = _make_snap(bar2, vwap=5815.50, orb_high=None, orb_low=None)
+    snap1 = _make_snap(bar1, vwap=5810.00, or_high=None, or_low=None)
+    snap2 = _make_snap(bar2, vwap=5815.50, or_high=None, or_low=None)
 
     observer, writer = _make_observer(tmp_path)
     await _process(observer, _make_event(snap1, ts=_ts(0)))
@@ -292,8 +292,8 @@ async def test_vwap_uses_value_at_bar_time(tmp_path):
 async def test_missing_orh_skips_gracefully(tmp_path):
     """When ORH is None (opening range not locked), no ORH row is emitted."""
     bar = _make_bar(open=5813.00, high=5815.00, low=5812.00, close=5814.00)
-    # orb_high=None, orb_low=None, orb_state=NOT_SET
-    snap = _make_snap(bar, vwap=5812.00, orb_high=None, orb_low=None)
+    # or_high=None, or_low=None, orb_state=NOT_SET
+    snap = _make_snap(bar, vwap=5812.00, or_high=None, or_low=None)
     event = _make_event(snap)
 
     observer, writer = _make_observer(tmp_path)
@@ -310,8 +310,8 @@ async def test_all_three_levels_emits_three_rows(tmp_path):
     """When VWAP + ORH + ORL are all available, exactly 3 rows are emitted per bar."""
     bar = _make_bar(open=5813.00, high=5820.00, low=5810.00, close=5816.00)
     snap = _make_snap(
-        bar, vwap=5812.00, orb_high=5818.00, orb_low=5808.00,
-        orb_state=ORBState.INSIDE,
+        bar, vwap=5812.00, or_high=5818.00, or_low=5808.00,
+        or_established=True,
     )
     event = _make_event(snap)
 
@@ -327,8 +327,8 @@ async def test_all_three_levels_emits_three_rows(tmp_path):
 async def test_duplicate_bar_idempotent(tmp_path):
     """Feeding the same bar twice produces one set of rows, not two."""
     bar = _make_bar(open=5813.00, high=5815.00, low=5812.00, close=5814.00)
-    snap = _make_snap(bar, vwap=5812.00, orb_high=5818.00, orb_low=5808.00,
-                      orb_state=ORBState.INSIDE)
+    snap = _make_snap(bar, vwap=5812.00, or_high=5818.00, or_low=5808.00,
+                      or_established=True)
     event = _make_event(snap)
 
     observer, writer = _make_observer(tmp_path)

@@ -28,7 +28,7 @@ from alpha.core.clock import Clock
 from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
-from alpha.models.enums import AssetClass, BarTimeframe, EventType, HealthStatus, ORBState, SessionPhase
+from alpha.models.enums import AssetClass, BarTimeframe, EventType, HealthStatus, SessionPhase
 from alpha.models.events import AnyEvent, BarBundleEvent, BarEvent, QuoteEvent
 from alpha.models.snapshot import BarSnapshot
 
@@ -107,6 +107,7 @@ class SymbolFeatureState:
         self.bars_since_last_vwap_touch: int = 0
         self._vwap_last_cross_direction: str | None = None  # "up" or "down"
         self._vwap_bars_since_cross: int = 0
+        self._vwap_touch_cooldown: int = 0   # bars remaining before next touch can be counted
         self.session_sweep_low: Decimal | None = None
         self.session_reject_high: Decimal | None = None
         # ATR-30
@@ -163,6 +164,7 @@ class SymbolFeatureState:
         self.bars_since_last_vwap_touch = 0
         self._vwap_last_cross_direction = None
         self._vwap_bars_since_cross = 0
+        self._vwap_touch_cooldown = 0
         self.session_sweep_low = None
         self.session_reject_high = None
         self.atr_30_buffer.clear()
@@ -518,34 +520,47 @@ class FeatureEngine(BaseEngine):
                 # Note: prev_above_vwap was already set to is_above above; capture the
                 # prior-bar side before it was updated for the swept check below.
                 swept = vwap > _ZERO and bar.low < vwap <= bar.close
-                if state.vwap_cross_up:
-                    state.vwap_touch_count += 1
-                    state.last_vwap_outcome = "reclaimed"
-                    state.bars_since_last_vwap_touch = 0
-                    state._vwap_last_cross_direction = "up"
-                    state._vwap_bars_since_cross = 0
-                elif state.vwap_cross_down:
-                    state.vwap_touch_count += 1
-                    if (
-                        state._vwap_last_cross_direction == "up"
-                        and state._vwap_bars_since_cross <= 3
-                    ):
-                        state.last_vwap_outcome = "rejected"
-                    else:
-                        state.last_vwap_outcome = "broken"
-                    state.bars_since_last_vwap_touch = 0
-                    state._vwap_last_cross_direction = "down"
-                    state._vwap_bars_since_cross = 0
-                elif swept and is_above:
-                    # Low dipped below VWAP but close recovered — approached from above
-                    state.vwap_touch_count += 1
-                    state.last_vwap_outcome = "swept"
-                    state.bars_since_last_vwap_touch = 0
-                else:
+                # Minimum exit distance guard for micro-sweeps
+                if swept and state.atr_30 is not None:
+                    swept = bar.low < vwap - state.atr_30 * Decimal("0.1")
+                touch_counted = False
+                if state._vwap_touch_cooldown == 0:
+                    if state.vwap_cross_up:
+                        state.vwap_touch_count += 1
+                        state.last_vwap_outcome = "reclaimed"
+                        state.bars_since_last_vwap_touch = 0
+                        state._vwap_last_cross_direction = "up"
+                        state._vwap_bars_since_cross = 0
+                        state._vwap_touch_cooldown = 3
+                        touch_counted = True
+                    elif state.vwap_cross_down:
+                        state.vwap_touch_count += 1
+                        if (
+                            state._vwap_last_cross_direction == "up"
+                            and state._vwap_bars_since_cross <= 3
+                        ):
+                            state.last_vwap_outcome = "rejected"
+                        else:
+                            state.last_vwap_outcome = "broken"
+                        state.bars_since_last_vwap_touch = 0
+                        state._vwap_last_cross_direction = "down"
+                        state._vwap_bars_since_cross = 0
+                        state._vwap_touch_cooldown = 3
+                        touch_counted = True
+                    elif swept and is_above:
+                        # Low dipped below VWAP but close recovered — approached from above
+                        state.vwap_touch_count += 1
+                        state.last_vwap_outcome = "swept"
+                        state.bars_since_last_vwap_touch = 0
+                        state._vwap_touch_cooldown = 3
+                        touch_counted = True
+                if not touch_counted:
                     if state.last_vwap_outcome is not None:
                         state.bars_since_last_vwap_touch += 1
                     if state._vwap_last_cross_direction is not None:
                         state._vwap_bars_since_cross += 1
+                if state._vwap_touch_cooldown > 0:
+                    state._vwap_touch_cooldown -= 1
 
                 # Track session extremes for thesis context
                 if vwap > _ZERO and bar.low < vwap:
@@ -624,7 +639,20 @@ class FeatureEngine(BaseEngine):
 
         vwap = state.vwap
         vwap_dev = float((bar.close - vwap) / vwap * 100) if vwap else 0.0
-        orb_state = self._orb_state(state, bar)
+
+        if not state.orb_established or state.orb_high is None or state.orb_low is None:
+            or_established = False
+            or_position = None
+        elif bar.close > state.orb_high:
+            or_established = True
+            or_position = "ABOVE"
+        elif bar.close < state.orb_low:
+            or_established = True
+            or_position = "BELOW"
+        else:
+            or_established = True
+            or_position = "INSIDE"
+
         atr = (
             Decimal(str(round(float(sum(state.atr_buffer) / len(state.atr_buffer)), 4)))
             if state.atr_buffer else None
@@ -651,18 +679,12 @@ class FeatureEngine(BaseEngine):
             ema_9_slope_accel = ema_9_slope - state.prev_ema_9_slope
         state.prev_ema_9_slope = ema_9_slope
         state.ema_9_slope_accel = ema_9_slope_accel
-        ema_20_slope: float | None = (
-            float((state.ema_20 - state.prev_ema_20) / state.prev_ema_20 * 100)
-            if state.ema_20 is not None and state.prev_ema_20 is not None and state.prev_ema_20 > _ZERO
-            else None
-        )
         vwap_slope: float | None = (
             float((state.vwap - state.prev_vwap) / state.prev_vwap * 100)
             if state.prev_vwap is not None and state.prev_vwap > _ZERO
             else None
         )
         ema_9_slope_direction = self._slope_direction(ema_9_slope, 0.005)
-        ema_20_slope_direction = self._slope_direction(ema_20_slope, 0.005)
         vwap_slope_direction = self._slope_direction(vwap_slope, 0.002)
         recent_lower_low = state.bars_since_last_lower_low <= 10
 
@@ -671,11 +693,17 @@ class FeatureEngine(BaseEngine):
             float((bar.close - bar.low) / bar_range) if bar_range > _ZERO else None
         )
         swept_below = bool(vwap > _ZERO and bar.low < vwap and bar.close >= vwap)
-        swept_orl = bool(state.orb_low is not None and bar.low < state.orb_low)
+        swept_or_low = bool(state.orb_low is not None and bar.low < state.orb_low)
         or_mid = (
             (state.orb_high + state.orb_low) / 2
             if state.orb_high and state.orb_low else None
         )
+        vwap_distance_atr = (
+            float((bar.close - vwap) / state.atr_30)
+            if state.atr_30 and state.atr_30 > _ZERO and vwap > _ZERO
+            else None
+        )
+        is_extended = abs(vwap_distance_atr) > 2.0 if vwap_distance_atr is not None else False
 
         b = Bar(
             symbol=bar.symbol,
@@ -701,15 +729,15 @@ class FeatureEngine(BaseEngine):
             vwap_deviation_pct=vwap_dev,
             cumulative_volume=state.cumulative_volume,
             relative_volume=state.relative_volume,
-            orb_high=state.orb_high,
-            orb_low=state.orb_low,
-            orb_range=(state.orb_high - state.orb_low)
+            or_high=state.orb_high,
+            or_low=state.orb_low,
+            or_range=(state.orb_high - state.orb_low)
             if state.orb_high and state.orb_low else None,
-            orb_state=orb_state,
+            or_established=or_established,
+            or_position=or_position,
             session_phase=self._calendar_for_symbol(bar.symbol).session_phase(bar.timestamp),
             bars_since_open=state.bars_since_open,
             ema_9=state.ema_9,
-            ema_20=state.ema_20,
             ema_21=state.ema_21,
             ema_50=state.ema_50,
             ema9_5m=m5.ema_9 if m5 is not None else None,
@@ -718,8 +746,6 @@ class FeatureEngine(BaseEngine):
             ema9_5m_slope_direction=self._slope_direction(m5.ema_9_slope, 0.005) if m5 is not None else None,
             ema21_5m_slope=m5.ema_21_slope if m5 is not None else None,
             ema21_5m_slope_direction=self._slope_direction(m5.ema_21_slope, 0.005) if m5 is not None else None,
-            is_bull_stack_5m=self._is_bull_stack_5m(m5) if m5 is not None else None,
-            is_bear_stack_5m=self._is_bear_stack_5m(m5) if m5 is not None else None,
             ema9_1h=h1.ema_9 if h1 is not None else None,
             ema21_1h=h1.ema_21 if h1 is not None else None,
             ema50_1h=h1.ema_50 if h1 is not None else None,
@@ -730,14 +756,10 @@ class FeatureEngine(BaseEngine):
             ema21_1h_slope_direction=self._slope_direction(h1.ema_21_slope, 0.005) if h1 is not None else None,
             ema50_1h_slope=h1.ema_50_slope if h1 is not None else None,
             ema50_1h_slope_direction=self._slope_direction(h1.ema_50_slope, 0.005) if h1 is not None else None,
-            is_bull_stack_1h=self._is_bull_stack_1h(h1) if h1 is not None else None,
-            is_bear_stack_1h=self._is_bear_stack_1h(h1) if h1 is not None else None,
             ema10_1d=self._d1_ema[bar.symbol].ema_10 if bar.symbol in self._d1_ema else None,
             ema20_1d=self._d1_ema[bar.symbol].ema_20 if bar.symbol in self._d1_ema else None,
             ema_9_slope=ema_9_slope,
             ema_9_slope_direction=ema_9_slope_direction,
-            ema_20_slope=ema_20_slope,
-            ema_20_slope_direction=ema_20_slope_direction,
             vwap_slope=vwap_slope,
             vwap_slope_direction=vwap_slope_direction,
             atr_14=atr,
@@ -746,8 +768,8 @@ class FeatureEngine(BaseEngine):
             bid_ask_spread=spread,
             bid_ask_spread_pct=spread_pct,
             is_above_vwap=bar.close >= vwap,
-            is_above_ema20=bar.close >= state.ema_20 if state.ema_20 else None,
-            is_extended=abs(vwap_dev) > 2.0 if vwap else False,
+            is_extended=is_extended,
+            vwap_distance_atr=vwap_distance_atr,
             bars_above_vwap=state.bars_above_vwap,
             bars_below_vwap=state.bars_below_vwap,
             vwap_cross_up=state.vwap_cross_up,
@@ -767,10 +789,7 @@ class FeatureEngine(BaseEngine):
             recent_lower_low=recent_lower_low,
             or_mid=or_mid,
             swept_below_vwap=swept_below,
-            swept_orl=swept_orl,
-            vwap_touch_count=state.vwap_touch_count,
-            last_vwap_outcome=state.last_vwap_outcome,
-            bars_since_last_vwap_touch=state.bars_since_last_vwap_touch,
+            swept_or_low=swept_or_low,
             atr_30=state.atr_30,
             ema_9_slope_accel=state.ema_9_slope_accel,
             rth_median_1m_range=state.rth_median_1m_range,
@@ -876,16 +895,6 @@ class FeatureEngine(BaseEngine):
         if not (state.ema_9 < state.ema_21 < state.ema_50):
             return False
         return state.sma_200 is None or state.ema_50 < state.sma_200
-
-    @staticmethod
-    def _orb_state(state: SymbolFeatureState, bar: BarEvent) -> ORBState:
-        if not state.orb_established or state.orb_high is None or state.orb_low is None:
-            return ORBState.NOT_SET
-        if bar.close > state.orb_high:
-            return ORBState.BREAKOUT_UP
-        if bar.close < state.orb_low:
-            return ORBState.BREAKOUT_DOWN
-        return ORBState.INSIDE
 
     def _calendar_for_symbol(self, ticker: str) -> SessionCalendar:
         return self._symbol_calendars.get(ticker, self._calendar)

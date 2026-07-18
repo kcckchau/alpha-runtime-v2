@@ -255,11 +255,11 @@ class LevelObserver:
         ):
             levels.append((ReferenceLevelType.RTH_VWAP, rth_vwap, True))
 
-        if snap.orb_high is not None:
-            levels.append((ReferenceLevelType.ORH, snap.orb_high, False))
+        if snap.or_high is not None:
+            levels.append((ReferenceLevelType.ORH, snap.or_high, False))
 
-        if snap.orb_low is not None:
-            levels.append((ReferenceLevelType.ORL, snap.orb_low, False))
+        if snap.or_low is not None:
+            levels.append((ReferenceLevelType.ORL, snap.or_low, False))
 
         bar = snap.bar
         for level_type, level_value, is_vwap in levels:
@@ -290,7 +290,7 @@ class LevelObserver:
                 volatility_definition_version="atr14_m1_v1",
                 tick_size=tick_size,
                 session_phase=str(snap.session_phase),
-                orb_state=str(snap.orb_state),
+                orb_state="established" if snap.or_established else "not_set",
                 schema_version="lbo_v1",
                 producer_version=self._producer_version,
                 data_quality=data_quality,
