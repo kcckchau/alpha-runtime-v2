@@ -63,16 +63,97 @@ class BarSnapshot(BaseModel):
 
     # ── Trend indicators — 1h (carry-forward: updated on each H1 bar) ────────
     # SMA200 requires 200 H1 bars (~8.5 trading days); will be None until warm.
+    # All fields below reflect the last sealed H1 bar and are carried forward unchanged
+    # until the next H1 bar seals. The H1 bar that coincides with the current M1
+    # timestamp may not yet be reflected — see htf_1h_watermark.
     ema9_1h: Decimal | None = None            # 1h EMA9
     ema21_1h: Decimal | None = None           # 1h EMA21
     ema50_1h: Decimal | None = None           # 1h EMA50
     sma200_1h: Decimal | None = None          # 1h SMA200
-    ema9_1h_slope: float | None = None        # % rate-of-change of 1h EMA9 vs prior 1h bar
-    ema9_1h_slope_direction: str | None = None
-    ema21_1h_slope: float | None = None       # % rate-of-change of 1h EMA21 vs prior 1h bar
+
+    # 1H ATR normalizer (computed from sealed 1H true ranges, independent of M1 ATR)
+    atr30_1h: Decimal | None = None           # None until atr30_1h_samples >= ATR30_1H_MIN_SAMPLES
+    atr30_1h_samples: int = 0                 # true-range samples accumulated
+
+    # 1H norm3 slopes: (ema[t] - ema[t-3]) / (3 * atr30_1h); units: ATR/1H-bar
+    # Policy: EMA_1H_SLOPE_POLICY_VERSION = "ema_1h_norm3_v1"; UNCALIBRATED thresholds.
+    # None until 4 EMA history values AND atr30_1h is warm.
+    ema9_1h_slope_norm_3: float | None = None
+    ema9_1h_slope_direction: str | None = None   # "up" / "flat" / "down" (SLOPE_FLAT_THRESHOLD_1H)
+    ema21_1h_slope_norm_3: float | None = None
     ema21_1h_slope_direction: str | None = None
-    ema50_1h_slope: float | None = None       # % rate-of-change of 1h EMA50 vs prior 1h bar
+    ema50_1h_slope_norm_3: float | None = None
     ema50_1h_slope_direction: str | None = None
+
+    # ── 1H EMA ribbon geometry ────────────────────────────────────────────────
+    # Active ribbon = EMA9 + EMA21 + EMA50 only. SMA200 is a separate structural anchor.
+    # Policy: EMA_1H_RIBBON_POLICY_VERSION = "ema_1h_ribbon_v1"
+    # All ribbon fields are None until all three EMAs and atr30_1h are warm.
+    ema_ribbon_low_1h: Decimal | None = None       # min(ema9, ema21, ema50)
+    ema_ribbon_high_1h: Decimal | None = None      # max(ema9, ema21, ema50)
+    ema_ribbon_center_1h: Decimal | None = None    # mean(ema9, ema21, ema50)
+    ema_ribbon_width_1h_atr: float | None = None   # (ribbon_high - ribbon_low) / atr30_1h
+
+    # Signed pairwise EMA distances in ATR units (fast - slow) / atr30_1h
+    # Positive = fast above slow (bullish ordering). Negative = fast below slow.
+    ema9_21_distance_1h_atr: float | None = None
+    ema21_50_distance_1h_atr: float | None = None
+    ema9_50_distance_1h_atr: float | None = None
+
+    # ── 1H stack and slope alignment ──────────────────────────────────────────
+    # Stack = price ordering of EMA values (structure).
+    # Alignment = direction of slopes (momentum). These are independent dimensions.
+    ema_stack_direction_1h: str | None = None   # "bullish" (9>21>50) | "bearish" (9<21<50) | "mixed"
+    ema_slope_alignment_1h: str | None = None   # "bullish" (all up) | "bearish" (all down) | "flat" | "mixed"
+
+    # ── H1-sealed price location vs ribbon ────────────────────────────────────
+    # Computed from the H1 sealed bar's close. Updated only on H1 bar events.
+    # These fields exclusively feed rolling history, persistence, and cross counts.
+    h1_close_location_vs_ema_ribbon_1h: str | None = None      # "above" | "inside" | "below"
+    h1_close_to_ema_ribbon_1h_atr: float | None = None         # 0.0 if inside; signed dist to nearest edge
+    h1_close_to_ema_ribbon_center_1h_atr: float | None = None  # (h1_close - ribbon_center) / atr30_1h
+
+    # ── M1-close live location vs carry-forward ribbon ────────────────────────
+    # Recomputed on every M1 snapshot from current bar's close vs last sealed H1 ribbon.
+    # Must NOT be appended to sealed-H1 rolling history.
+    m1_close_location_vs_ema_ribbon_1h: str | None = None
+    m1_close_to_ema_ribbon_1h_atr: float | None = None
+    m1_close_to_ema_ribbon_center_1h_atr: float | None = None
+
+    # ── SMA200 structural context (separate from ribbon) ──────────────────────
+    ema_ribbon_center_to_sma200_1h_atr: float | None = None    # (ribbon_center - sma200) / atr30_1h
+    price_to_sma200_1h_atr: float | None = None                # (m1_close - sma200) / atr30_1h
+
+    # ── Rolling ribbon history (sealed H1 bars only) ──────────────────────────
+    # Based on h1_close_location and ribbon width at H1 seal time. Point-in-time safe:
+    # percentile and slopes exclude the current bar.
+    ema_ribbon_width_percentile_60h: float | None = None   # percentile rank in 60-bar rolling window
+    ema_ribbon_width_slope_3h: float | None = None         # (width[t] - width[t-3]) / 3
+    ema_ribbon_width_slope_6h: float | None = None         # (width[t] - width[t-6]) / 6
+    ema_bullish_stack_persistence_1h_bars: int = 0         # consecutive H1 bars with bullish stack
+    ema_bearish_stack_persistence_1h_bars: int = 0
+    price_inside_ribbon_persistence_1h_bars: int = 0       # consecutive H1 bars with h1_close inside ribbon
+
+    # Cross / transition counts (sealed H1 bars, last 6 sealed bars = indices [t-6..t-1])
+    # transition_count: any state change among ABOVE / INSIDE / BELOW
+    # full_cross_count: complete ABOVE ↔ BELOW change (may pass through INSIDE)
+    price_ribbon_location_transition_count_6h: int = 0
+    price_ribbon_full_cross_count_6h: int = 0
+
+    # ── Ribbon width state ────────────────────────────────────────────────────
+    # Based on rolling width percentile. Thresholds: RIBBON_COMPRESSED_PERCENTILE / EXPANDED.
+    ema_ribbon_width_state_1h: str | None = None   # "compressed" | "normal" | "expanded"
+
+    # ── Derived ribbon contexts (research-only, not wired into live setup logic) ──
+    bullish_ema_ribbon_context_1h: bool = False
+    bearish_ema_ribbon_context_1h: bool = False
+    chop_ema_ribbon_context_1h: bool = False
+
+    # ── H1 watermark ─────────────────────────────────────────────────────────
+    # Timestamp of the last sealed H1 bar reflected in this snapshot.
+    # The H1 bar whose timestamp equals the current M1 bar may NOT be reflected
+    # (event ordering at the hourly boundary is not guaranteed in live mode).
+    htf_1h_watermark: datetime | None = None
 
     # ── Trend indicators — 1D (carry-forward: updated on each D1 bar) ────────
     ema10_1d: Decimal | None = None           # 1d EMA10
