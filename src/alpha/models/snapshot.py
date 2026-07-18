@@ -18,6 +18,8 @@ class BarSnapshot(BaseModel):
 
     # ── VWAP ────────────────────────────────────────────────────────────────
     vwap: Decimal
+    full_session_vwap: Decimal | None = None   # resets at CME session boundary (18:00 ET prior day)
+    rth_vwap: Decimal | None = None            # resets at RTH open (09:30 ET); None before first RTH bar
     vwap_upper_band: Decimal | None = None      # +1 std dev
     vwap_lower_band: Decimal | None = None      # -1 std dev
     vwap_deviation_pct: float = 0.0             # (close - vwap) / vwap * 100

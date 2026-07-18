@@ -40,10 +40,26 @@ export type EmaConfig = {
   color: string;
 };
 
+/**
+ * Arbitrary pre-computed line series, keyed by `id` so callers can add/remove/
+ * update lines declaratively (same reconciliation pattern as `emas`). Unlike
+ * `emas`, values are supplied ready-made — no running EMA/VWAP state is
+ * derived from `bars`. Used by the research chart for RTH VWAP and dynamic
+ * proximity bands, which don't fit the live-VWAP/EMA incremental-update model.
+ */
+export type ExtraLineSeries = {
+  id: string;
+  color: string;
+  lineWidth?: number;
+  lineStyle?: number;
+  data: LineData<Time>[];
+};
+
 type CandlesChartProps = {
   bars: BarRow[];
   overlays: OverlayLine[];
   emas?: EmaConfig[];
+  extraLines?: ExtraLineSeries[];
   markers?: SeriesMarker<Time>[];
   viewportKey?: string;
   onMarkerClick?: (setupId: string) => void;
@@ -83,7 +99,12 @@ const _etFmt = new Intl.DateTimeFormat("en-US", {
   hour12: false,
 });
 
-function toETEpoch(timestamp: string): number {
+/** Convert an absolute ISO timestamp to the chart's ET wall-clock epoch.
+ *
+ * lightweight-charts has no timezone support, so all series that share this
+ * chart must use this same conversion—not raw Unix time.
+ */
+export function toETEpoch(timestamp: string): number {
   const raw = new Date(timestamp).getTime();
   const parts = _etFmt.formatToParts(new Date(raw));
   const g = (t: string) => parts.find((p) => p.type === t)?.value ?? "00";
@@ -221,7 +242,12 @@ function buildVwapData(bars: BarRow[], cache: Map<string, number>, is24h: boolea
     cumTPV += typical * vol;
     cumVol += vol;
     prevTime = t;
-    data.push({ time: t as Time, value: cumVol > 0 ? cumTPV / cumVol : Number(b.close) });
+    // Bars with no volume (e.g. research replay, which has no volume field at
+    // all — see LevelBarObservation) can't drive the running weighted-average
+    // computation below. Fall back to the backend-recorded vwap for that bar
+    // rather than silently tracing `close` (cumVol stays 0 forever otherwise).
+    const fallback = b.vwap != null ? Number(b.vwap) : Number(b.close);
+    data.push({ time: t as Time, value: cumVol > 0 ? cumTPV / cumVol : fallback });
   }
 
   return {
@@ -285,8 +311,9 @@ function vwapPointFromState(
   const vol = Number(bar.volume ?? 0);
   cumTPV += typical * vol;
   cumVol += vol;
+  const fallback = bar.vwap != null ? Number(bar.vwap) : Number(bar.close);
   return {
-    value: cumVol > 0 ? cumTPV / cumVol : Number(bar.close),
+    value: cumVol > 0 ? cumTPV / cumVol : fallback,
     nextState: { cumTPV, cumVol, prevTime: t, session: cmeSessionId(t) },
   };
 }
@@ -340,6 +367,7 @@ export function CandlesChart({
   bars,
   overlays,
   emas = [],
+  extraLines = [],
   markers = [],
   viewportKey,
   onMarkerClick,
@@ -356,6 +384,7 @@ export function CandlesChart({
   const candleRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const vwapRef = useRef<ISeriesApi<"Line"> | null>(null);
   const emaSeriesRef = useRef<Map<number, ISeriesApi<"Line">>>(new Map());
+  const extraLineSeriesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
   const markerApiRef = useRef<ReturnType<typeof createSeriesMarkers<Time>> | null>(null);
   const lastViewportKeyRef = useRef<string | undefined>(undefined);
 
@@ -495,6 +524,7 @@ export function CandlesChart({
       volRef.current = null;
       markerApiRef.current = null;
       emaSeriesRef.current.clear();
+      extraLineSeriesRef.current.clear();
       bandPrevDayRef.current = null;
       bandPreRef.current = null;
       bandRegRef.current = null;
@@ -676,6 +706,45 @@ export function CandlesChart({
 
     prevBarsRef.current = bars;
   }, [bars, emas, viewportKey, is24h, prevDayDate, sessionStartEpoch]);
+
+  // Extra line series effect (RTH VWAP, proximity bands, …) — reconciled independently
+  // of the bar-data effect above so toggling/changing `extraLines` alone (e.g. a UI
+  // checkbox) always takes effect, even when `bars` itself hasn't changed and the bar
+  // effect would otherwise treat the render as a no-op "live update" tick.
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+
+    const wanted = new Set(extraLines.map((l) => l.id));
+    for (const [id, series] of extraLineSeriesRef.current) {
+      if (!wanted.has(id)) {
+        chart.removeSeries(series);
+        extraLineSeriesRef.current.delete(id);
+      }
+    }
+    for (const line of extraLines) {
+      let series = extraLineSeriesRef.current.get(line.id);
+      if (!series) {
+        series = chart.addSeries(LineSeries, {
+          color: line.color,
+          lineWidth: (line.lineWidth ?? 1) as 1 | 2 | 3 | 4,
+          lineStyle: line.lineStyle ?? LineStyle.Solid,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+          title: "",
+        });
+        extraLineSeriesRef.current.set(line.id, series);
+      } else {
+        series.applyOptions({
+          color: line.color,
+          lineWidth: (line.lineWidth ?? 1) as 1 | 2 | 3 | 4,
+          lineStyle: line.lineStyle ?? LineStyle.Solid,
+        });
+      }
+      series.setData(line.data);
+    }
+  }, [extraLines]);
 
   // Overlay / marker effect — price lines and markers update independently of bar data
   useEffect(() => {

@@ -74,6 +74,8 @@ def wire_all(engine: "BootstrapEngine") -> None:
     engine._position_monitor = wire_position_monitor(engine)
     wire_notifications(engine)
     wire_execution(engine)
+    wire_level_observer(engine)
+    wire_interaction_engine(engine)
 
     engine._engines = [
         engine._storage,
@@ -237,6 +239,109 @@ def wire_notifications(engine: "BootstrapEngine") -> None:
     engine._telegram_notifier = TelegramNotifier(
         engine._settings.telegram, engine._event_bus
     )
+
+
+def _clear_research_partitions_for_today(research_root: "Path", engine: "BootstrapEngine") -> None:
+    """Clear today's research partitions for all registered symbols before wiring.
+
+    Called once at startup so that each backend run writes a clean, single-run_id
+    partition for the current session. Without this, every restart appends a new
+    run_id file to the same session_date directory, producing duplicate rows.
+
+    Only clears the current session date (determined per-symbol via the calendar).
+    Historical dates (replayed via research_replay.py) are left untouched.
+    """
+    import shutil
+    from datetime import datetime, timezone
+    from alpha.calendar.resolver import calendar_for_symbol
+
+    now_utc = datetime.now(tz=timezone.utc)
+
+    tables = [
+        research_root / "level_observations",
+        research_root / "interaction" / "episodes",
+        research_root / "interaction" / "episode_bars",
+    ]
+
+    cleared: list[str] = []
+    for sym in engine._registry.all():
+        try:
+            cal = calendar_for_symbol(sym)
+            session_date = cal.session_date(now_utc).isoformat()
+        except Exception:
+            session_date = now_utc.date().isoformat()  # fallback
+
+        for table in tables:
+            part_dir = table / sym.ticker / f"session_date={session_date}"
+            if part_dir.exists():
+                shutil.rmtree(part_dir)
+                cleared.append(str(part_dir))
+
+    if cleared:
+        for p in cleared:
+            logger.info("Cleared stale research partition: %s", p)
+    else:
+        logger.info("No stale research partitions to clear for today's session.")
+
+
+def wire_level_observer(engine: "BootstrapEngine") -> None:
+    """Wire the Phase 0 shadow LevelObserver.
+
+    The observer subscribes to PIPELINE_OUTPUT with drop_if_full=True so it
+    never back-pressures the main pipeline. It is not added to engine._engines
+    — it has no BaseEngine lifecycle and is flushed directly in _on_stop.
+    """
+    from pathlib import Path
+    from alpha.models.enums import RuntimeMode
+    from alpha.research.level_observer import LevelObserver, RunMode
+    from alpha.research.parquet_writer import LevelObservationWriter
+
+    mode = engine._settings.runtime.mode
+    if mode == RuntimeMode.LIVE or mode == RuntimeMode.PAPER:
+        run_mode = RunMode.LIVE
+    elif mode == RuntimeMode.REPLAY:
+        run_mode = RunMode.REPLAY
+    else:
+        run_mode = RunMode.BACKFILL
+
+    research_root = Path(engine._settings.storage.parquet_root).parent / "research"
+    _clear_research_partitions_for_today(research_root, engine)
+    writer = LevelObservationWriter(research_root=research_root)
+
+    from alpha.engines.live.monitor import IngestionMonitor
+    ingestion_monitor = (
+        engine._ingestion_monitor
+        if isinstance(engine._ingestion_monitor, IngestionMonitor)
+        else None
+    )
+
+    observer = LevelObserver(
+        event_bus=engine._event_bus,
+        registry=engine._registry,
+        writer=writer,
+        run_mode=run_mode,
+        ingestion_monitor=ingestion_monitor,
+    )
+    observer.attach()
+    engine._level_observer = observer
+    logger.info("LevelObserver wired (shadow research pipeline, Phase 0)")
+
+
+def wire_interaction_engine(engine: "BootstrapEngine") -> None:
+    """Wire Phase 1 Level Interaction Engine as shadow research subscriber."""
+    from pathlib import Path
+    from alpha.research.interaction.engine import LevelInteractionEngine
+
+    research_root = Path(engine._settings.storage.parquet_root).parent / "research"
+    # Partitions already cleared by wire_level_observer (called first).
+    interaction_engine = LevelInteractionEngine(
+        event_bus=engine._event_bus,
+        registry=engine._registry,
+        research_root=research_root,
+    )
+    interaction_engine.attach()
+    engine._interaction_engine = interaction_engine
+    logger.info("LevelInteractionEngine wired (shadow research, Phase 1)")
 
 
 def wire_execution(engine: "BootstrapEngine") -> None:

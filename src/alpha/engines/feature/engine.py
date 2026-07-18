@@ -123,6 +123,10 @@ class SymbolFeatureState:
         # RTH-specific low — resets at RTH open, independent of Globex low
         self.rth_intraday_low: Decimal | None = None
         self.is_new_rth_lod: bool = False
+        # RTH VWAP — resets at 09:30 ET (RTH open), accumulates only cash-session bars
+        self.rth_vwap_num: Decimal = _ZERO
+        self.rth_vwap_vol: int = 0
+        self.rth_session_active: bool = False
 
     def reset_session(self) -> None:
         self.bars_since_open = 0
@@ -171,12 +175,21 @@ class SymbolFeatureState:
         self.rth_p90_1m_range = None
         self.rth_intraday_low = None
         self.is_new_rth_lod = False
+        self.rth_vwap_num = _ZERO
+        self.rth_vwap_vol = 0
+        self.rth_session_active = False
 
     @property
     def vwap(self) -> Decimal:
         if self.cumulative_volume == 0:
             return _ZERO
         return self.cumulative_vwap_num / Decimal(self.cumulative_volume)
+
+    @property
+    def rth_vwap(self) -> Decimal | None:
+        if not self.rth_session_active or self.rth_vwap_vol == 0:
+            return None
+        return self.rth_vwap_num / Decimal(self.rth_vwap_vol)
 
 
 class _HTFEMAState:
@@ -423,6 +436,13 @@ class FeatureEngine(BaseEngine):
 
             # ORB and bars_since_open are cash-session concepts — RTH only.
             if is_rth:
+                # RTH VWAP: accumulate only cash-session bars; activates on first RTH bar
+                if not state.rth_session_active:
+                    state.rth_session_active = True
+                rth_typical = (bar.high + bar.low + bar.close) / 3
+                state.rth_vwap_num += rth_typical * bar.volume
+                state.rth_vwap_vol += bar.volume
+
                 state.bars_since_open += 1
                 orb_end = calendar.opening_range_end(session_date, state.orb_minutes)
                 if not state.orb_established and bar.timestamp < orb_end:
@@ -676,6 +696,8 @@ class FeatureEngine(BaseEngine):
             timeframe=bar.timeframe,
             bar=b,
             vwap=vwap,
+            full_session_vwap=vwap if vwap > _ZERO else None,
+            rth_vwap=state.rth_vwap,
             vwap_deviation_pct=vwap_dev,
             cumulative_volume=state.cumulative_volume,
             relative_volume=state.relative_volume,
