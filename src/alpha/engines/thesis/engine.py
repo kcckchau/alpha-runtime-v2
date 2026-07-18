@@ -333,7 +333,6 @@ class ThesisEngine(BaseEngine):
             snap.is_above_vwap
             and snap.bars_above_vwap >= 2
             and snap.is_lower_high
-            and snap.ema9_1m_slope_norm_3 is not None and snap.ema9_1m_slope_norm_3 < -0.04
             and snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.40
             and snap.vwap is not None and snap.vwap > 0
             and snap.vwap_deviation_pct <= 0.8   # within 0.8% of VWAP — not too extended
@@ -563,22 +562,9 @@ class ThesisEngine(BaseEngine):
                 delta -= 0.08
                 evidence.append(EvidenceItem(f"weak close ({cp:.0%}) despite above VWAP", positive=False, weight=0.08))
 
-        # EMA directional pressure
-        if snap.ema9_1m_slope_norm_3 is not None:
-            if snap.ema9_1m_slope_norm_3 > 0.06:
-                delta += 0.08
-                evidence.append(EvidenceItem("EMA9 turning up", positive=True, weight=0.08))
-            elif snap.ema9_1m_slope_norm_3 < -0.19:
-                delta -= 0.08
-                evidence.append(EvidenceItem("EMA9 strongly declining", positive=False, weight=0.08))
-
-        if snap.ema21_5m_slope_norm_3 is not None:
-            if snap.ema21_5m_slope_norm_3 > 0.01:
-                delta += 0.05
-                evidence.append(EvidenceItem("EMA21 flattening/rising", positive=True, weight=0.05))
-            elif snap.ema21_5m_slope_norm_3 < -0.06:
-                delta -= 0.05
-                evidence.append(EvidenceItem("EMA21 declining", positive=False, weight=0.05))
+        # EMA slope scoring — disabled pending norm3_v1 threshold calibration.
+        # Requires: slope distributions by timeframe/phase, VWAP outcome labels,
+        # forward return / MFE / MAE analysis. See feature/slope-norm3 branch.
 
         # Tick flow: did selling dry up?
         if tick.sell_tps_10s is not None and tick.session_avg_tps > 0:
@@ -664,9 +650,7 @@ class ThesisEngine(BaseEngine):
                 if snap.is_lower_high:
                     delta += 0.07
                     evidence.append(EvidenceItem("lower high forming — distribution continuing", positive=True, weight=0.07))
-                if snap.ema9_1m_slope_norm_3 is not None and snap.ema9_1m_slope_norm_3 < -0.06:
-                    delta += 0.06
-                    evidence.append(EvidenceItem("EMA9 declining toward VWAP", positive=True, weight=0.06))
+                # ema9_1m_slope_norm_3 < threshold: disabled — awaiting norm3_v1 calibration
                 if snap.bar_close_position_pct is not None and snap.bar_close_position_pct < 0.35:
                     delta += 0.05
                     evidence.append(EvidenceItem("weak close — sellers controlling the bar", positive=True, weight=0.05))
@@ -714,19 +698,9 @@ class ThesisEngine(BaseEngine):
                 delta -= 0.08
                 evidence.append(EvidenceItem(f"strong close ({cp:.0%}) — buyers present", positive=False, weight=0.08))
 
-        # EMA pressure
-        if snap.ema9_1m_slope_norm_3 is not None:
-            if snap.ema9_1m_slope_norm_3 < -0.06:
-                delta += 0.08
-                evidence.append(EvidenceItem("EMA9 sloping down", positive=True, weight=0.08))
-            elif snap.ema9_1m_slope_norm_3 > 0.19:
-                delta -= 0.08
-                evidence.append(EvidenceItem("EMA9 still rising — bearish thesis weakened", positive=False, weight=0.08))
-
-        if snap.ema21_5m_slope_norm_3 is not None:
-            if snap.ema21_5m_slope_norm_3 < -0.01:
-                delta += 0.05
-                evidence.append(EvidenceItem("EMA21 declining", positive=True, weight=0.05))
+        # EMA slope scoring — disabled pending norm3_v1 threshold calibration.
+        # Requires: slope distributions by timeframe/phase, VWAP outcome labels,
+        # forward return / MFE / MAE analysis. See feature/slope-norm3 branch.
 
         # Tick flow: buying faded?
         if tick.buy_tps_10s is not None and tick.session_avg_tps > 0:

@@ -41,6 +41,12 @@ logger = logging.getLogger(__name__)
 
 _ZERO = Decimal("0")
 
+# Minimum true-range samples before atr30_5m is considered warm and
+# ema9/21_5m_slope_norm_3 values are exposed. A single-TR estimate is
+# statistically noise; 5 samples (~25 min into session) is a pragmatic floor.
+# UNCALIBRATED — adjust after reviewing 5m TR distributions by session phase.
+ATR30_5M_MIN_SAMPLES: int = 5
+
 
 def _percentile(data: list[Decimal], pct: float) -> Decimal | None:
     """Linear-interpolation percentile over a list of Decimals.  No minimum size."""
@@ -244,7 +250,8 @@ class _HTFEMAState:
         self._track_atr30 = track_atr30
         self.prev_close: Decimal | None = None
         self.atr30_buffer: deque[Decimal] = deque(maxlen=30)
-        self.atr30: Decimal | None = None
+        self.atr30: Decimal | None = None          # None until atr30_sample_count >= ATR30_5M_MIN_SAMPLES
+        self.atr30_sample_count: int = 0           # number of true-range samples accumulated
         self.ema9_history: deque[Decimal] = deque(maxlen=4)
         self.ema21_history: deque[Decimal] = deque(maxlen=4)
         self.last_sealed_ts: datetime | None = None
@@ -776,6 +783,7 @@ class FeatureEngine(BaseEngine):
             ema9_5m=m5.ema_9 if m5 is not None else None,
             ema21_5m=m5.ema_21 if m5 is not None else None,
             atr30_5m=m5.atr30 if m5 is not None else None,
+            atr30_5m_samples=m5.atr30_sample_count if m5 is not None else 0,
             ema9_5m_slope_norm_3=ema9_5m_slope_norm_3,
             ema9_5m_slope_direction=ema9_5m_slope_direction,
             ema21_5m_slope_norm_3=ema21_5m_slope_norm_3,
@@ -890,7 +898,12 @@ class FeatureEngine(BaseEngine):
                 abs(bar.low - s.prev_close),
             )
             s.atr30_buffer.append(tr)
-            s.atr30 = sum(s.atr30_buffer) / len(s.atr30_buffer)
+            s.atr30_sample_count += 1
+            # Only expose atr30 once a minimum number of samples are available.
+            # Slopes remain None until this warms — prevents single-TR noise from
+            # flowing into strategy gates. See ATR30_5M_MIN_SAMPLES.
+            if s.atr30_sample_count >= ATR30_5M_MIN_SAMPLES:
+                s.atr30 = sum(s.atr30_buffer) / len(s.atr30_buffer)
         if s._track_atr30:
             s.prev_close = bar.close
 

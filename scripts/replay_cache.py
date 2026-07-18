@@ -410,6 +410,10 @@ class ReplayResultSaver:
                 "bar_close_position_pct": round(snap.bar_close_position_pct, 3) if snap.bar_close_position_pct is not None else None,
                 "ema9_slope_norm3": round(snap.ema9_1m_slope_norm_3, 6) if snap.ema9_1m_slope_norm_3 is not None else None,
                 "ema9_slope_direction": snap.ema9_1m_slope_direction,
+                "ema21_slope_norm3": round(snap.ema21_1m_slope_norm_3, 6) if snap.ema21_1m_slope_norm_3 is not None else None,
+                "ema9_5m_slope_norm3": round(snap.ema9_5m_slope_norm_3, 6) if snap.ema9_5m_slope_norm_3 is not None else None,
+                "ema21_5m_slope_norm3": round(snap.ema21_5m_slope_norm_3, 6) if snap.ema21_5m_slope_norm_3 is not None else None,
+                "atr30_5m_samples": snap.atr30_5m_samples,
             }
 
         # ── thesis ────────────────────────────────────────────────────────────

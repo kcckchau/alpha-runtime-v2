@@ -255,27 +255,38 @@ def test_m5_pipeline_ordering_watermark():
     assert snap.ema9_5m is not None
 
 
-def test_atr30_5m_warms_after_two_5m_bars():
+def test_atr30_5m_requires_minimum_samples():
     """
-    atr30_5m requires prev_close for the first TR computation.
-    It must be None after the first 5m bar, and defined after the second.
+    atr30_5m must be None until ATR30_5M_MIN_SAMPLES true-range samples are available.
+
+    - First 5m bar: no prev_close → no TR, atr30=None, sample_count=0
+    - Bars 2..N-1: TRs accumulate but atr30 remains None (below minimum)
+    - Bar N (MIN_SAMPLES+1 total): atr30 becomes defined
+
+    This prevents a single-TR noise estimate from flowing into 5m slope calculations.
     """
+    from alpha.engines.feature.engine import ATR30_5M_MIN_SAMPLES
+
     engine = _build_feature_engine()
-    import asyncio
 
-    # First 5m bar — no prev_close yet, so no TR, atr30_5m stays None
-    m5_ts1 = _rth_ts(0)
-    m5_bar1 = _make_bar_event("MNQ", m5_ts1, close=19000.0, timeframe_str="M5")
-    asyncio.get_event_loop().run_until_complete(engine._handle_bar(m5_bar1))
-    # In pipeline_mode this is buffered; flush manually to inspect state
-    engine._update_htf_ema(engine._m5_ema, m5_bar1, track_atr30=True)
-    m5_state1 = engine._m5_ema.get("MNQ")
-    assert m5_state1 is not None
-    assert m5_state1.atr30 is None, "atr30_5m must be None after first 5m bar (no prev_close)"
+    # Feed (ATR30_5M_MIN_SAMPLES) bars — first produces no TR (no prev_close),
+    # so we need MIN_SAMPLES+1 bars total for MIN_SAMPLES TRs.
+    for i in range(ATR30_5M_MIN_SAMPLES):
+        m5_bar = _make_bar_event("MNQ", _rth_ts(i * 5), close=19000.0 + i, timeframe_str="M5")
+        engine._update_htf_ema(engine._m5_ema, m5_bar, track_atr30=True)
 
-    # Second 5m bar — prev_close is now set, TR computed, atr30_5m populates
-    m5_ts2 = _rth_ts(5)
-    m5_bar2 = _make_bar_event("MNQ", m5_ts2, close=19010.0, timeframe_str="M5")
-    engine._update_htf_ema(engine._m5_ema, m5_bar2, track_atr30=True)
-    m5_state2 = engine._m5_ema.get("MNQ")
-    assert m5_state2.atr30 is not None, "atr30_5m must be defined after second 5m bar"
+    m5_state = engine._m5_ema.get("MNQ")
+    assert m5_state is not None
+    # Should still be None — we have MIN_SAMPLES-1 TRs (first bar had no prev_close)
+    assert m5_state.atr30 is None, (
+        f"atr30_5m must remain None until {ATR30_5M_MIN_SAMPLES} TR samples; "
+        f"got sample_count={m5_state.atr30_sample_count}"
+    )
+
+    # One more bar pushes us to MIN_SAMPLES TRs — atr30 must now be defined
+    extra_bar = _make_bar_event("MNQ", _rth_ts(ATR30_5M_MIN_SAMPLES * 5), close=19010.0, timeframe_str="M5")
+    engine._update_htf_ema(engine._m5_ema, extra_bar, track_atr30=True)
+    assert m5_state.atr30 is not None, (
+        f"atr30_5m must be defined after {ATR30_5M_MIN_SAMPLES} TR samples"
+    )
+    assert m5_state.atr30_sample_count == ATR30_5M_MIN_SAMPLES

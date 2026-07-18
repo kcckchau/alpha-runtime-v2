@@ -927,7 +927,7 @@ class SetupEngine(BaseEngine):
             return "close_not_below_ema9"
         if snap.ema_21 is not None and snap.bar.close >= snap.ema_21:
             return "close_not_below_ema20"
-        if snap.ema9_1m_slope_norm_3 is not None and snap.ema9_1m_slope_norm_3 >= 0:
+        if snap.ema9_1m_slope_direction is not None and snap.ema9_1m_slope_direction != "down":
             return "ema9_slope_not_down"
         if snap.ema9_5m is not None and snap.ema21_5m is not None and snap.ema9_5m > snap.ema21_5m:
             return "five_min_stack_still_bullish"

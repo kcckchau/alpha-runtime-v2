@@ -226,7 +226,8 @@ class TestFakeBreakdownReclaimLong:
         engine._update_fake_breakdown_long(thesis, snap, level, tick, trigger)
 
         assert thesis.confidence > confidence_before
-        assert thesis.confidence > 0.50  # should jump significantly on strong reclaim
+        # EMA slope scoring disabled (awaiting norm3_v1 calibration) — base: 0.47
+        assert thesis.confidence > 0.40  # structural + flow signals still build confidence
         pos_texts = [e.text for e in thesis.evidence if e.positive]
         assert any("reclaimed VWAP" in t for t in pos_texts)
         assert any("strong close" in t for t in pos_texts)

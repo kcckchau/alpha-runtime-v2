@@ -53,7 +53,8 @@ class BarSnapshot(BaseModel):
     # ── Trend indicators — 5m (carry-forward: updated on each M5 bar) ────────
     ema9_5m: Decimal | None = None            # 5m EMA9
     ema21_5m: Decimal | None = None           # 5m EMA21
-    atr30_5m: Decimal | None = None           # 5m ATR30; None until 2 completed 5m bars
+    atr30_5m: Decimal | None = None           # 5m ATR30; None until atr30_5m_samples >= ATR30_5M_MIN_SAMPLES
+    atr30_5m_samples: int = 0                 # true-range samples accumulated (research/audit field)
     ema9_5m_slope_norm_3: float | None = None   # (EMA9[t] - EMA9[t-3]) / (3 * atr30_5m); ATR/bar
     ema9_5m_slope_direction: str | None = None
     ema21_5m_slope_norm_3: float | None = None  # (EMA21[t] - EMA21[t-3]) / (3 * atr30_5m)
