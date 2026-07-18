@@ -126,6 +126,61 @@ class BarSnapshot(BaseModel):
     vwap_distance_atr: float | None = None   # (close - vwap) / atr_30; None until atr_30 warms
     atr_30: Decimal | None = None           # M1 30-period ATR
 
+    # ── EMA slope acceleration (norm3_v1; UNCALIBRATED) ──────────────────────
+    # slope_accel = slope_norm_3[t] - slope_norm_3[t-1]; units: ATR/bar²
+    # None until two consecutive non-None slopes are available.
+    ema9_1m_slope_accel_norm: float | None = None
+    ema21_1m_slope_accel_norm: float | None = None
+    ema9_5m_slope_accel_norm: float | None = None   # carry-forward from last sealed 5m bar
+    ema21_5m_slope_accel_norm: float | None = None
+
+    # ── EMA multi-timeframe alignment ─────────────────────────────────────────
+    # Based on raw slope sign (< 0 / > 0), not the classified direction.
+    # None-safe: flags are False when any required slope is None.
+    ema_bearish_alignment_1m: bool = False   # ema9_1m < 0 and ema21_1m < 0
+    ema_bearish_alignment_5m: bool = False   # ema9_5m < 0 and ema21_5m < 0
+    ema_bullish_alignment_1m: bool = False
+    ema_bullish_alignment_5m: bool = False
+    ema_mtf_all_bearish: bool = False        # all 4 norm3 slopes negative
+    ema_mtf_all_bullish: bool = False        # all 4 norm3 slopes positive
+
+    # ── EMA MTF directional strength ──────────────────────────────────────────
+    # Mean of all 4 slopes when fully aligned; None when not all same sign or any is None.
+    ema_mtf_bearish_strength: float | None = None   # negative mean (more negative = stronger)
+    ema_mtf_bullish_strength: float | None = None   # positive mean
+
+    # ── EMA slope dispersion ──────────────────────────────────────────────────
+    # Population std dev of the 4 norm3 slopes; None if any is None.
+    # Low = coherent directional move; high = mixed/divergent timeframe signals.
+    ema_slope_dispersion: float | None = None
+
+    # ── EMA MTF persistence ───────────────────────────────────────────────────
+    # Consecutive bars where ema_mtf_all_bearish / ema_mtf_all_bullish was True.
+    ema_bearish_persistence_bars: int = 0
+    ema_bullish_persistence_bars: int = 0
+
+    # ── VWAP approach geometry ────────────────────────────────────────────────
+    # Based on change in vwap_distance_atr (signed ATR distance) bar-over-bar.
+    vwap_approach_direction: str | None = None      # "toward" | "away" | "at" | None (first bar)
+    vwap_approach_velocity_atr: float | None = None # vwap_dist_atr[t] - vwap_dist_atr[t-1]; ATR/bar
+    vwap_approach_persistence_bars: int = 0         # consecutive "toward" bars
+
+    # ── VWAP test events ──────────────────────────────────────────────────────
+    # Fires when price approaches VWAP from one side (within VWAP_TEST_TOLERANCE_ATR).
+    # UNCALIBRATED tolerance; see ATR constant in feature engine.
+    vwap_test_from_below: bool = False              # below VWAP, within tolerance, bars_below >= 1
+    vwap_test_from_above: bool = False              # above VWAP, within tolerance, bars_above >= 1
+    bars_below_vwap_before_test: int = 0            # bars_below_vwap at time of vwap_test_from_below
+    bars_above_vwap_before_test: int = 0            # bars_above_vwap at time of vwap_test_from_above
+
+    # ── Candle geometry ───────────────────────────────────────────────────────
+    bar_body_pct: float | None = None               # |close - open| / (high - low); 0 = doji, 1 = no wicks
+    upper_wick_pct: float | None = None             # (high - max(open,close)) / (high - low)
+    lower_wick_pct: float | None = None             # (min(open,close) - low) / (high - low)
+    bar_range_atr: float | None = None              # (high - low) / atr_30; ATR multiples
+    is_inside_bar: bool = False                     # high <= prev_high and low >= prev_low
+    is_outside_bar: bool = False                    # high > prev_high and low < prev_low (engulfing range)
+
     # ── RTH candle-range distribution (so far today, RTH bars only) ───────────
     rth_median_1m_range: Decimal | None = None  # median 1m bar range this RTH session
     rth_p75_1m_range: Decimal | None = None     # 75th pct — "large but normal" candle

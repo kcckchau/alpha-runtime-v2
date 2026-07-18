@@ -16,6 +16,7 @@ No trading logic here — only pure feature computation.
 from __future__ import annotations
 
 import logging
+import math
 from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -46,6 +47,14 @@ _ZERO = Decimal("0")
 # statistically noise; 5 samples (~25 min into session) is a pragmatic floor.
 # UNCALIBRATED — adjust after reviewing 5m TR distributions by session phase.
 ATR30_5M_MIN_SAMPLES: int = 5
+
+# Distance threshold for VWAP test events: "approaching within N ATR of VWAP".
+# UNCALIBRATED — pending VWAP outcome distribution analysis.
+VWAP_TEST_TOLERANCE_ATR: float = 1.0
+
+# Distance below which vwap_approach_direction is classified as "at" rather than
+# "toward" or "away". UNCALIBRATED.
+VWAP_AT_THRESHOLD_ATR: float = 0.2
 
 
 def _percentile(data: list[Decimal], pct: float) -> Decimal | None:
@@ -104,6 +113,8 @@ class SymbolFeatureState:
         self.is_higher_high: bool = False
         self.is_lower_low: bool = False
         self.is_lower_high: bool = False
+        self.is_inside_bar: bool = False
+        self.is_outside_bar: bool = False
         self.prev_bar_high: Decimal | None = None
         self.prev_bar_low: Decimal | None = None
         self.prev_ema_9: Decimal | None = None
@@ -127,6 +138,15 @@ class SymbolFeatureState:
         # EMA history for 3-bar ATR-normalized slope (norm3_v1)
         self.ema9_1m_history: Deque[Decimal] = deque(maxlen=4)
         self.ema21_1m_history: Deque[Decimal] = deque(maxlen=4)
+        # Previous norm3 slopes — for acceleration computation
+        self.prev_ema9_1m_slope_norm_3: float | None = None
+        self.prev_ema21_1m_slope_norm_3: float | None = None
+        # MTF alignment persistence counters
+        self.ema_bearish_persistence_bars: int = 0
+        self.ema_bullish_persistence_bars: int = 0
+        # VWAP approach state
+        self.prev_vwap_distance_atr: float | None = None
+        self.vwap_approach_persistence_bars: int = 0
         # RTH candle-range distribution (reset each RTH session)
         self.rth_ranges: list[Decimal] = []
         self.rth_median_1m_range: Decimal | None = None
@@ -163,6 +183,8 @@ class SymbolFeatureState:
         self.is_higher_high = False
         self.is_lower_low = False
         self.is_lower_high = False
+        self.is_inside_bar = False
+        self.is_outside_bar = False
         self.prev_bar_high = None
         self.prev_bar_low = None
         self.prev_ema_9 = None
@@ -182,6 +204,12 @@ class SymbolFeatureState:
         self.atr_30 = None
         self.ema9_1m_history.clear()
         self.ema21_1m_history.clear()
+        self.prev_ema9_1m_slope_norm_3 = None
+        self.prev_ema21_1m_slope_norm_3 = None
+        self.ema_bearish_persistence_bars = 0
+        self.ema_bullish_persistence_bars = 0
+        self.prev_vwap_distance_atr = None
+        self.vwap_approach_persistence_bars = 0
         self.rth_ranges = []
         self.rth_median_1m_range = None
         self.rth_p75_1m_range = None
@@ -255,6 +283,11 @@ class _HTFEMAState:
         self.ema9_history: deque[Decimal] = deque(maxlen=4)
         self.ema21_history: deque[Decimal] = deque(maxlen=4)
         self.last_sealed_ts: datetime | None = None
+        # Previous norm3 slopes for acceleration carry-forward
+        self.prev_ema9_slope_norm_3: float | None = None
+        self.prev_ema21_slope_norm_3: float | None = None
+        self.ema9_slope_accel: float | None = None   # carry-forward from last sealed bar
+        self.ema21_slope_accel: float | None = None
 
 
 class FeatureEngine(BaseEngine):
@@ -618,6 +651,18 @@ class FeatureEngine(BaseEngine):
             state.is_lower_high = (
                 state.prev_bar_high is not None and bar.high < state.prev_bar_high
             )
+            state.is_inside_bar = bool(
+                state.prev_bar_high is not None
+                and state.prev_bar_low is not None
+                and bar.high <= state.prev_bar_high
+                and bar.low >= state.prev_bar_low
+            )
+            state.is_outside_bar = bool(
+                state.prev_bar_high is not None
+                and state.prev_bar_low is not None
+                and bar.high > state.prev_bar_high
+                and bar.low < state.prev_bar_low
+            )
             state.prev_bar_high = bar.high
             state.prev_bar_low = bar.low
             if state.is_lower_low:
@@ -634,6 +679,8 @@ class FeatureEngine(BaseEngine):
             state.is_higher_high = False
             state.is_lower_low = False
             state.is_lower_high = False
+            state.is_inside_bar = False
+            state.is_outside_bar = False
 
         prev_ema_9 = state.ema_9
         prev_ema_20 = state.ema_20
@@ -745,6 +792,130 @@ class FeatureEngine(BaseEngine):
         )
         is_extended = abs(vwap_distance_atr) > 2.0 if vwap_distance_atr is not None else False
 
+        # ── EMA slope acceleration ────────────────────────────────────────────
+        # 1m: current slope - previous slope; update state after computing.
+        ema9_1m_slope_accel_norm: float | None = (
+            ema9_1m_slope_norm_3 - state.prev_ema9_1m_slope_norm_3
+            if ema9_1m_slope_norm_3 is not None and state.prev_ema9_1m_slope_norm_3 is not None
+            else None
+        )
+        ema21_1m_slope_accel_norm: float | None = (
+            ema21_1m_slope_norm_3 - state.prev_ema21_1m_slope_norm_3
+            if ema21_1m_slope_norm_3 is not None and state.prev_ema21_1m_slope_norm_3 is not None
+            else None
+        )
+        state.prev_ema9_1m_slope_norm_3 = ema9_1m_slope_norm_3
+        state.prev_ema21_1m_slope_norm_3 = ema21_1m_slope_norm_3
+
+        # 5m: update prev slopes and carry-forward accel only when a new M5 bar sealed.
+        if m5 is not None and m5.last_sealed_ts == bar.timestamp:
+            if ema9_5m_slope_norm_3 is not None and m5.prev_ema9_slope_norm_3 is not None:
+                m5.ema9_slope_accel = ema9_5m_slope_norm_3 - m5.prev_ema9_slope_norm_3
+            else:
+                m5.ema9_slope_accel = None
+            if ema21_5m_slope_norm_3 is not None and m5.prev_ema21_slope_norm_3 is not None:
+                m5.ema21_slope_accel = ema21_5m_slope_norm_3 - m5.prev_ema21_slope_norm_3
+            else:
+                m5.ema21_slope_accel = None
+            m5.prev_ema9_slope_norm_3 = ema9_5m_slope_norm_3
+            m5.prev_ema21_slope_norm_3 = ema21_5m_slope_norm_3
+        ema9_5m_slope_accel_norm = m5.ema9_slope_accel if m5 is not None else None
+        ema21_5m_slope_accel_norm = m5.ema21_slope_accel if m5 is not None else None
+
+        # ── EMA MTF alignment & composite flags ───────────────────────────────
+        _s9_1m = ema9_1m_slope_norm_3
+        _s21_1m = ema21_1m_slope_norm_3
+        _s9_5m = ema9_5m_slope_norm_3
+        _s21_5m = ema21_5m_slope_norm_3
+        _all_avail = _s9_1m is not None and _s21_1m is not None and _s9_5m is not None and _s21_5m is not None
+
+        ema_bearish_alignment_1m = _s9_1m is not None and _s21_1m is not None and _s9_1m < 0 and _s21_1m < 0
+        ema_bearish_alignment_5m = _s9_5m is not None and _s21_5m is not None and _s9_5m < 0 and _s21_5m < 0
+        ema_bullish_alignment_1m = _s9_1m is not None and _s21_1m is not None and _s9_1m > 0 and _s21_1m > 0
+        ema_bullish_alignment_5m = _s9_5m is not None and _s21_5m is not None and _s9_5m > 0 and _s21_5m > 0
+
+        ema_mtf_all_bearish = _all_avail and _s9_1m < 0 and _s21_1m < 0 and _s9_5m < 0 and _s21_5m < 0  # type: ignore[operator]
+        ema_mtf_all_bullish = _all_avail and _s9_1m > 0 and _s21_1m > 0 and _s9_5m > 0 and _s21_5m > 0  # type: ignore[operator]
+
+        if ema_mtf_all_bearish:
+            ema_mtf_bearish_strength: float | None = (_s9_1m + _s21_1m + _s9_5m + _s21_5m) / 4  # type: ignore[operator]
+            ema_mtf_bullish_strength: float | None = None
+        elif ema_mtf_all_bullish:
+            ema_mtf_bearish_strength = None
+            ema_mtf_bullish_strength = (_s9_1m + _s21_1m + _s9_5m + _s21_5m) / 4  # type: ignore[operator]
+        else:
+            ema_mtf_bearish_strength = None
+            ema_mtf_bullish_strength = None
+
+        ema_slope_dispersion: float | None = None
+        if _all_avail:
+            slopes = [_s9_1m, _s21_1m, _s9_5m, _s21_5m]  # type: ignore[list-item]
+            mean = sum(slopes) / 4
+            ema_slope_dispersion = math.sqrt(sum((s - mean) ** 2 for s in slopes) / 4)
+
+        # Update persistence counters (state side-effect before snapshot construction).
+        if ema_mtf_all_bearish:
+            state.ema_bearish_persistence_bars += 1
+            state.ema_bullish_persistence_bars = 0
+        elif ema_mtf_all_bullish:
+            state.ema_bullish_persistence_bars += 1
+            state.ema_bearish_persistence_bars = 0
+        else:
+            state.ema_bearish_persistence_bars = 0
+            state.ema_bullish_persistence_bars = 0
+
+        # ── VWAP approach geometry ─────────────────────────────────────────────
+        vwap_approach_velocity_atr: float | None = None
+        vwap_approach_direction: str | None = None
+        if vwap_distance_atr is not None and state.prev_vwap_distance_atr is not None:
+            vwap_approach_velocity_atr = vwap_distance_atr - state.prev_vwap_distance_atr
+            abs_dist = abs(vwap_distance_atr)
+            if abs_dist <= VWAP_AT_THRESHOLD_ATR:
+                vwap_approach_direction = "at"
+            elif vwap_distance_atr * vwap_approach_velocity_atr < 0:
+                # opposite signs → moving toward zero (approaching VWAP)
+                vwap_approach_direction = "toward"
+            else:
+                vwap_approach_direction = "away"
+        state.prev_vwap_distance_atr = vwap_distance_atr
+
+        if vwap_approach_direction == "toward":
+            state.vwap_approach_persistence_bars += 1
+        else:
+            state.vwap_approach_persistence_bars = 0
+
+        is_above = bar.close >= vwap
+        vwap_test_from_below = bool(
+            vwap_distance_atr is not None
+            and not is_above
+            and abs(vwap_distance_atr) <= VWAP_TEST_TOLERANCE_ATR
+            and state.bars_below_vwap >= 1
+        )
+        vwap_test_from_above = bool(
+            vwap_distance_atr is not None
+            and is_above
+            and abs(vwap_distance_atr) <= VWAP_TEST_TOLERANCE_ATR
+            and state.bars_above_vwap >= 1
+        )
+
+        # ── Candle geometry ────────────────────────────────────────────────────
+        bar_body_pct: float | None = None
+        upper_wick_pct: float | None = None
+        lower_wick_pct: float | None = None
+        bar_range_atr: float | None = None
+        if bar_range > _ZERO:
+            bar_range_f = float(bar_range)
+            body = abs(float(bar.close - bar.open))
+            bar_body_pct = body / bar_range_f
+            upper_wick_pct = float(bar.high - max(bar.open, bar.close)) / bar_range_f
+            lower_wick_pct = float(min(bar.open, bar.close) - bar.low) / bar_range_f
+        if state.atr_30 is not None and state.atr_30 > _ZERO:
+            bar_range_atr = float(bar_range) / float(state.atr_30)
+
+        # is_inside_bar / is_outside_bar computed in _update_state before prev_bar_high/low update
+        is_inside_bar = state.is_inside_bar
+        is_outside_bar = state.is_outside_bar
+
         b = Bar(
             symbol=bar.symbol,
             timeframe=bar.timeframe,
@@ -836,6 +1007,34 @@ class FeatureEngine(BaseEngine):
             swept_below_vwap=swept_below,
             swept_or_low=swept_or_low,
             atr_30=state.atr_30,
+            ema9_1m_slope_accel_norm=ema9_1m_slope_accel_norm,
+            ema21_1m_slope_accel_norm=ema21_1m_slope_accel_norm,
+            ema9_5m_slope_accel_norm=ema9_5m_slope_accel_norm,
+            ema21_5m_slope_accel_norm=ema21_5m_slope_accel_norm,
+            ema_bearish_alignment_1m=ema_bearish_alignment_1m,
+            ema_bearish_alignment_5m=ema_bearish_alignment_5m,
+            ema_bullish_alignment_1m=ema_bullish_alignment_1m,
+            ema_bullish_alignment_5m=ema_bullish_alignment_5m,
+            ema_mtf_all_bearish=ema_mtf_all_bearish,
+            ema_mtf_all_bullish=ema_mtf_all_bullish,
+            ema_mtf_bearish_strength=ema_mtf_bearish_strength,
+            ema_mtf_bullish_strength=ema_mtf_bullish_strength,
+            ema_slope_dispersion=ema_slope_dispersion,
+            ema_bearish_persistence_bars=state.ema_bearish_persistence_bars,
+            ema_bullish_persistence_bars=state.ema_bullish_persistence_bars,
+            vwap_approach_direction=vwap_approach_direction,
+            vwap_approach_velocity_atr=vwap_approach_velocity_atr,
+            vwap_approach_persistence_bars=state.vwap_approach_persistence_bars,
+            vwap_test_from_below=vwap_test_from_below,
+            vwap_test_from_above=vwap_test_from_above,
+            bars_below_vwap_before_test=state.bars_below_vwap if vwap_test_from_below else 0,
+            bars_above_vwap_before_test=state.bars_above_vwap if vwap_test_from_above else 0,
+            bar_body_pct=bar_body_pct,
+            upper_wick_pct=upper_wick_pct,
+            lower_wick_pct=lower_wick_pct,
+            bar_range_atr=bar_range_atr,
+            is_inside_bar=is_inside_bar,
+            is_outside_bar=is_outside_bar,
             rth_median_1m_range=state.rth_median_1m_range,
             rth_p75_1m_range=state.rth_p75_1m_range,
             rth_p90_1m_range=state.rth_p90_1m_range,
