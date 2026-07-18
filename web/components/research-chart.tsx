@@ -136,6 +136,22 @@ function toEpoch(iso: string): number {
   return toETEpoch(iso);
 }
 
+function cmeSessionStartEpoch(sessionDate: string): number {
+  // CandlesChart's time axis uses ET wall-clock timestamps re-expressed as UTC.
+  // A CME session labelled YYYY-MM-DD begins at 18:00 ET on the prior date.
+  const day = new Date(`${sessionDate}T00:00:00Z`);
+  day.setUTCDate(day.getUTCDate() - 1);
+  return Math.floor(
+    Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), 18, 0, 0) / 1000,
+  );
+}
+
+function priorCalendarDate(date: string): string {
+  const day = new Date(`${date}T00:00:00Z`);
+  day.setUTCDate(day.getUTCDate() - 1);
+  return day.toISOString().slice(0, 10);
+}
+
 // Text is deliberately terse — "V9" not "VWAP (full session) #9 open" — because
 // with 4 levels × open+close markers, episodes cluster tightly in time whenever
 // price sits near multiple levels at once (see e.g. the opening range, where
@@ -218,7 +234,8 @@ function buildRthVwapLine(bars: ResearchBar[]): ExtraLineSeries {
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function ResearchChart() {
-  const [symbol, setSymbol] = useState("MNQ");
+  const [symbol, setSymbol] = useState("");
+  const [symbols, setSymbols] = useState<string[]>([]);
   const [dates, setDates] = useState<string[]>([]);
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
   const [payload, setPayload] = useState<ChartPayload | null>(null);
@@ -228,8 +245,31 @@ export function ResearchChart() {
   const [showRthVwap, setShowRthVwap] = useState(true);
   const [showBands, setShowBands] = useState(false);
 
-  // Load available session dates whenever the symbol changes
+  // Discover symbols from research storage rather than duplicating a
+  // hard-coded contract list in the UI. Prefer the currently-active MNQ
+  // contract when present, otherwise select the first available symbol.
   useEffect(() => {
+    let cancelled = false;
+    fetchJson<{ symbols: string[] }>("/research/symbols")
+      .then((res) => {
+        if (cancelled) return;
+        setSymbols(res.symbols);
+        setSymbol(res.symbols.includes("MNQ-09") ? "MNQ-09" : (res.symbols[0] ?? ""));
+        setError(null);
+      })
+      .catch((e) => !cancelled && setError(String(e)));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Load available session dates whenever the symbol changes.
+  useEffect(() => {
+    if (!symbol) {
+      setDates([]);
+      setSelectedDate(null);
+      return;
+    }
     let cancelled = false;
     fetchJson<{ symbol: string; dates: string[] }>(`/research/sessions?symbol=${symbol}`)
       .then((res) => {
@@ -246,7 +286,7 @@ export function ResearchChart() {
 
   // Load chart payload whenever the selected date changes
   useEffect(() => {
-    if (!selectedDate) return;
+    if (!symbol || !selectedDate) return;
     let cancelled = false;
     setLoading(true);
     setSelectedEpisodeId(null);
@@ -322,8 +362,10 @@ export function ResearchChart() {
           onChange={(e) => setSymbol(e.target.value)}
           style={selectStyle}
         >
-          <option value="MNQ">MNQ</option>
-          <option value="MNQ-09">MNQ-09</option>
+          {symbols.length === 0 && <option value="">no research symbols</option>}
+          {symbols.map((availableSymbol) => (
+            <option key={availableSymbol} value={availableSymbol}>{availableSymbol}</option>
+          ))}
         </select>
         <select
           value={selectedDate ?? ""}
@@ -370,6 +412,8 @@ export function ResearchChart() {
               viewportKey={`${payload.symbol}:${payload.session_date}`}
               onMarkerClick={(id) => setSelectedEpisodeId(id)}
               is24h
+              prevDayDate={priorCalendarDate(payload.session_date)}
+              sessionStartEpoch={cmeSessionStartEpoch(payload.session_date)}
             />
           </div>
 

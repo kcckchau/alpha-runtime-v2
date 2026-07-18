@@ -15,7 +15,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 
 from alpha.config.loader import get_settings
-from alpha.research.query import build_chart_payload, list_session_dates
+from alpha.research.query import build_chart_payload, list_session_dates, list_symbols
 
 router = APIRouter(prefix="/research", tags=["research"])
 
@@ -23,6 +23,14 @@ router = APIRouter(prefix="/research", tags=["research"])
 def _research_root() -> Path:
     settings = get_settings()
     return Path(settings.storage.parquet_root).parent / "research"
+
+
+@router.get("/symbols")
+async def get_symbols() -> dict:
+    """List symbols that have recorded research data."""
+    loop = asyncio.get_running_loop()
+    symbols = await loop.run_in_executor(None, list_symbols, _research_root())
+    return {"symbols": symbols}
 
 
 @router.get("/sessions")

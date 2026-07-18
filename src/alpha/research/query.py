@@ -44,6 +44,14 @@ def _read_partition_dir(part_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def list_symbols(research_root: Path, dataset: str = "level_observations") -> list[str]:
+    """Return symbols with recorded research observations."""
+    base = research_root / dataset
+    if not base.exists():
+        return []
+    return sorted(child.name for child in base.iterdir() if child.is_dir())
+
+
 def list_session_dates(research_root: Path, symbol: str, dataset: str = "level_observations") -> list[str]:
     """Return sorted session_date strings available for a symbol under a dataset.
 
