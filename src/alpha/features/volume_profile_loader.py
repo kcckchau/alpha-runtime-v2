@@ -90,4 +90,5 @@ class VolumeProfileLoader:
         data["val"] = Decimal(data["val"])
         data["hvn_levels"] = [Decimal(x) for x in data["hvn_levels"]]
         data["lvn_levels"] = [Decimal(x) for x in data["lvn_levels"]]
+        data.setdefault("source", "bars")  # backwards-compat: files built before source field was added
         return VolumeProfile(**data)
