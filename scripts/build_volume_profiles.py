@@ -32,6 +32,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from alpha.features.volume_profile import VolumeProfileBuilder
+from alpha.features.volume_profile_loader import VolumeProfileLoader, _serialize_profile
 from alpha.models.bar import Bar
 from alpha.models.enums import BarTimeframe, DataSourceId, TakerSide
 from alpha.models.trade import Trade
@@ -160,16 +161,8 @@ def _profile_path(out_dir: Path, symbol: str, d: date, session_type: str) -> Pat
 
 def _save_profile(profile_path: Path, profile: "VolumeProfile") -> None:  # type: ignore[name-defined]
     profile_path.parent.mkdir(parents=True, exist_ok=True)
-    data = profile.model_dump()
-    # Serialize Decimal and date
-    data["poc"] = str(data["poc"])
-    data["vah"] = str(data["vah"])
-    data["val"] = str(data["val"])
-    data["hvn_levels"] = [str(x) for x in data["hvn_levels"]]
-    data["lvn_levels"] = [str(x) for x in data["lvn_levels"]]
-    data["session_date"] = str(data["session_date"])
     with open(profile_path, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(_serialize_profile(profile), f, indent=2)
 
 
 def build_date(

@@ -26,6 +26,18 @@ from pathlib import Path
 from alpha.models.volume_profile import VolumeProfile
 
 
+def _serialize_profile(profile: VolumeProfile) -> dict:
+    """Serialize a VolumeProfile to a JSON-safe dict."""
+    data = profile.model_dump()
+    data["poc"] = str(data["poc"])
+    data["vah"] = str(data["vah"])
+    data["val"] = str(data["val"])
+    data["hvn_levels"] = [str(x) for x in data["hvn_levels"]]
+    data["lvn_levels"] = [str(x) for x in data["lvn_levels"]]
+    data["session_date"] = str(data["session_date"])
+    return data
+
+
 class VolumeProfileLoader:
     def __init__(self, profiles_dir: Path, max_lookback_days: int = 10) -> None:
         """
@@ -53,6 +65,13 @@ class VolumeProfileLoader:
     ) -> tuple[VolumeProfile | None, VolumeProfile | None]:
         """Return (prior_rth, globex) — convenience for session open."""
         return self.load_prior_rth(symbol, session_date), self.load_globex(symbol, session_date)
+
+    def save(self, symbol: str, profile: VolumeProfile) -> None:
+        """Persist a VolumeProfile to the standard JSON path."""
+        path = self._profile_path(symbol, profile.session_date, profile.session_type)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(_serialize_profile(profile), f, indent=2)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
