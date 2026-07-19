@@ -55,6 +55,7 @@ class DatabaseSettings(BaseSettings):
 
 class StorageSettings(BaseSettings):
     parquet_root: Path = Path("data/parquet")
+    volume_profiles_root: Path = Path("data/volume_profiles")
     compress: str = "snappy"            # snappy | zstd | gzip | none
     row_group_size: int = 50_000
 
