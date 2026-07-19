@@ -199,6 +199,13 @@ class LevelObserver:
         if snap is None:
             return
 
+        # Skip writing observations for catchup/backfill bars. The live backend
+        # replays historical bars at startup; writing those to research partitions
+        # contaminates dates already covered by research_replay.py with a second
+        # run_id starting mid-session (wherever catchup began). State is still
+        # maintained (session rollover detection below runs unconditionally).
+        write_obs = not event.is_replay
+
         symbol = event.symbol
         bar_timestamp = event.timestamp
 
@@ -260,6 +267,9 @@ class LevelObserver:
 
         if snap.or_low is not None:
             levels.append((ReferenceLevelType.ORL, snap.or_low, False))
+
+        if not write_obs:
+            return
 
         bar = snap.bar
         for level_type, level_value, is_vwap in levels:
