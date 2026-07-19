@@ -16,11 +16,14 @@ M1 OHLC reconstruction:
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pyarrow.parquet as pq
+
+from alpha.features.volume_profile_loader import VolumeProfileLoader
 
 # Separation threshold (episode CLOSE boundary) mirrored from
 # LevelDistanceConfig defaults in interaction/config.py — keep these two in
@@ -177,7 +180,40 @@ def _episode_identity(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def build_chart_payload(research_root: Path, symbol: str, session_date: str) -> dict[str, Any]:
+def _load_vp(
+    profiles_root: Path | None,
+    symbol: str,
+    session_date_str: str,
+) -> tuple[dict | None, dict | None]:
+    """Load prior RTH and Globex VP profiles for the session. Returns (rth, globex) dicts."""
+    if profiles_root is None:
+        return None, None
+    loader = VolumeProfileLoader(profiles_root)
+    d = date.fromisoformat(session_date_str)
+    rth_profile = loader.load_prior_rth(symbol, d)
+    globex_profile = loader.load_globex(symbol, d)
+
+    def _to_dict(p: Any) -> dict | None:
+        if p is None:
+            return None
+        return {
+            "poc": float(p.poc),
+            "vah": float(p.vah),
+            "val": float(p.val),
+            "hvn_levels": [float(x) for x in p.hvn_levels],
+            "lvn_levels": [float(x) for x in p.lvn_levels],
+            "source": p.source,
+        }
+
+    return _to_dict(rth_profile), _to_dict(globex_profile)
+
+
+def build_chart_payload(
+    research_root: Path,
+    symbol: str,
+    session_date: str,
+    profiles_root: Path | None = None,
+) -> dict[str, Any]:
     """Build the full chart-ready payload for one symbol/session_date.
 
     Shape:
@@ -223,6 +259,8 @@ def build_chart_payload(research_root: Path, symbol: str, session_date: str) -> 
         ep["bars"] = bars_by_episode.get(row["episode_id"], [])
         episodes.append(ep)
 
+    vp_rth, vp_globex = _load_vp(profiles_root, symbol, session_date)
+
     return {
         "symbol": symbol,
         "session_date": session_date,
@@ -230,4 +268,6 @@ def build_chart_payload(research_root: Path, symbol: str, session_date: str) -> 
         "orb_high": float(static_levels["orh"]) if static_levels["orh"] is not None else None,
         "orb_low": float(static_levels["orl"]) if static_levels["orl"] is not None else None,
         "episodes": episodes,
+        "vp_rth": vp_rth,
+        "vp_globex": vp_globex,
     }

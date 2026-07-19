@@ -89,6 +89,15 @@ type Episode = {
   bars: EpisodeBarRow[];
 };
 
+type VpProfile = {
+  poc: number;
+  vah: number;
+  val: number;
+  hvn_levels: number[];
+  lvn_levels: number[];
+  source: string;
+};
+
 type ChartPayload = {
   symbol: string;
   session_date: string;
@@ -96,6 +105,8 @@ type ChartPayload = {
   orb_high: number | null;
   orb_low: number | null;
   episodes: Episode[];
+  vp_rth: VpProfile | null;
+  vp_globex: { poc: number; vah: number; val: number; hvn_levels: number[]; lvn_levels: number[]; source: string } | null;
 };
 
 // ─── Level type styling ─────────────────────────────────────────────────────────
@@ -113,6 +124,15 @@ const LEVEL_STYLE: Record<string, { color: string; label: string; short: string 
   "vwap:rth":           { color: "#a855f7", label: "VWAP (RTH)", short: "R" },
   "orh:rth":            { color: "#f59e0b", label: "ORH", short: "H" },
   "orl:rth":            { color: "#3b82f6", label: "ORL", short: "L" },
+};
+
+const VP_COLORS = {
+  poc:        "#f97316",  // orange
+  vah:        "#22c55e",  // green
+  val:        "#ef4444",  // red
+  hvn:        "rgba(249,115,22,0.45)",  // dim orange
+  lvn:        "rgba(20,184,166,0.45)",  // dim teal
+  globex_poc: "rgba(139,92,246,0.7)",   // dim purple
 };
 
 // Keep the research view visually consistent with the live M1/5M chart.
@@ -244,6 +264,7 @@ export function ResearchChart() {
   const [loading, setLoading] = useState(false);
   const [showRthVwap, setShowRthVwap] = useState(true);
   const [showBands, setShowBands] = useState(false);
+  const [showVP, setShowVP] = useState(true);
 
   // Discover symbols from research storage rather than duplicating a
   // hard-coded contract list in the UI. Prefer the currently-active MNQ
@@ -308,8 +329,19 @@ export function ResearchChart() {
     const out: { label: string; price: number; color: string }[] = [];
     if (payload.orb_high != null) out.push({ label: "ORH", price: payload.orb_high, color: LEVEL_STYLE["orh:rth"].color });
     if (payload.orb_low != null) out.push({ label: "ORL", price: payload.orb_low, color: LEVEL_STYLE["orl:rth"].color });
+    if (showVP && payload.vp_rth) {
+      const vp = payload.vp_rth;
+      out.push({ label: "POC", price: vp.poc, color: VP_COLORS.poc });
+      out.push({ label: "VAH", price: vp.vah, color: VP_COLORS.vah });
+      out.push({ label: "VAL", price: vp.val, color: VP_COLORS.val });
+      vp.hvn_levels.forEach((p, i) => out.push({ label: `HVN${i + 1}`, price: p, color: VP_COLORS.hvn }));
+      vp.lvn_levels.forEach((p, i) => out.push({ label: `LVN${i + 1}`, price: p, color: VP_COLORS.lvn }));
+    }
+    if (showVP && payload.vp_globex) {
+      out.push({ label: "GPOC", price: payload.vp_globex.poc, color: VP_COLORS.globex_poc });
+    }
     return out;
-  }, [payload]);
+  }, [payload, showVP]);
 
   const markers = useMemo(() => (payload ? buildMarkers(payload.episodes) : []), [payload]);
 
@@ -386,6 +418,10 @@ export function ResearchChart() {
           <input type="checkbox" checked={showBands} onChange={(e) => setShowBands(e.target.checked)} />
           Proximity bands
         </label>
+        <label style={checkboxLabelStyle}>
+          <input type="checkbox" checked={showVP} onChange={(e) => setShowVP(e.target.checked)} />
+          VP levels
+        </label>
         {loading && <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>loading…</span>}
         {payload && (
           <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
@@ -424,6 +460,18 @@ export function ResearchChart() {
             <LegendDot color={LEVEL_STYLE["orl:rth"].color} label="ORL" />
             <LegendDot color="#60a5fa" label="EMA 9" />
             <LegendDot color="#fbbf24" label="EMA 21" />
+            {showVP && payload?.vp_rth && (
+              <>
+                <LegendDot color={VP_COLORS.poc} label="POC (prior RTH)" />
+                <LegendDot color={VP_COLORS.vah} label="VAH" />
+                <LegendDot color={VP_COLORS.val} label="VAL" />
+                <LegendDot color={VP_COLORS.hvn} label="HVN" />
+                <LegendDot color={VP_COLORS.lvn} label="LVN" />
+              </>
+            )}
+            {showVP && payload?.vp_globex && (
+              <LegendDot color={VP_COLORS.globex_poc} label="Globex POC" />
+            )}
             <span>circle = episode open · square = episode close (click a marker for detail) · dotted = ±proximity band (entry threshold, narrower) · dashed = ±separation band (exit threshold, wider — must clear for 3 consecutive bars)</span>
           </div>
 
