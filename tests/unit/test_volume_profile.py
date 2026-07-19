@@ -95,6 +95,16 @@ def test_poc_in_distribution():
     assert str(p.poc) in p.distribution
 
 
+def test_poc_tie_break_lowest_price_wins():
+    """When two bins share max volume, lowest price is POC (vp_v1 policy)."""
+    bars = [
+        _bar(100.0, 100.0, 500),
+        _bar(105.0, 105.0, 500),
+    ]
+    p = _builder().build(bars, "MNQ-09", _DATE)
+    assert p.poc == Decimal("100.0")
+
+
 # ── Value Area ────────────────────────────────────────────────────────────────
 
 def test_value_area_contains_poc():
@@ -228,13 +238,20 @@ def test_distribution_keys_are_sorted():
     assert keys == sorted(keys)
 
 
-def test_distribution_volume_sums_to_total():
-    """Sum of distribution values must equal total_volume (within rounding)."""
+def test_distribution_volume_sums_to_bar_input_volume():
+    """sum(distribution) must equal sum(bar.volume) — no inflation, no loss."""
     bars = [_bar(100.0, 105.0, 1000), _bar(103.0, 107.0, 2000)]
     p = _builder().build(bars, "MNQ-09", _DATE)
-    dist_sum = sum(p.distribution.values())
-    # Allow small rounding difference from int(round(...)) per bin
-    assert abs(dist_sum - p.total_volume) <= len(p.distribution)
+    assert p.total_volume == sum(b.volume for b in bars)
+    assert sum(p.distribution.values()) == p.total_volume
+
+
+def test_distribution_conservation_sparse_bar():
+    """A bar spanning many bins with small volume must not inflate total."""
+    bars = [_bar(100.0, 119.0, 3)]  # 20 bins, volume=3 → exactly 3 distributed
+    p = _builder().build(bars, "MNQ-09", _DATE)
+    assert p.total_volume == 3
+    assert sum(p.distribution.values()) == 3
 
 
 def test_volume_distributed_across_bar_range():

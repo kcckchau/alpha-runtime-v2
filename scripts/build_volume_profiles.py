@@ -1,8 +1,9 @@
 """
 Build and store volume profiles for all available RTH sessions.
 
-Prefers trade (MBP-1) data when available for exact volume placement and delta.
-Falls back to 1m bars with uniform distribution when trades are absent.
+Prefers Databento trade data (event_type="trade") when available for exact
+volume placement and delta. Falls back to 1m bars with uniform distribution
+when trades are absent.
 
 Usage:
     python scripts/build_volume_profiles.py --symbol MNQ-09
@@ -133,6 +134,26 @@ def _filter_globex_trades(
     return [t for t in trades_prior + trades_current if lo <= t.timestamp.astimezone(_ET) < hi]
 
 
+def _globex_trades_complete(trades: list[Trade], session_date: date) -> bool:
+    """
+    Return True only if trades span both sides of the Globex session.
+
+    A Globex session from prior 18:00 ET to current 09:30 ET has two halves:
+      prior-day half:   18:00–23:59 ET
+      current-day half: 00:00–09:29 ET
+
+    If prior-day trade data is missing, trades will only cover the current-day
+    half, producing a silently incomplete profile. We reject it rather than
+    storing a partial profile that looks valid.
+
+    Gate: require at least one trade before midnight ET of session_date.
+    """
+    if not trades:
+        return False
+    midnight = datetime(session_date.year, session_date.month, session_date.day, 0, 0, tzinfo=_ET)
+    return any(t.timestamp.astimezone(_ET) < midnight for t in trades)
+
+
 def _profile_path(out_dir: Path, symbol: str, d: date, session_type: str) -> Path:
     return out_dir / symbol / f"{d}_{session_type}.json"
 
@@ -170,9 +191,11 @@ def build_date(
         print(f"  {session_date}: skipped (already exists)")
         return
 
-    # Try trades first (exact volume placement + delta)
-    use_trades = not bars_only and _trades_parquet_path(data_dir, symbol, session_date).exists()
+    # Load current-day data — prefer trades, fall back to bars
+    trades_current: list[Trade] = []
+    bars_current: list[Bar] = []
 
+    use_trades = not bars_only and _trades_parquet_path(data_dir, symbol, session_date).exists()
     if use_trades:
         trades_current = _load_trades(_trades_parquet_path(data_dir, symbol, session_date))
         if not trades_current:
@@ -207,12 +230,25 @@ def build_date(
         if use_trades:
             trades_prior = _load_trades(_trades_parquet_path(data_dir, symbol, prior_day))
             globex_items = _filter_globex_trades(trades_prior, trades_current, session_date)
-            if globex_items:
+            if not globex_items:
+                print(f"  {session_date} Globex: no overnight trades found")
+            elif not _globex_trades_complete(globex_items, session_date):
+                # Prior-day trades missing — profile would only cover 00:00–09:30,
+                # silently omitting the 18:00–23:59 session. Fall back to bars.
+                print(f"  {session_date} Globex [trades]: incomplete (prior-day missing), falling back to bars")
+                bars_prior = _load_bars(_bars_parquet_path(data_dir, symbol, prior_day))
+                bars_curr = _load_bars(_bars_parquet_path(data_dir, symbol, session_date))
+                globex_bars = _filter_globex(bars_prior, bars_curr, session_date)
+                if globex_bars:
+                    profile = builder.build(globex_bars, symbol, session_date, "globex")
+                    _save_profile(globex_out, profile)
+                    print(f"  {session_date} Globex [bars fallback]: {len(globex_bars)} bars, POC={profile.poc}, VA=[{profile.val}, {profile.vah}], vol={profile.total_volume:,}")
+                else:
+                    print(f"  {session_date} Globex: no bar fallback data either, skipping")
+            else:
                 profile = builder.build_from_trades(globex_items, symbol, session_date, "globex")
                 _save_profile(globex_out, profile)
                 print(f"  {session_date} Globex [trades]: {len(globex_items):,} ticks, POC={profile.poc}, VA=[{profile.val}, {profile.vah}], vol={profile.total_volume:,}")
-            else:
-                print(f"  {session_date} Globex: no overnight trades found")
         else:
             bars_prior = _load_bars(_bars_parquet_path(data_dir, symbol, prior_day))
             globex_bars = _filter_globex(bars_prior, bars_current, session_date)
