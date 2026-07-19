@@ -264,7 +264,7 @@ def test_atr30_5m_requires_minimum_samples():
     # so we need MIN_SAMPLES+1 bars total for MIN_SAMPLES TRs.
     for i in range(ATR30_5M_MIN_SAMPLES):
         m5_bar = _make_bar_event("MNQ", _rth_ts(i * 5), close=19000.0 + i, timeframe_str="M5")
-        engine._update_htf_ema(engine._m5_ema, m5_bar, track_atr30=True)
+        engine._update_htf_ema(engine._m5_ema, m5_bar, track_atr30=True, atr30_min_samples=ATR30_5M_MIN_SAMPLES)
 
     m5_state = engine._m5_ema.get("MNQ")
     assert m5_state is not None
@@ -276,7 +276,7 @@ def test_atr30_5m_requires_minimum_samples():
 
     # One more bar pushes us to MIN_SAMPLES TRs — atr30 must now be defined
     extra_bar = _make_bar_event("MNQ", _rth_ts(ATR30_5M_MIN_SAMPLES * 5), close=19010.0, timeframe_str="M5")
-    engine._update_htf_ema(engine._m5_ema, extra_bar, track_atr30=True)
+    engine._update_htf_ema(engine._m5_ema, extra_bar, track_atr30=True, atr30_min_samples=ATR30_5M_MIN_SAMPLES)
     assert m5_state.atr30 is not None, (
         f"atr30_5m must be defined after {ATR30_5M_MIN_SAMPLES} TR samples"
     )

@@ -30,6 +30,7 @@ from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.features.slope import (
+    SLOPE_FLAT_THRESHOLD_1H,
     SLOPE_FLAT_THRESHOLD_1M,
     SLOPE_FLAT_THRESHOLD_5M,
     classify_slope,
@@ -47,6 +48,11 @@ _ZERO = Decimal("0")
 # statistically noise; 5 samples (~25 min into session) is a pragmatic floor.
 # UNCALIBRATED — adjust after reviewing 5m TR distributions by session phase.
 ATR30_5M_MIN_SAMPLES: int = 5
+
+# Minimum H1 true-range samples before atr30_1h is exposed. First H1 bar has no
+# prev_close → 0 TRs. Require at least 3 to reduce single-candle spike noise.
+# UNCALIBRATED — adjust after reviewing H1 TR distributions.
+ATR30_1H_MIN_SAMPLES: int = 3
 
 
 def _percentile(data: list[Decimal], pct: float) -> Decimal | None:
@@ -232,6 +238,9 @@ class _HTFEMAState:
 
     EMA50 and SMA200 are optional — only computed when the state is created
     with track_ema50=True / track_sma200=True (used for H1 and D1).
+
+    track_atr30=True (M5, H1): enables true-range accumulation and norm3 slopes.
+    track_ribbon=True (H1 only): enables EMA ribbon geometry and rolling history.
     """
 
     def __init__(
@@ -241,6 +250,8 @@ class _HTFEMAState:
         track_ema50: bool = False,
         track_sma200: bool = False,
         track_atr30: bool = False,
+        track_ribbon: bool = False,
+        atr30_min_samples: int = 1,
     ) -> None:
         self.ema_9: Decimal | None = None
         self.ema_21: Decimal | None = None
@@ -264,20 +275,49 @@ class _HTFEMAState:
             deque(maxlen=200) if track_sma200 else None
         )
         self.sma_200: Decimal | None = None         # None until 200 bars seen
-        # ATR30 and norm3 slope state — populated when track_atr30=True (M5)
+        # ATR30 and norm3 slope state — populated when track_atr30=True (M5, H1)
         self._track_atr30 = track_atr30
+        self._atr30_min_samples = atr30_min_samples
         self.prev_close: Decimal | None = None
         self.atr30_buffer: deque[Decimal] = deque(maxlen=30)
-        self.atr30: Decimal | None = None          # None until atr30_sample_count >= ATR30_5M_MIN_SAMPLES
+        self.atr30: Decimal | None = None          # None until atr30_sample_count >= atr30_min_samples
         self.atr30_sample_count: int = 0           # number of true-range samples accumulated
         self.ema9_history: deque[Decimal] = deque(maxlen=4)
         self.ema21_history: deque[Decimal] = deque(maxlen=4)
+        self.ema50_history: deque[Decimal] = deque(maxlen=4)   # for norm3 EMA50 slope
         self.last_sealed_ts: datetime | None = None
-        # Previous norm3 slopes for acceleration carry-forward
+        # Previous norm3 slopes for acceleration carry-forward (M5 only)
         self.prev_ema9_slope_norm_3: float | None = None
         self.prev_ema21_slope_norm_3: float | None = None
         self.ema9_slope_accel: float | None = None   # carry-forward from last sealed bar
         self.ema21_slope_accel: float | None = None
+        # Transient norm3 slope values set during _update_htf_ema (ribbon path)
+        self._slope9_norm3: float | None = None
+        self._slope21_norm3: float | None = None
+        self._slope50_norm3: float | None = None
+        self._dir9: str | None = None
+        self._dir21: str | None = None
+        self._dir50: str | None = None
+        # ── Ribbon rolling history (track_ribbon=True, H1 only) ───────────────
+        # Width history holds sealed-bar values only (point-in-time safe).
+        self._track_ribbon = track_ribbon
+        _RIBBON_HISTORY_LEN = 120
+        self.ribbon_width_history: deque[float] = deque(maxlen=_RIBBON_HISTORY_LEN)
+        # Carry-forward ribbon geometry (used in _build_snapshot)
+        self.ribbon_low: Decimal | None = None
+        self.ribbon_high: Decimal | None = None
+        self.ribbon_center: Decimal | None = None
+        self.ribbon_width_atr: float | None = None
+        self.ema9_21_dist_atr: float | None = None
+        self.ema21_50_dist_atr: float | None = None
+        self.stack_direction: str | None = None
+        self.slope_alignment: str | None = None
+        self.h1_close_location: str | None = None
+        self.h1_close_to_ribbon_atr: float | None = None
+        self.h1_close_to_center_atr: float | None = None
+        self.ribbon_width_percentile: float | None = None
+        self.ribbon_width_slope_3h: float | None = None
+        self.ribbon_width_slope_6h: float | None = None
 
 
 class FeatureEngine(BaseEngine):
@@ -404,7 +444,7 @@ class FeatureEngine(BaseEngine):
         # Flush any buffered M5 bars first so HTF EMA reflects the sealed 5m bar
         # that coincides with this M1 timestamp (deterministic M1/M5 ordering fix).
         for m5_bar in self._pending_m5.pop(bar.symbol, []):
-            self._update_htf_ema(self._m5_ema, m5_bar, track_atr30=True)
+            self._update_htf_ema(self._m5_ema, m5_bar, track_atr30=True, atr30_min_samples=ATR30_5M_MIN_SAMPLES)
         state = self._get_or_create(bar.symbol)
         self._update_state(state, bar)
         snapshot = self._build_snapshot(state, bar)
@@ -428,10 +468,15 @@ class FeatureEngine(BaseEngine):
                 # before the coincident M1 snapshot is built (ordering fix).
                 self._pending_m5.setdefault(event.symbol, []).append(event)
                 return
-            self._update_htf_ema(self._m5_ema, event, track_atr30=True)
+            self._update_htf_ema(self._m5_ema, event, track_atr30=True, atr30_min_samples=ATR30_5M_MIN_SAMPLES)
             return
         if event.timeframe == BarTimeframe.H1:
-            self._update_htf_ema(self._h1_ema, event, track_ema50=True, track_sma200=True)
+            self._update_htf_ema(
+                self._h1_ema, event,
+                track_ema50=True, track_sma200=True,
+                track_atr30=True, track_ribbon=True,
+                atr30_min_samples=ATR30_1H_MIN_SAMPLES,
+            )
             return
         if event.timeframe != BarTimeframe.M1:
             return  # S1 and other bars not processed here
@@ -934,12 +979,42 @@ class FeatureEngine(BaseEngine):
             ema21_1h=h1.ema_21 if h1 is not None else None,
             ema50_1h=h1.ema_50 if h1 is not None else None,
             sma200_1h=h1.sma_200 if h1 is not None else None,
-            ema9_1h_slope=h1.ema_9_slope if h1 is not None else None,
-            ema9_1h_slope_direction=self._slope_direction(h1.ema_9_slope, 0.005) if h1 is not None else None,
-            ema21_1h_slope=h1.ema_21_slope if h1 is not None else None,
-            ema21_1h_slope_direction=self._slope_direction(h1.ema_21_slope, 0.005) if h1 is not None else None,
-            ema50_1h_slope=h1.ema_50_slope if h1 is not None else None,
-            ema50_1h_slope_direction=self._slope_direction(h1.ema_50_slope, 0.005) if h1 is not None else None,
+            atr30_1h=h1.atr30 if h1 is not None else None,
+            atr30_1h_samples=h1.atr30_sample_count if h1 is not None else 0,
+            ema9_1h_slope_norm_3=h1._slope9_norm3 if h1 is not None else None,
+            ema9_1h_slope_direction=classify_slope(h1._slope9_norm3, SLOPE_FLAT_THRESHOLD_1H) if h1 is not None else None,
+            ema21_1h_slope_norm_3=h1._slope21_norm3 if h1 is not None else None,
+            ema21_1h_slope_direction=classify_slope(h1._slope21_norm3, SLOPE_FLAT_THRESHOLD_1H) if h1 is not None else None,
+            ema50_1h_slope_norm_3=h1._slope50_norm3 if h1 is not None else None,
+            ema50_1h_slope_direction=classify_slope(h1._slope50_norm3, SLOPE_FLAT_THRESHOLD_1H) if h1 is not None else None,
+            ema_ribbon_low_1h=h1.ribbon_low if h1 is not None else None,
+            ema_ribbon_high_1h=h1.ribbon_high if h1 is not None else None,
+            ema_ribbon_center_1h=h1.ribbon_center if h1 is not None else None,
+            ema_ribbon_width_1h_atr=h1.ribbon_width_atr if h1 is not None else None,
+            ema9_21_distance_1h_atr=h1.ema9_21_dist_atr if h1 is not None else None,
+            ema21_50_distance_1h_atr=h1.ema21_50_dist_atr if h1 is not None else None,
+            ema_stack_direction_1h=h1.stack_direction if h1 is not None else None,
+            ema_slope_alignment_1h=h1.slope_alignment if h1 is not None else None,
+            h1_close_location_vs_ema_ribbon_1h=h1.h1_close_location if h1 is not None else None,
+            h1_close_to_ema_ribbon_1h_atr=h1.h1_close_to_ribbon_atr if h1 is not None else None,
+            h1_close_to_ema_ribbon_center_1h_atr=h1.h1_close_to_center_atr if h1 is not None else None,
+            **self._m1_ribbon_location(bar.close, h1),
+            ema_ribbon_width_percentile_60h=h1.ribbon_width_percentile if h1 is not None else None,
+            ema_ribbon_width_slope_3h=h1.ribbon_width_slope_3h if h1 is not None else None,
+            ema_ribbon_width_slope_6h=h1.ribbon_width_slope_6h if h1 is not None else None,
+            htf_1h_watermark=h1.last_sealed_ts if h1 is not None else None,
+            ema_ribbon_center_to_sma200_1h_atr=(
+                float((h1.ribbon_center - h1.sma_200) / h1.atr30)
+                if h1 is not None and h1.ribbon_center is not None
+                and h1.sma_200 is not None and h1.atr30 is not None and h1.atr30 > _ZERO
+                else None
+            ),
+            price_to_sma200_1h_atr=(
+                float((bar.close - h1.sma_200) / h1.atr30)
+                if h1 is not None and h1.sma_200 is not None
+                and h1.atr30 is not None and h1.atr30 > _ZERO
+                else None
+            ),
             ema10_1d=self._d1_ema[bar.symbol].ema_10 if bar.symbol in self._d1_ema else None,
             ema20_1d=self._d1_ema[bar.symbol].ema_20 if bar.symbol in self._d1_ema else None,
             ema9_1m_slope_norm_3=ema9_1m_slope_norm_3,
@@ -1017,8 +1092,10 @@ class FeatureEngine(BaseEngine):
         track_ema50: bool = False,
         track_sma200: bool = False,
         track_atr30: bool = False,
+        track_ribbon: bool = False,
+        atr30_min_samples: int = 1,
     ) -> None:
-        """Update EMA9/EMA21 (and optionally EMA10/EMA20/EMA50/SMA200/ATR30) for a HTF bar."""
+        """Update EMA9/EMA21 (and optionally EMA10/EMA20/EMA50/SMA200/ATR30/ribbon) for a HTF bar."""
         sym = bar.symbol
         if sym not in store:
             store[sym] = _HTFEMAState(
@@ -1027,6 +1104,8 @@ class FeatureEngine(BaseEngine):
                 track_ema50=track_ema50,
                 track_sma200=track_sma200,
                 track_atr30=track_atr30,
+                track_ribbon=track_ribbon,
+                atr30_min_samples=atr30_min_samples,
             )
         s = store[sym]
         s.prev_ema_9 = s.ema_9
@@ -1054,8 +1133,11 @@ class FeatureEngine(BaseEngine):
         # Append to history deques for norm3 slope computation
         s.ema9_history.append(s.ema_9)
         s.ema21_history.append(s.ema_21)
+        if s._track_ema50:
+            s.ema50_history.append(s.ema_50)
         s.last_sealed_ts = bar.timestamp
-        # ATR30 for this timeframe (used to normalize 5m slopes)
+        # ATR30 for this timeframe — computed from sealed bars' true range.
+        # Do not derive from lower-timeframe ATR.
         if s._track_atr30 and s.prev_close is not None:
             tr = max(
                 bar.high - bar.low,
@@ -1064,13 +1146,110 @@ class FeatureEngine(BaseEngine):
             )
             s.atr30_buffer.append(tr)
             s.atr30_sample_count += 1
-            # Only expose atr30 once a minimum number of samples are available.
-            # Slopes remain None until this warms — prevents single-TR noise from
-            # flowing into strategy gates. See ATR30_5M_MIN_SAMPLES.
-            if s.atr30_sample_count >= ATR30_5M_MIN_SAMPLES:
+            if s.atr30_sample_count >= s._atr30_min_samples:
                 s.atr30 = sum(s.atr30_buffer) / len(s.atr30_buffer)
         if s._track_atr30:
             s.prev_close = bar.close
+
+        # ── 1H EMA ribbon computation (track_ribbon=True) ─────────────────────
+        # Runs after EMA and ATR30 are updated for this bar so ribbon reflects
+        # the current sealed H1 state. All results stored as carry-forward.
+        if not s._track_ribbon:
+            return
+
+        e9, e21, e50 = s.ema_9, s.ema_21, s.ema_50
+        atr30 = s.atr30
+        ribbon_ready = e9 is not None and e21 is not None and e50 is not None and atr30 is not None and atr30 > _ZERO
+
+        if ribbon_ready:
+            # Ribbon geometry
+            s.ribbon_low  = min(e9, e21, e50)
+            s.ribbon_high = max(e9, e21, e50)
+            s.ribbon_center = (e9 + e21 + e50) / 3
+            s.ribbon_width_atr = float((s.ribbon_high - s.ribbon_low) / atr30)
+            s.ema9_21_dist_atr  = float((e9  - e21) / atr30)
+            s.ema21_50_dist_atr = float((e21 - e50) / atr30)
+
+            # Stack direction — ordering of EMA values only (not slope-based)
+            if e9 > e21 > e50:
+                s.stack_direction = "bullish"
+            elif e9 < e21 < e50:
+                s.stack_direction = "bearish"
+            else:
+                s.stack_direction = "mixed"
+
+            # Norm3 slopes and slope alignment
+            def _norm3(history: "deque[Decimal]", atr: "Decimal") -> "float | None":
+                if len(history) < 4 or atr <= _ZERO:
+                    return None
+                return float((history[-1] - history[0]) / (3 * atr))
+
+            slope9  = _norm3(s.ema9_history,  atr30)
+            slope21 = _norm3(s.ema21_history, atr30)
+            slope50 = _norm3(s.ema50_history, atr30)
+            # Store on state so _build_snapshot can carry them forward
+            s._slope9_norm3  = slope9
+            s._slope21_norm3 = slope21
+            s._slope50_norm3 = slope50
+
+            dir9  = classify_slope(slope9,  SLOPE_FLAT_THRESHOLD_1H)
+            dir21 = classify_slope(slope21, SLOPE_FLAT_THRESHOLD_1H)
+            dir50 = classify_slope(slope50, SLOPE_FLAT_THRESHOLD_1H)
+            s._dir9, s._dir21, s._dir50 = dir9, dir21, dir50
+
+            if dir9 == "up" and dir21 == "up" and dir50 == "up":
+                s.slope_alignment = "bullish"
+            elif dir9 == "down" and dir21 == "down" and dir50 == "down":
+                s.slope_alignment = "bearish"
+            elif dir9 == "flat" and dir21 == "flat" and dir50 == "flat":
+                s.slope_alignment = "flat"
+            else:
+                s.slope_alignment = "mixed"
+
+            # H1-sealed price location vs ribbon
+            h1_close = bar.close
+            if h1_close > s.ribbon_high:
+                loc = "above"
+                dist_to_edge = float((h1_close - s.ribbon_high) / atr30)
+            elif h1_close < s.ribbon_low:
+                loc = "below"
+                dist_to_edge = float((h1_close - s.ribbon_low) / atr30)
+            else:
+                loc = "inside"
+                dist_to_edge = 0.0
+            s.h1_close_location = loc
+            s.h1_close_to_ribbon_atr = dist_to_edge
+            s.h1_close_to_center_atr = float((h1_close - s.ribbon_center) / atr30)
+
+            # ── Rolling history (point-in-time: read BEFORE appending current bar) ──
+
+            # Width percentile from prior 60 bars only (PIT: current bar excluded)
+            prev_widths = list(s.ribbon_width_history)[-60:]
+            if prev_widths:
+                rank = sum(1 for w in prev_widths if w <= s.ribbon_width_atr)
+                s.ribbon_width_percentile = rank / len(prev_widths) * 100.0
+            else:
+                s.ribbon_width_percentile = None
+
+            # Width slopes (read prior history before appending)
+            _wh = list(s.ribbon_width_history)
+            s.ribbon_width_slope_3h = (
+                (s.ribbon_width_atr - _wh[-3]) / 3 if len(_wh) >= 3 else None
+            )
+            s.ribbon_width_slope_6h = (
+                (s.ribbon_width_atr - _wh[-6]) / 6 if len(_wh) >= 6 else None
+            )
+
+            # Now append current bar to history (must be AFTER all reads above)
+            s.ribbon_width_history.append(s.ribbon_width_atr)
+        else:
+            # EMA or ATR not yet warm — initialise transient slope attrs to None
+            s._slope9_norm3 = None
+            s._slope21_norm3 = None
+            s._slope50_norm3 = None
+            s._dir9 = None
+            s._dir21 = None
+            s._dir50 = None
 
     @staticmethod
     def _ema(price: Decimal, prev: Decimal | None, period: int) -> Decimal:
@@ -1126,6 +1305,42 @@ class FeatureEngine(BaseEngine):
         if not (state.ema_9 < state.ema_21 < state.ema_50):
             return False
         return state.sma_200 is None or state.ema_50 < state.sma_200
+
+    @staticmethod
+    def _m1_ribbon_location(close: Decimal, h1: "_HTFEMAState | None") -> dict:
+        """Compute M1 close location vs carry-forward H1 ribbon.
+
+        Returns a dict of the three m1_close_* fields so the caller can unpack
+        with **. Returns None-valued fields when ribbon is not yet warm.
+        These fields must NOT be appended to sealed-H1 rolling history.
+        """
+        if (
+            h1 is None
+            or h1.ribbon_low is None
+            or h1.ribbon_high is None
+            or h1.ribbon_center is None
+            or h1.atr30 is None
+            or h1.atr30 <= _ZERO
+        ):
+            return {
+                "m1_close_location_vs_ema_ribbon_1h": None,
+                "m1_close_to_ema_ribbon_1h_atr": None,
+                "m1_close_to_ema_ribbon_center_1h_atr": None,
+            }
+        if close > h1.ribbon_high:
+            loc = "above"
+            dist = float((close - h1.ribbon_high) / h1.atr30)
+        elif close < h1.ribbon_low:
+            loc = "below"
+            dist = float((close - h1.ribbon_low) / h1.atr30)
+        else:
+            loc = "inside"
+            dist = 0.0
+        return {
+            "m1_close_location_vs_ema_ribbon_1h": loc,
+            "m1_close_to_ema_ribbon_1h_atr": dist,
+            "m1_close_to_ema_ribbon_center_1h_atr": float((close - h1.ribbon_center) / h1.atr30),
+        }
 
     def _calendar_for_symbol(self, ticker: str) -> SessionCalendar:
         return self._symbol_calendars.get(ticker, self._calendar)
