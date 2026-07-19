@@ -1,14 +1,18 @@
 """
 VolumeProfileBuilder — pure function, no side effects.
 
-Computes POC / VAH / VAL / HVN / LVN from a list of sealed bars.
+Computes POC / VAH / VAL / HVN / LVN from a list of sealed bars or trades.
 
-Volume distribution method:
+Bar-based distribution (build):
     For each bar, volume is distributed uniformly across all price bins
-    spanned by [low, high]. This is the standard approach when tick-level
-    data is not available.
+    spanned by [low, high]. Standard approximation when tick data unavailable.
 
     vol_per_bin = bar.volume / number_of_bins_in_bar_range
+
+Trade-based distribution (build_from_trades):
+    Each trade is placed in the exact bin for its price.
+    Taker side is tracked per bin → delta_distribution (buy - sell).
+    Produces exact volume placement and delta profile.
 
 Value area rule: standard 70% starting from POC, expanding up or down
 one bin at a time toward the side with more volume.
@@ -25,6 +29,7 @@ from datetime import date
 from decimal import Decimal, ROUND_DOWN
 
 from alpha.models.bar import Bar
+from alpha.models.trade import Trade
 from alpha.models.volume_profile import VolumeProfile
 
 DEFAULT_BIN_SIZE: Decimal = Decimal("1.0")
@@ -57,6 +62,32 @@ class VolumeProfileBuilder:
             raise ValueError(f"No bars provided for {symbol} {session_date} {session_type}")
 
         dist = self._build_distribution(bars)
+        return self._finalize(dist, None, symbol, session_date, session_type, "bars")
+
+    def build_from_trades(
+        self,
+        trades: list[Trade],
+        symbol: str,
+        session_date: date,
+        session_type: str = "rth",
+    ) -> VolumeProfile:
+        if not trades:
+            raise ValueError(f"No trades provided for {symbol} {session_date} {session_type}")
+
+        dist, delta = self._build_distribution_from_trades(trades)
+        return self._finalize(dist, delta, symbol, session_date, session_type, "trades")
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _finalize(
+        self,
+        dist: dict[Decimal, int],
+        delta: dict[Decimal, int] | None,
+        symbol: str,
+        session_date: date,
+        session_type: str,
+        source: str,
+    ) -> VolumeProfile:
         sorted_levels = sorted(dist.keys())
         total_volume = sum(dist.values())
 
@@ -65,11 +96,18 @@ class VolumeProfileBuilder:
         hvns = self._hvn(dist, sorted_levels, poc)[: self.max_hvn]
         lvns = self._lvn(dist, sorted_levels)[: self.max_lvn]
 
+        delta_dist = (
+            {str(k): delta[k] for k in sorted_levels if k in delta}
+            if delta is not None
+            else None
+        )
+
         return VolumeProfile(
             symbol=symbol,
             session_date=session_date,
             session_type=session_type,
             bin_size=float(self.bin_size),
+            source=source,
             poc=poc,
             vah=vah,
             val=val,
@@ -77,10 +115,9 @@ class VolumeProfileBuilder:
             value_area_volume=va_volume,
             hvn_levels=hvns,
             lvn_levels=lvns,
-            distribution={str(k): v for k, v in zip(sorted_levels, [dist[l] for l in sorted_levels])},
+            distribution={str(k): dist[k] for k in sorted_levels},
+            delta_distribution=delta_dist,
         )
-
-    # ── Internal ──────────────────────────────────────────────────────────────
 
     def _bin(self, price: Decimal) -> Decimal:
         """Round price down to nearest bin boundary."""
@@ -108,6 +145,25 @@ class VolumeProfileBuilder:
                 dist[b] = dist.get(b, 0.0) + vol_per_bin
 
         return {k: max(1, int(round(v))) for k, v in dist.items()}
+
+    def _build_distribution_from_trades(
+        self, trades: list[Trade]
+    ) -> tuple[dict[Decimal, int], dict[Decimal, int]]:
+        """Exact volume placement per trade. Returns (volume_dist, delta_dist)."""
+        vol: dict[Decimal, int] = {}
+        delta: dict[Decimal, int] = {}
+
+        for trade in trades:
+            b = self._bin(trade.price)
+            vol[b] = vol.get(b, 0) + trade.size
+            # buy taker = aggressive buy = +delta; sell taker = aggressive sell = -delta
+            side = str(trade.taker_side).lower()
+            if side == "buy":
+                delta[b] = delta.get(b, 0) + trade.size
+            elif side == "sell":
+                delta[b] = delta.get(b, 0) - trade.size
+
+        return vol, delta
 
     def _value_area(
         self,

@@ -1,7 +1,7 @@
 """
 Unit tests for VolumeProfileBuilder.
 
-All tests use synthetic bars with known volume distributions so
+All tests use synthetic bars or trades with known volume distributions so
 results can be verified by hand.
 """
 
@@ -12,7 +12,8 @@ import pytest
 
 from alpha.features.volume_profile import VolumeProfileBuilder
 from alpha.models.bar import Bar
-from alpha.models.enums import BarTimeframe
+from alpha.models.enums import BarTimeframe, TakerSide
+from alpha.models.trade import Trade
 
 
 _DATE = date(2026, 7, 3)
@@ -269,3 +270,112 @@ def test_bin_size_stored():
     bars = [_bar(100.0, 100.0, 100)]
     p = VolumeProfileBuilder(bin_size=Decimal("2.0")).build(bars, "MNQ-09", _DATE)
     assert p.bin_size == 2.0
+
+
+def test_bars_source_field():
+    bars = [_bar(100.0, 100.0, 100)]
+    p = _builder().build(bars, "MNQ-09", _DATE)
+    assert p.source == "bars"
+    assert p.delta_distribution is None
+
+
+# ── Trades path ───────────────────────────────────────────────────────────────
+
+def _trade(price: float, size: int, side: TakerSide) -> Trade:
+    return Trade(
+        symbol="MNQ-09",
+        timestamp=datetime(2026, 7, 3, 14, 0, tzinfo=timezone.utc),
+        price=Decimal(str(price)),
+        size=size,
+        taker_side=side,
+    )
+
+
+def test_empty_trades_raises():
+    with pytest.raises(ValueError, match="No trades"):
+        _builder().build_from_trades([], "MNQ-09", _DATE)
+
+
+def test_trades_source_field():
+    trades = [_trade(100.0, 10, TakerSide.BUY)]
+    p = _builder().build_from_trades(trades, "MNQ-09", _DATE)
+    assert p.source == "trades"
+    assert p.delta_distribution is not None
+
+
+def test_trades_exact_volume_placement():
+    """Each trade lands in its exact bin — no bar-range spreading."""
+    trades = [
+        _trade(100.0, 50, TakerSide.BUY),
+        _trade(100.25, 30, TakerSide.SELL),  # same bin 100.0 (bin_size=1.0)
+        _trade(102.0, 200, TakerSide.BUY),
+    ]
+    p = _builder().build_from_trades(trades, "MNQ-09", _DATE)
+    assert p.poc == Decimal("102.0")
+    assert p.distribution["102.0"] == 200
+    assert p.distribution["100.0"] == 80   # 50 + 30
+
+
+def test_trades_delta_buy_minus_sell():
+    """delta = buy_volume - sell_volume per bin."""
+    trades = [
+        _trade(100.0, 60, TakerSide.BUY),
+        _trade(100.0, 40, TakerSide.SELL),
+        _trade(101.0, 100, TakerSide.SELL),
+    ]
+    p = _builder().build_from_trades(trades, "MNQ-09", _DATE)
+    assert p.delta_distribution["100.0"] == 20    # 60 - 40
+    assert p.delta_distribution["101.0"] == -100  # 0 - 100
+
+
+def test_trades_poc_is_highest_volume_bin():
+    trades = [
+        _trade(100.0, 10, TakerSide.BUY),
+        _trade(101.0, 500, TakerSide.SELL),
+        _trade(102.0, 30, TakerSide.BUY),
+    ]
+    p = _builder().build_from_trades(trades, "MNQ-09", _DATE)
+    assert p.poc == Decimal("101.0")
+
+
+def test_trades_value_area_volume_at_least_70_pct():
+    trades = [
+        _trade(100.0, 100, TakerSide.BUY),
+        _trade(101.0, 100, TakerSide.BUY),
+        _trade(102.0, 500, TakerSide.SELL),
+        _trade(103.0, 100, TakerSide.BUY),
+        _trade(104.0, 100, TakerSide.BUY),
+        _trade(110.0, 100, TakerSide.SELL),
+    ]
+    p = _builder().build_from_trades(trades, "MNQ-09", _DATE)
+    assert p.value_area_volume >= int(p.total_volume * 0.70)
+
+
+def test_trades_total_volume():
+    trades = [
+        _trade(100.0, 10, TakerSide.BUY),
+        _trade(101.0, 20, TakerSide.SELL),
+        _trade(101.0, 5, TakerSide.BUY),
+    ]
+    p = _builder().build_from_trades(trades, "MNQ-09", _DATE)
+    assert p.total_volume == 35
+
+
+def test_trades_distribution_keys_sorted():
+    trades = [
+        _trade(105.0, 10, TakerSide.BUY),
+        _trade(100.0, 10, TakerSide.SELL),
+        _trade(103.0, 10, TakerSide.BUY),
+    ]
+    p = _builder().build_from_trades(trades, "MNQ-09", _DATE)
+    keys = [Decimal(k) for k in p.distribution.keys()]
+    assert keys == sorted(keys)
+
+
+def test_trades_delta_distribution_keys_match_distribution():
+    trades = [
+        _trade(100.0, 10, TakerSide.BUY),
+        _trade(102.0, 20, TakerSide.SELL),
+    ]
+    p = _builder().build_from_trades(trades, "MNQ-09", _DATE)
+    assert set(p.delta_distribution.keys()) == set(p.distribution.keys())
