@@ -527,7 +527,7 @@ def test_m1_close_location_updates_every_bar():
 
 def test_m1_live_fields_do_not_affect_h1_rolling_history():
     """
-    Feeding M1 bars must not append to ribbon_location_history (sealed H1 history).
+    Feeding M1 bars must not append to ribbon_width_history (sealed H1 history).
     The rolling history length should only grow when H1 bars are fed.
     """
     engine = _build_engine()
@@ -535,14 +535,14 @@ def test_m1_live_fields_do_not_affect_h1_rolling_history():
         _feed_h1(engine, _make_h1_bar("MNQ", 9 + i, 19000.0))
 
     h1 = engine._h1_ema["MNQ"]
-    history_len_before = len(h1.ribbon_location_history)
+    history_len_before = len(h1.ribbon_width_history)
 
     # Feed 5 M1 bars
     for m in range(5):
         _feed_m1(engine, 19, m, 19000.0)
 
-    assert len(h1.ribbon_location_history) == history_len_before, (
-        "M1 bars must not append to sealed-H1 ribbon_location_history"
+    assert len(h1.ribbon_width_history) == history_len_before, (
+        "M1 bars must not append to sealed-H1 ribbon_width_history"
     )
 
 
@@ -611,207 +611,12 @@ def test_width_slope_6h():
         assert abs(h1.ribbon_width_slope_6h - expected) < 1e-9
 
 
-# ── Persistence counters ──────────────────────────────────────────────────────
-
-def test_bullish_stack_persistence_increments():
-    """Persistence counter must increment on consecutive bullish-stack H1 bars."""
-    engine = _build_engine()
-    # Feed rising bars to achieve bullish stack
-    for i in range(20):
-        _feed_h1(engine, _make_h1_bar("MNQ", 9 + i, 19000.0 + i * 300))
-
-    h1 = engine._h1_ema["MNQ"]
-    assert h1 is not None
-    if h1.stack_direction == "bullish":
-        assert h1.bullish_stack_persistence >= 1
-        assert h1.bearish_stack_persistence == 0
-
-
-def test_inside_ribbon_persistence_increments():
-    """inside_ribbon_persistence counts consecutive H1 bars with close inside ribbon."""
-    engine = _build_engine()
-    # Feed stable bars where price stays inside converged ribbon
-    for i in range(20):
-        _feed_h1(engine, _make_h1_bar("MNQ", 9 + i, 19000.0, high_offset=1.0, low_offset=1.0))
-
-    h1 = engine._h1_ema["MNQ"]
-    assert h1 is not None
-    if h1.h1_close_location == "inside":
-        assert h1.inside_ribbon_persistence >= 1
-
-
-def test_persistence_resets_on_stack_change():
-    """Bullish persistence resets to 0 when stack becomes non-bullish."""
-    engine = _build_engine()
-    # Build bullish stack
-    for i in range(15):
-        _feed_h1(engine, _make_h1_bar("MNQ", 9 + i, 19000.0 + i * 300))
-
-    h1 = engine._h1_ema["MNQ"]
-    was_bullish = h1.stack_direction == "bullish"
-
-    # Crash price to invert EMAs
-    for i in range(10):
-        _feed_h1(engine, _make_h1_bar("MNQ", 24 + i, 17000.0 - i * 300))
-
-    if was_bullish and h1.stack_direction != "bullish":
-        assert h1.bullish_stack_persistence == 0
-
-
-# ── Transition and cross counts ───────────────────────────────────────────────
-
-def test_transition_count_semantics():
-    """
-    transition_count_6h counts any state changes among ABOVE/INSIDE/BELOW
-    across the last 6 sealed H1 bars.
-
-    Build a controlled history: [above, inside, below, inside, above, inside, below]
-    The last 6 entries are [inside, below, inside, above, inside, below].
-    Transitions: inside→below, below→inside, inside→above, above→inside, inside→below = 5.
-    """
-    engine = _build_engine()
-    # Warm up ribbon with stable bars first
-    for i in range(12):
-        _feed_h1(engine, _make_h1_bar("MNQ", 9 + i, 19000.0))
-
-    h1 = engine._h1_ema["MNQ"]
-    if h1.ribbon_low is None:
-        pytest.skip("Ribbon not warm")
-
-    # Directly inject a known location history to test counting logic
-    from collections import deque
-    h1.ribbon_location_history = deque(
-        ["above", "inside", "below", "inside", "above", "inside", "below"],
-        maxlen=120,
-    )
-
-    # Count transitions manually from last 6: [inside, below, inside, above, inside, below]
-    # idx 1→2: inside→below    (+1)
-    # idx 2→3: below→inside   (+1)
-    # idx 3→4: inside→above   (+1)
-    # idx 4→5: above→inside   (+1)
-    # idx 5→6: inside→below   (+1)
-    expected_transitions = 5
-
-    _lh = list(h1.ribbon_location_history)
-    _last6 = _lh[-6:]
-    trans = sum(1 for i in range(1, len(_last6)) if _last6[i] != _last6[i - 1])
-    assert trans == expected_transitions, f"Expected {expected_transitions} transitions, got {trans}"
-
-
-def test_full_cross_count_semantics():
-    """
-    full_cross_count_6h counts complete ABOVE ↔ BELOW transitions.
-    Passing through INSIDE counts as one full cross from the prior side to the new side.
-
-    History: [above, inside, below, inside, above] over last 5 bars.
-    Full crosses: above→(inside)→below = 1, below→(inside)→above = 1 → total 2.
-    """
-    from collections import deque
-
-    engine = _build_engine()
-    for i in range(12):
-        _feed_h1(engine, _make_h1_bar("MNQ", 9 + i, 19000.0))
-    h1 = engine._h1_ema["MNQ"]
-    if h1.ribbon_low is None:
-        pytest.skip("Ribbon not warm")
-
-    h1.ribbon_location_history = deque(
-        ["above", "inside", "below", "inside", "above"],
-        maxlen=120,
-    )
-
-    _lh = list(h1.ribbon_location_history)
-    _full = 0
-    _prev_side = None
-    for loc in _lh[-6:]:
-        if loc in ("above", "below"):
-            if _prev_side is not None and _prev_side != loc:
-                _full += 1
-            _prev_side = loc
-
-    assert _full == 2, f"Expected 2 full crosses, got {_full}"
-
-
-def test_transition_count_does_not_require_above_below_only():
-    """inside→above and inside→below both count as transitions (not only full crosses)."""
-    from collections import deque
-
-    engine = _build_engine()
-    for i in range(12):
-        _feed_h1(engine, _make_h1_bar("MNQ", 9 + i, 19000.0))
-    h1 = engine._h1_ema["MNQ"]
-    if h1.ribbon_low is None:
-        pytest.skip("Ribbon not warm")
-
-    # 6 entries: all inside then above
-    h1.ribbon_location_history = deque(
-        ["inside", "inside", "inside", "inside", "inside", "above"],
-        maxlen=120,
-    )
-    _lh = list(h1.ribbon_location_history)
-    trans = sum(1 for i in range(max(0, len(_lh) - 6), len(_lh)) if i > 0 and _lh[i] != _lh[i - 1])
-    assert trans == 1  # only one transition: inside→above
-
-
-# ── Derived ribbon contexts ────────────────────────────────────────────────────
-
-def test_bullish_ribbon_context_requires_all_three_conditions():
-    """bullish_context = bullish stack AND bullish alignment AND price above/inside."""
-    from alpha.engines.feature.engine import _HTFEMAState
-
-    s = _HTFEMAState(track_ribbon=True)
-    # All three satisfied
-    s.stack_direction = "bullish"
-    s.slope_alignment = "bullish"
-    s.h1_close_location = "above"
-    s.bullish_ribbon_context = (
-        s.stack_direction == "bullish"
-        and s.slope_alignment == "bullish"
-        and s.h1_close_location in ("above", "inside")
-    )
-    assert s.bullish_ribbon_context
-
-    # Fail on one condition
-    s.slope_alignment = "mixed"
-    s.bullish_ribbon_context = (
-        s.stack_direction == "bullish"
-        and s.slope_alignment == "bullish"
-        and s.h1_close_location in ("above", "inside")
-    )
-    assert not s.bullish_ribbon_context
-
-
-def test_chop_ribbon_context_requires_compressed_inside_and_crosses():
-    """chop_context = compressed width AND price inside AND transition_count >= 3."""
-    from alpha.engines.feature.engine import _HTFEMAState
-
-    s = _HTFEMAState(track_ribbon=True)
-    s.ribbon_width_state = "compressed"
-    s.h1_close_location = "inside"
-    s.ribbon_location_transition_count_6h = 3
-
-    chop = (
-        s.ribbon_width_state == "compressed"
-        and s.h1_close_location == "inside"
-        and s.ribbon_location_transition_count_6h >= 3
-    )
-    assert chop
-
-    # Does not trigger on mixed stack alone
-    s.ribbon_location_transition_count_6h = 2
-    chop = (
-        s.ribbon_width_state == "compressed"
-        and s.h1_close_location == "inside"
-        and s.ribbon_location_transition_count_6h >= 3
-    )
-    assert not chop
 
 
 # ── Bootstrap / restart behavior ──────────────────────────────────────────────
 
 def test_all_ribbon_fields_none_before_first_h1_bar():
-    """Before any H1 bar, all ribbon snapshot fields must be None / 0."""
+    """Before any H1 bar, all ribbon snapshot fields must be None."""
     engine = _build_engine()
     snap = _feed_m1(engine, 9, 30, 19000.0)
     assert snap.ema9_1h is None
@@ -820,7 +625,7 @@ def test_all_ribbon_fields_none_before_first_h1_bar():
     assert snap.ema_stack_direction_1h is None
     assert snap.m1_close_location_vs_ema_ribbon_1h is None
     assert snap.htf_1h_watermark is None
-    assert snap.ema_bullish_stack_persistence_1h_bars == 0
+    assert snap.ema_ribbon_width_percentile_60h is None
 
 
 def test_ribbon_snapshot_fields_warm_after_h1_bars():

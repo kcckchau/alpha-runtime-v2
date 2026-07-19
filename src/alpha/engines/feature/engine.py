@@ -30,8 +30,6 @@ from alpha.core.engine import BaseEngine, EngineHealth
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.features.slope import (
-    RIBBON_COMPRESSED_PERCENTILE,
-    RIBBON_EXPANDED_PERCENTILE,
     SLOPE_FLAT_THRESHOLD_1H,
     SLOPE_FLAT_THRESHOLD_1M,
     SLOPE_FLAT_THRESHOLD_5M,
@@ -301,16 +299,10 @@ class _HTFEMAState:
         self._dir21: str | None = None
         self._dir50: str | None = None
         # ── Ribbon rolling history (track_ribbon=True, H1 only) ───────────────
-        # All history deques hold sealed-bar values only (point-in-time safe).
+        # Width history holds sealed-bar values only (point-in-time safe).
         self._track_ribbon = track_ribbon
         _RIBBON_HISTORY_LEN = 120
         self.ribbon_width_history: deque[float] = deque(maxlen=_RIBBON_HISTORY_LEN)
-        self.ribbon_location_history: deque[str] = deque(maxlen=_RIBBON_HISTORY_LEN)
-        self.ribbon_stack_history: deque[str] = deque(maxlen=_RIBBON_HISTORY_LEN)
-        # Persistence counters (sealed H1 bars)
-        self.bullish_stack_persistence: int = 0
-        self.bearish_stack_persistence: int = 0
-        self.inside_ribbon_persistence: int = 0
         # Carry-forward ribbon geometry (used in _build_snapshot)
         self.ribbon_low: Decimal | None = None
         self.ribbon_high: Decimal | None = None
@@ -318,7 +310,6 @@ class _HTFEMAState:
         self.ribbon_width_atr: float | None = None
         self.ema9_21_dist_atr: float | None = None
         self.ema21_50_dist_atr: float | None = None
-        self.ema9_50_dist_atr: float | None = None
         self.stack_direction: str | None = None
         self.slope_alignment: str | None = None
         self.h1_close_location: str | None = None
@@ -327,12 +318,6 @@ class _HTFEMAState:
         self.ribbon_width_percentile: float | None = None
         self.ribbon_width_slope_3h: float | None = None
         self.ribbon_width_slope_6h: float | None = None
-        self.ribbon_location_transition_count_6h: int = 0
-        self.ribbon_full_cross_count_6h: int = 0
-        self.ribbon_width_state: str | None = None
-        self.bullish_ribbon_context: bool = False
-        self.bearish_ribbon_context: bool = False
-        self.chop_ribbon_context: bool = False
 
 
 class FeatureEngine(BaseEngine):
@@ -1008,7 +993,6 @@ class FeatureEngine(BaseEngine):
             ema_ribbon_width_1h_atr=h1.ribbon_width_atr if h1 is not None else None,
             ema9_21_distance_1h_atr=h1.ema9_21_dist_atr if h1 is not None else None,
             ema21_50_distance_1h_atr=h1.ema21_50_dist_atr if h1 is not None else None,
-            ema9_50_distance_1h_atr=h1.ema9_50_dist_atr if h1 is not None else None,
             ema_stack_direction_1h=h1.stack_direction if h1 is not None else None,
             ema_slope_alignment_1h=h1.slope_alignment if h1 is not None else None,
             h1_close_location_vs_ema_ribbon_1h=h1.h1_close_location if h1 is not None else None,
@@ -1018,15 +1002,6 @@ class FeatureEngine(BaseEngine):
             ema_ribbon_width_percentile_60h=h1.ribbon_width_percentile if h1 is not None else None,
             ema_ribbon_width_slope_3h=h1.ribbon_width_slope_3h if h1 is not None else None,
             ema_ribbon_width_slope_6h=h1.ribbon_width_slope_6h if h1 is not None else None,
-            ema_bullish_stack_persistence_1h_bars=h1.bullish_stack_persistence if h1 is not None else 0,
-            ema_bearish_stack_persistence_1h_bars=h1.bearish_stack_persistence if h1 is not None else 0,
-            price_inside_ribbon_persistence_1h_bars=h1.inside_ribbon_persistence if h1 is not None else 0,
-            price_ribbon_location_transition_count_6h=h1.ribbon_location_transition_count_6h if h1 is not None else 0,
-            price_ribbon_full_cross_count_6h=h1.ribbon_full_cross_count_6h if h1 is not None else 0,
-            ema_ribbon_width_state_1h=h1.ribbon_width_state if h1 is not None else None,
-            bullish_ema_ribbon_context_1h=h1.bullish_ribbon_context if h1 is not None else False,
-            bearish_ema_ribbon_context_1h=h1.bearish_ribbon_context if h1 is not None else False,
-            chop_ema_ribbon_context_1h=h1.chop_ribbon_context if h1 is not None else False,
             htf_1h_watermark=h1.last_sealed_ts if h1 is not None else None,
             ema_ribbon_center_to_sma200_1h_atr=(
                 float((h1.ribbon_center - h1.sma_200) / h1.atr30)
@@ -1194,7 +1169,6 @@ class FeatureEngine(BaseEngine):
             s.ribbon_width_atr = float((s.ribbon_high - s.ribbon_low) / atr30)
             s.ema9_21_dist_atr  = float((e9  - e21) / atr30)
             s.ema21_50_dist_atr = float((e21 - e50) / atr30)
-            s.ema9_50_dist_atr  = float((e9  - e50) / atr30)
 
             # Stack direction — ordering of EMA values only (not slope-based)
             if e9 > e21 > e50:
@@ -1266,73 +1240,8 @@ class FeatureEngine(BaseEngine):
                 (s.ribbon_width_atr - _wh[-6]) / 6 if len(_wh) >= 6 else None
             )
 
-            # Cross / transition counts from prior sealed-bar location history.
-            # "last 6 bars" = the 6 most recent entries in ribbon_location_history
-            # (which is read BEFORE appending the current bar — PIT safe).
-            _lh = list(s.ribbon_location_history)[-6:]  # exactly last 6 prior bars
-            # Transition count: any state change among ABOVE / INSIDE / BELOW
-            _trans = sum(1 for i in range(1, len(_lh)) if _lh[i] != _lh[i - 1])
-            # Full-cross count: ABOVE ↔ BELOW change (may pass through INSIDE).
-            # Walk the 6-bar window tracking the last non-inside side seen.
-            _full = 0
-            _prev_side: str | None = None
-            for loc in _lh:
-                if loc in ("above", "below"):
-                    if _prev_side is not None and _prev_side != loc:
-                        _full += 1
-                    _prev_side = loc
-            s.ribbon_location_transition_count_6h = _trans
-            s.ribbon_full_cross_count_6h = _full
-
-            # Persistence counters — updated based on the CURRENT sealed bar
-            if s.stack_direction == "bullish":
-                s.bullish_stack_persistence += 1
-                s.bearish_stack_persistence = 0
-            elif s.stack_direction == "bearish":
-                s.bearish_stack_persistence += 1
-                s.bullish_stack_persistence = 0
-            else:
-                s.bullish_stack_persistence = 0
-                s.bearish_stack_persistence = 0
-
-            if loc == "inside":
-                s.inside_ribbon_persistence += 1
-            else:
-                s.inside_ribbon_persistence = 0
-
-            # Ribbon width state
-            pct = s.ribbon_width_percentile
-            if pct is not None:
-                if pct <= RIBBON_COMPRESSED_PERCENTILE:
-                    s.ribbon_width_state = "compressed"
-                elif pct >= RIBBON_EXPANDED_PERCENTILE:
-                    s.ribbon_width_state = "expanded"
-                else:
-                    s.ribbon_width_state = "normal"
-            else:
-                s.ribbon_width_state = None
-
-            # Derived ribbon contexts
-            s.bullish_ribbon_context = (
-                s.stack_direction == "bullish"
-                and s.slope_alignment == "bullish"
-                and loc in ("above", "inside")
-            )
-            s.bearish_ribbon_context = (
-                s.stack_direction == "bearish"
-                and s.slope_alignment == "bearish"
-                and loc in ("below", "inside")
-            )
-            s.chop_ribbon_context = (
-                s.ribbon_width_state == "compressed"
-                and loc == "inside"
-                and s.ribbon_location_transition_count_6h >= 3
-            )
-
             # Now append current bar to history (must be AFTER all reads above)
             s.ribbon_width_history.append(s.ribbon_width_atr)
-            s.ribbon_location_history.append(loc)
-            s.ribbon_stack_history.append(s.stack_direction)
         else:
             # EMA or ATR not yet warm — initialise transient slope attrs to None
             s._slope9_norm3 = None

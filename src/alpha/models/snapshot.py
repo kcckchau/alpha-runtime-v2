@@ -98,7 +98,6 @@ class BarSnapshot(BaseModel):
     # Positive = fast above slow (bullish ordering). Negative = fast below slow.
     ema9_21_distance_1h_atr: float | None = None
     ema21_50_distance_1h_atr: float | None = None
-    ema9_50_distance_1h_atr: float | None = None
 
     # ── 1H stack and slope alignment ──────────────────────────────────────────
     # Stack = price ordering of EMA values (structure).
@@ -125,29 +124,10 @@ class BarSnapshot(BaseModel):
     price_to_sma200_1h_atr: float | None = None                # (m1_close - sma200) / atr30_1h
 
     # ── Rolling ribbon history (sealed H1 bars only) ──────────────────────────
-    # Based on h1_close_location and ribbon width at H1 seal time. Point-in-time safe:
-    # percentile and slopes exclude the current bar.
+    # Based on ribbon width at H1 seal time. Point-in-time safe: current bar excluded.
     ema_ribbon_width_percentile_60h: float | None = None   # percentile rank in 60-bar rolling window
     ema_ribbon_width_slope_3h: float | None = None         # (width[t] - width[t-3]) / 3
     ema_ribbon_width_slope_6h: float | None = None         # (width[t] - width[t-6]) / 6
-    ema_bullish_stack_persistence_1h_bars: int = 0         # consecutive H1 bars with bullish stack
-    ema_bearish_stack_persistence_1h_bars: int = 0
-    price_inside_ribbon_persistence_1h_bars: int = 0       # consecutive H1 bars with h1_close inside ribbon
-
-    # Cross / transition counts (sealed H1 bars, last 6 sealed bars = indices [t-6..t-1])
-    # transition_count: any state change among ABOVE / INSIDE / BELOW
-    # full_cross_count: complete ABOVE ↔ BELOW change (may pass through INSIDE)
-    price_ribbon_location_transition_count_6h: int = 0
-    price_ribbon_full_cross_count_6h: int = 0
-
-    # ── Ribbon width state ────────────────────────────────────────────────────
-    # Based on rolling width percentile. Thresholds: RIBBON_COMPRESSED_PERCENTILE / EXPANDED.
-    ema_ribbon_width_state_1h: str | None = None   # "compressed" | "normal" | "expanded"
-
-    # ── Derived ribbon contexts (research-only, not wired into live setup logic) ──
-    bullish_ema_ribbon_context_1h: bool = False
-    bearish_ema_ribbon_context_1h: bool = False
-    chop_ema_ribbon_context_1h: bool = False
 
     # ── H1 watermark ─────────────────────────────────────────────────────────
     # Timestamp of the last sealed H1 bar reflected in this snapshot.
