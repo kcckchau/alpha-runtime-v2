@@ -394,11 +394,11 @@ class ReplayResultSaver:
                 "atr30_1h": _dec(snap.atr30_1h),
                 "atr30_1h_samples": snap.atr30_1h_samples,
                 # ── 1H norm3 slopes ────────────────────────────────────────────
-                "ema9_1h_slope_norm3": round(snap.ema9_1h_slope_norm_3, 6) if snap.ema9_1h_slope_norm_3 is not None else None,
+                "ema9_1h_slope_norm_3": round(snap.ema9_1h_slope_norm_3, 6) if snap.ema9_1h_slope_norm_3 is not None else None,
                 "ema9_1h_slope_direction": snap.ema9_1h_slope_direction,
-                "ema21_1h_slope_norm3": round(snap.ema21_1h_slope_norm_3, 6) if snap.ema21_1h_slope_norm_3 is not None else None,
+                "ema21_1h_slope_norm_3": round(snap.ema21_1h_slope_norm_3, 6) if snap.ema21_1h_slope_norm_3 is not None else None,
                 "ema21_1h_slope_direction": snap.ema21_1h_slope_direction,
-                "ema50_1h_slope_norm3": round(snap.ema50_1h_slope_norm_3, 6) if snap.ema50_1h_slope_norm_3 is not None else None,
+                "ema50_1h_slope_norm_3": round(snap.ema50_1h_slope_norm_3, 6) if snap.ema50_1h_slope_norm_3 is not None else None,
                 "ema50_1h_slope_direction": snap.ema50_1h_slope_direction,
                 # ── 1H ribbon geometry ─────────────────────────────────────────
                 "ema_ribbon_low_1h": _dec(snap.ema_ribbon_low_1h),
@@ -443,13 +443,13 @@ class ReplayResultSaver:
                 "is_lower_high": snap.is_lower_high,
                 "bar_close_position_pct": round(snap.bar_close_position_pct, 3) if snap.bar_close_position_pct is not None else None,
                 # ── EMA slopes ─────────────────────────────────────────────────
-                "ema9_1m_slope_norm3": round(snap.ema9_1m_slope_norm_3, 6) if snap.ema9_1m_slope_norm_3 is not None else None,
+                "ema9_1m_slope_norm_3": round(snap.ema9_1m_slope_norm_3, 6) if snap.ema9_1m_slope_norm_3 is not None else None,
                 "ema9_1m_slope_direction": snap.ema9_1m_slope_direction,
-                "ema21_1m_slope_norm3": round(snap.ema21_1m_slope_norm_3, 6) if snap.ema21_1m_slope_norm_3 is not None else None,
+                "ema21_1m_slope_norm_3": round(snap.ema21_1m_slope_norm_3, 6) if snap.ema21_1m_slope_norm_3 is not None else None,
                 "ema21_1m_slope_direction": snap.ema21_1m_slope_direction,
-                "ema9_5m_slope_norm3": round(snap.ema9_5m_slope_norm_3, 6) if snap.ema9_5m_slope_norm_3 is not None else None,
+                "ema9_5m_slope_norm_3": round(snap.ema9_5m_slope_norm_3, 6) if snap.ema9_5m_slope_norm_3 is not None else None,
                 "ema9_5m_slope_direction": snap.ema9_5m_slope_direction,
-                "ema21_5m_slope_norm3": round(snap.ema21_5m_slope_norm_3, 6) if snap.ema21_5m_slope_norm_3 is not None else None,
+                "ema21_5m_slope_norm_3": round(snap.ema21_5m_slope_norm_3, 6) if snap.ema21_5m_slope_norm_3 is not None else None,
                 "ema21_5m_slope_direction": snap.ema21_5m_slope_direction,
                 "atr30_5m_samples": snap.atr30_5m_samples,
                 # ── EMA acceleration ───────────────────────────────────────────

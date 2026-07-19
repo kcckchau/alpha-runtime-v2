@@ -1223,8 +1223,8 @@ class FeatureEngine(BaseEngine):
 
             # ── Rolling history (point-in-time: read BEFORE appending current bar) ──
 
-            # Width percentile from prior bars only
-            prev_widths = list(s.ribbon_width_history)
+            # Width percentile from prior 60 bars only (PIT: current bar excluded)
+            prev_widths = list(s.ribbon_width_history)[-60:]
             if prev_widths:
                 rank = sum(1 for w in prev_widths if w <= s.ribbon_width_atr)
                 s.ribbon_width_percentile = rank / len(prev_widths) * 100.0

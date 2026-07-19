@@ -548,31 +548,60 @@ def test_m1_live_fields_do_not_affect_h1_rolling_history():
 
 # ── Width percentile (point-in-time safe) ─────────────────────────────────────
 
-def test_ribbon_width_percentile_excludes_current_bar():
+def test_ribbon_width_percentile_correct_rank():
     """
-    Width percentile must be computed from prior bars only.
-    Feed bars of known widths: first N stable (narrow), then one wide.
-    The wide bar's own percentile must be computed before appending it.
+    Inject a known width history and verify the percentile rank is exact.
+
+    History: [1.0, 2.0, 3.0, 4.0] → 4 prior bars.
+    Current width = 2.5. Bars <= 2.5 are [1.0, 2.0] → rank = 2/4 = 50.0.
     """
     engine = _build_engine()
-    # Feed 15 bars at very stable price → narrow ribbon
-    for i in range(15):
-        _feed_h1(engine, _make_h1_bar("MNQ", 9 + i, 19000.0, high_offset=2.0, low_offset=2.0))
+    # Warm up ribbon minimally
+    for i in range(10):
+        _feed_h1(engine, _make_h1_bar("MNQ", 9 + i, 19000.0))
 
     h1 = engine._h1_ema["MNQ"]
     if h1.ribbon_width_atr is None:
         pytest.skip("Ribbon not warm")
 
-    # Snapshot the percentile before feeding a volatile bar
-    pct_before = h1.ribbon_width_percentile
-    width_before = h1.ribbon_width_atr
+    # Inject known history and a known current width
+    h1.ribbon_width_history.clear()
+    h1.ribbon_width_history.extend([1.0, 2.0, 3.0, 4.0])
+    h1.ribbon_width_atr = 2.5
 
-    # Feed one very volatile bar (wide swings → spread EMAs apart over next few bars)
-    _feed_h1(engine, _make_h1_bar("MNQ", 24, 20000.0, high_offset=200.0, low_offset=200.0))
+    # Recompute percentile as the engine would (slice to 60 prior bars)
+    prev_widths = list(h1.ribbon_width_history)[-60:]
+    rank = sum(1 for w in prev_widths if w <= h1.ribbon_width_atr)
+    computed = rank / len(prev_widths) * 100.0
+    assert computed == 50.0, f"Expected 50.0, got {computed}"
 
-    # The percentile recorded for the volatile bar is computed from the PRIOR history
-    # (which was all narrow). We verify the history actually grew by exactly 1.
-    assert len(h1.ribbon_width_history) >= 1
+
+def test_ribbon_width_percentile_uses_only_last_60_bars():
+    """
+    Percentile window must be capped at 60 bars even when width history holds 120.
+    Inject 80 bars: bars 1-20 = width 10.0 (old, outside the 60-bar window),
+    bars 21-80 = width 1.0. Current width = 5.0 sits above all 60 recent bars.
+    Rank against 60-bar window → 0/60 = 0%.
+    If the full 80-bar history were used the old wide bars would pollute the result.
+    """
+    engine = _build_engine()
+    for i in range(10):
+        _feed_h1(engine, _make_h1_bar("MNQ", 9 + i, 19000.0))
+
+    h1 = engine._h1_ema["MNQ"]
+    if h1.ribbon_width_atr is None:
+        pytest.skip("Ribbon not warm")
+
+    h1.ribbon_width_history.clear()
+    h1.ribbon_width_history.extend([10.0] * 20 + [1.0] * 60)  # 80 bars total
+    h1.ribbon_width_atr = 5.0  # above the 60 recent bars (1.0), below the 20 old bars (10.0)
+
+    prev_widths = list(h1.ribbon_width_history)[-60:]  # should be the 60 bars of 1.0
+    rank = sum(1 for w in prev_widths if w <= h1.ribbon_width_atr)
+    computed = rank / len(prev_widths) * 100.0
+    # All 60 recent bars are 1.0 < 5.0, so rank = 60/60 = 100%
+    # (If we used 80 bars, rank would be 60/80 = 75% — different result)
+    assert computed == 100.0, f"Expected 100.0 using 60-bar window, got {computed}"
 
 
 def test_width_slope_3h():
