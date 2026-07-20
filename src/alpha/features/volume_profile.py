@@ -120,7 +120,11 @@ class VolumeProfileBuilder:
         )
         vah, val, va_volume = self._value_area(dist, sorted_levels, poc, total_volume)
         hvns = self._hvn(dist, sorted_levels, poc)[: self.max_hvn]
-        lvns = self._lvn(dist, sorted_levels)[: self.max_lvn]
+        hvn_set = set(hvns)
+        # Drop any LVN whose merged center snapped to the same bin as an HVN.
+        # This is a merge artifact: two clusters (peak + trough) can round to
+        # identical prices after volume-weighted center snapping. HVN wins.
+        lvns = [lvl for lvl in self._lvn(dist, sorted_levels) if lvl not in hvn_set][: self.max_lvn]
 
         delta_dist = (
             {str(k): delta[k] for k in sorted_levels if k in delta}
