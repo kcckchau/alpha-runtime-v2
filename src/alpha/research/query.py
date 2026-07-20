@@ -16,11 +16,14 @@ M1 OHLC reconstruction:
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pyarrow.parquet as pq
+
+from alpha.features.volume_profile_loader import VolumeProfileLoader
 
 # Separation threshold (episode CLOSE boundary) mirrored from
 # LevelDistanceConfig defaults in interaction/config.py — keep these two in
@@ -160,16 +163,16 @@ def _bar_record_to_dict(row: dict[str, Any]) -> dict[str, Any]:
 def _episode_identity(row: dict[str, Any]) -> tuple[Any, ...]:
     """Return the stable identity of an interaction episode.
 
-    Research replay is intentionally append-only, so rerunning the same
-    deterministic replay produces new UUIDs for logically identical episodes.
-    The UUID is therefore not suitable for read-side identity. This key retains
-    every attribute that defines the actual interaction and its policy version.
+    Research replay is intentionally append-only and assigns UUIDs (session_id,
+    level_id, episode_id) and interaction_index fresh each run — none of these
+    are stable across runs. Two episodes from different runs are logically
+    identical iff they share the same symbol, level geometry (level_type +
+    session_scope), timestamp window, and policy version.
     """
     return (
         row["symbol"],
-        row["session_id"],
-        row["level_id"],
-        row["interaction_index"],
+        row["level_type"],
+        row["session_scope"],
         row["started_at"],
         row["ended_at"],
         row["policy_config_hash"],
@@ -177,7 +180,40 @@ def _episode_identity(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def build_chart_payload(research_root: Path, symbol: str, session_date: str) -> dict[str, Any]:
+def _load_vp(
+    profiles_root: Path | None,
+    symbol: str,
+    session_date_str: str,
+) -> tuple[dict | None, dict | None]:
+    """Load prior RTH and Globex VP profiles for the session. Returns (rth, globex) dicts."""
+    if profiles_root is None:
+        return None, None
+    loader = VolumeProfileLoader(profiles_root)
+    d = date.fromisoformat(session_date_str)
+    rth_profile = loader.load_prior_rth(symbol, d)
+    globex_profile = loader.load_globex(symbol, d)
+
+    def _to_dict(p: Any) -> dict | None:
+        if p is None:
+            return None
+        return {
+            "poc": float(p.poc),
+            "vah": float(p.vah),
+            "val": float(p.val),
+            "hvn_levels": [float(x) for x in p.hvn_levels],
+            "lvn_levels": [float(x) for x in p.lvn_levels],
+            "source": p.source,
+        }
+
+    return _to_dict(rth_profile), _to_dict(globex_profile)
+
+
+def build_chart_payload(
+    research_root: Path,
+    symbol: str,
+    session_date: str,
+    profiles_root: Path | None = None,
+) -> dict[str, Any]:
     """Build the full chart-ready payload for one symbol/session_date.
 
     Shape:
@@ -217,11 +253,19 @@ def build_chart_payload(research_root: Path, symbol: str, session_date: str) -> 
     for row in episode_rows:
         unique_episode_rows.setdefault(_episode_identity(row), row)
 
+    # Re-number interaction_index sequentially per (level_type, session_scope)
+    # after dedup — the original index is assigned per-run and is not stable.
+    level_counters: dict[tuple[str, str], int] = {}
     episodes: list[dict[str, Any]] = []
     for row in sorted(unique_episode_rows.values(), key=lambda r: r["started_at"]):
+        key = (row["level_type"], row["session_scope"])
+        level_counters[key] = level_counters.get(key, 0) + 1
         ep = _episode_row_to_dict(row)
+        ep["interaction_index"] = level_counters[key]
         ep["bars"] = bars_by_episode.get(row["episode_id"], [])
         episodes.append(ep)
+
+    vp_rth, vp_globex = _load_vp(profiles_root, symbol, session_date)
 
     return {
         "symbol": symbol,
@@ -230,4 +274,6 @@ def build_chart_payload(research_root: Path, symbol: str, session_date: str) -> 
         "orb_high": float(static_levels["orh"]) if static_levels["orh"] is not None else None,
         "orb_low": float(static_levels["orl"]) if static_levels["orl"] is not None else None,
         "episodes": episodes,
+        "vp_rth": vp_rth,
+        "vp_globex": vp_globex,
     }

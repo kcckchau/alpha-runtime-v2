@@ -18,12 +18,23 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 from alpha.calendar.resolver import calendar_for_symbol
+from alpha.features.volume_profile import VolumeProfileBuilder
+from alpha.features.volume_profile_loader import VolumeProfileLoader
 from alpha.models.enums import AssetClass, BarTimeframe
 from alpha.models.events import BarEvent, EventMetadata
+
+_ET = ZoneInfo("America/New_York")
+_RTH_OPEN_H, _RTH_OPEN_M = 9, 30
+_RTH_CLOSE_H, _RTH_CLOSE_M = 16, 0
+_GLOBEX_START_H, _GLOBEX_START_M = 18, 0
+# A session is considered sealed RTH if bars exist at/past this time (ET).
+# Guards against building an incomplete profile mid-session.
+_RTH_SEAL_H, _RTH_SEAL_M = 15, 55
 
 if TYPE_CHECKING:
     from alpha.calendar.base import SessionCalendar
@@ -168,6 +179,9 @@ class CatchupService:
                 await self._storage.save_bar(bar)
             await self._storage.flush()
 
+            # ── VP profiles: build from M1 bars for any sealed sessions ───────
+            self._build_vp_profiles(symbol, m1_bars)
+
             # ── H1/D1: Parquet cache with gap-fill ────────────────────────────
             hourly_bars = await self._load_or_fetch_bars(
                 symbol=symbol,
@@ -229,6 +243,101 @@ class CatchupService:
             end=end,
             emit=False,
         )
+
+    # ── Volume Profile auto-build ─────────────────────────────────────────────
+
+    def _build_vp_profiles(self, symbol: str, m1_bars: list[Any]) -> None:
+        """
+        Build VP profiles for sealed sessions found in the catchup M1 bars.
+
+        Called after M1 bars are saved to Parquet, before they are emitted.
+        Skips sessions that already have JSON profiles on disk.
+
+        Source is always "bars" here — trade-based profiles are built by the
+        offline build_volume_profiles.py script when trade data is available.
+        Bar-based profiles are sufficient for POC/VA in the live engine.
+
+        RTH seal gate: only build RTH if the session has a bar at/after 15:55 ET
+        (guards against building an incomplete mid-session profile on restart).
+
+        Globex completeness gate: only build Globex if prior-evening bars exist
+        (18:00–23:59 ET on prior day), to avoid a silent half-session profile.
+        """
+        loader = VolumeProfileLoader(self._settings.storage.volume_profiles_root)
+        builder = VolumeProfileBuilder()
+
+        # Group bars by their ET calendar date
+        bars_by_date: dict[date, list[Any]] = defaultdict(list)
+        for bar in m1_bars:
+            bars_by_date[bar.timestamp.astimezone(_ET).date()].append(bar)
+
+        for session_date in sorted(bars_by_date.keys()):
+            day_bars = bars_by_date[session_date]
+
+            # ── RTH ──────────────────────────────────────────────────────────
+            rth_path = loader._profile_path(symbol, session_date, "rth")
+            if not rth_path.exists():
+                rth_open = datetime(
+                    session_date.year, session_date.month, session_date.day,
+                    _RTH_OPEN_H, _RTH_OPEN_M, tzinfo=_ET,
+                )
+                rth_close = datetime(
+                    session_date.year, session_date.month, session_date.day,
+                    _RTH_CLOSE_H, _RTH_CLOSE_M, tzinfo=_ET,
+                )
+                rth_seal = datetime(
+                    session_date.year, session_date.month, session_date.day,
+                    _RTH_SEAL_H, _RTH_SEAL_M, tzinfo=_ET,
+                )
+                rth_bars = [b for b in day_bars if rth_open <= b.timestamp.astimezone(_ET) < rth_close]
+                is_sealed = any(b.timestamp.astimezone(_ET) >= rth_seal for b in rth_bars)
+                if rth_bars and is_sealed:
+                    profile = builder.build(rth_bars, symbol, session_date, "rth")  # type: ignore[arg-type]
+                    loader.save(symbol, profile)
+                    logger.info(
+                        "VP RTH [bars] built at startup | %s %s | POC=%s VA=[%s,%s] vol=%d",
+                        symbol, session_date, profile.poc, profile.val, profile.vah, profile.total_volume,
+                    )
+                elif rth_bars:
+                    logger.debug("VP RTH skipped | %s %s | session not yet sealed", symbol, session_date)
+
+            # ── Globex ───────────────────────────────────────────────────────
+            globex_path = loader._profile_path(symbol, session_date, "globex")
+            if not globex_path.exists():
+                prior_date = session_date - timedelta(days=1)
+                prior_bars = bars_by_date.get(prior_date, [])
+
+                globex_start = datetime(
+                    prior_date.year, prior_date.month, prior_date.day,
+                    _GLOBEX_START_H, _GLOBEX_START_M, tzinfo=_ET,
+                )
+                rth_open = datetime(
+                    session_date.year, session_date.month, session_date.day,
+                    _RTH_OPEN_H, _RTH_OPEN_M, tzinfo=_ET,
+                )
+                midnight = datetime(
+                    session_date.year, session_date.month, session_date.day,
+                    0, 0, tzinfo=_ET,
+                )
+
+                overnight_bars = [
+                    b for b in prior_bars + day_bars
+                    if globex_start <= b.timestamp.astimezone(_ET) < rth_open
+                ]
+                has_prior_evening = any(b.timestamp.astimezone(_ET) < midnight for b in overnight_bars)
+
+                if overnight_bars and has_prior_evening:
+                    profile = builder.build(overnight_bars, symbol, session_date, "globex")  # type: ignore[arg-type]
+                    loader.save(symbol, profile)
+                    logger.info(
+                        "VP Globex [bars] built at startup | %s %s | POC=%s VA=[%s,%s] vol=%d",
+                        symbol, session_date, profile.poc, profile.val, profile.vah, profile.total_volume,
+                    )
+                elif overnight_bars:
+                    logger.debug(
+                        "VP Globex skipped | %s %s | no prior-evening bars (incomplete session)",
+                        symbol, session_date,
+                    )
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

@@ -89,6 +89,15 @@ type Episode = {
   bars: EpisodeBarRow[];
 };
 
+type VpProfile = {
+  poc: number;
+  vah: number;
+  val: number;
+  hvn_levels: number[];
+  lvn_levels: number[];
+  source: string;
+};
+
 type ChartPayload = {
   symbol: string;
   session_date: string;
@@ -96,6 +105,8 @@ type ChartPayload = {
   orb_high: number | null;
   orb_low: number | null;
   episodes: Episode[];
+  vp_rth: VpProfile | null;
+  vp_globex: { poc: number; vah: number; val: number; hvn_levels: number[]; lvn_levels: number[]; source: string } | null;
 };
 
 // ─── Level type styling ─────────────────────────────────────────────────────────
@@ -113,6 +124,15 @@ const LEVEL_STYLE: Record<string, { color: string; label: string; short: string 
   "vwap:rth":           { color: "#a855f7", label: "VWAP (RTH)", short: "R" },
   "orh:rth":            { color: "#f59e0b", label: "ORH", short: "H" },
   "orl:rth":            { color: "#3b82f6", label: "ORL", short: "L" },
+};
+
+const VP_COLORS = {
+  poc:        "#f97316",  // orange
+  vah:        "#22c55e",  // green
+  val:        "#ef4444",  // red
+  hvn:        "rgba(249,115,22,0.45)",  // dim orange
+  lvn:        "rgba(20,184,166,0.45)",  // dim teal
+  globex_poc: "rgba(139,92,246,0.7)",   // dim purple
 };
 
 // Keep the research view visually consistent with the live M1/5M chart.
@@ -152,32 +172,49 @@ function priorCalendarDate(date: string): string {
   return day.toISOString().slice(0, 10);
 }
 
+// ─── withAlpha helper ─────────────────────────────────────────────────────────
+
+function withAlpha(color: string, alpha: number): string {
+  if (color.startsWith("rgba(")) {
+    return color.replace(/[\d.]+\)$/, `${alpha})`);
+  }
+  if (color.startsWith("#") && color.length >= 7) {
+    const r = parseInt(color.slice(1, 3), 16);
+    const g = parseInt(color.slice(3, 5), 16);
+    const b = parseInt(color.slice(5, 7), 16);
+    return `rgba(${r},${g},${b},${alpha})`;
+  }
+  return color;
+}
+
 // Text is deliberately terse — "V9" not "VWAP (full session) #9 open" — because
 // with 4 levels × open+close markers, episodes cluster tightly in time whenever
 // price sits near multiple levels at once (see e.g. the opening range, where
 // VWAP/ORH/ORL are all close together). Full detail is one click away via
-// onMarkerClick → EpisodeDetail; the marker itself only needs to be scannable.
-function buildMarkers(episodes: Episode[]): SeriesMarker<Time>[] {
+// onMarkerClick → EpisodeInspector; the marker itself only needs to be scannable.
+function buildMarkers(episodes: Episode[], selectedId: string | null, showLabels: boolean): SeriesMarker<Time>[] {
   const markers: SeriesMarker<Time>[] = [];
+  const hasSelection = selectedId !== null;
   for (const ep of episodes) {
     const { color, short } = styleFor(ep.level_type, ep.session_scope);
+    const isSelected = ep.episode_id === selectedId;
+    const markerColor = hasSelection && !isSelected ? withAlpha(color, 0.2) : color;
+    const text = (isSelected || showLabels) ? `${short}${ep.interaction_index}` : "";
     markers.push({
       time: toEpoch(ep.started_at) as Time,
       position: ep.approach_side === "from_below" ? "belowBar" : "aboveBar",
-      color,
+      color: markerColor,
       shape: "circle",
-      text: `${short}${ep.interaction_index}`,
+      text,
       id: ep.episode_id,
     });
     if (ep.ended_at) {
       markers.push({
         time: toEpoch(ep.ended_at) as Time,
         position: ep.end_side === "below" ? "belowBar" : "aboveBar",
-        color: ep.is_valid_for_research ? color : "rgba(160,160,160,0.5)",
+        color: ep.is_valid_for_research ? markerColor : withAlpha("#a0a0a0", 0.5),
         shape: "square",
-        // No text on close markers — pairing with the same-colour open marker's
-        // number plus the square shape is enough to scan; a text label here
-        // was the single biggest contributor to overlapping-label clutter.
+        text: "",
         id: ep.episode_id,
       });
     }
@@ -231,6 +268,49 @@ function buildRthVwapLine(bars: ResearchBar[]): ExtraLineSeries {
   return { id: "rth-vwap", color: LEVEL_STYLE["vwap:rth"].color, lineWidth: 1, data };
 }
 
+// ─── Style constants ──────────────────────────────────────────────────────────
+
+const selectStyle: React.CSSProperties = {
+  background: "#111111",
+  color: "#fff",
+  border: "0.5px solid rgba(255,255,255,0.15)",
+  borderRadius: 4,
+  padding: "4px 8px",
+  fontFamily: "'IBM Plex Mono', monospace",
+  fontSize: 12,
+};
+
+const checkboxLabelStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  fontSize: 11,
+  color: "rgba(255,255,255,0.6)",
+  fontFamily: "'IBM Plex Mono', monospace",
+  cursor: "pointer",
+};
+
+const filterLabelStyle: React.CSSProperties = {
+  fontSize: 10,
+  color: "rgba(255,255,255,0.35)",
+  fontFamily: "'IBM Plex Mono', monospace",
+  letterSpacing: "0.06em",
+  textTransform: "uppercase",
+};
+
+function filterBtnStyle(active: boolean): React.CSSProperties {
+  return {
+    background: active ? "rgba(255,255,255,0.12)" : "transparent",
+    color: active ? "#fff" : "rgba(255,255,255,0.45)",
+    border: `0.5px solid ${active ? "rgba(255,255,255,0.25)" : "rgba(255,255,255,0.08)"}`,
+    borderRadius: 3,
+    padding: "2px 8px",
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: 11,
+    cursor: "pointer",
+  };
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function ResearchChart() {
@@ -244,6 +324,14 @@ export function ResearchChart() {
   const [loading, setLoading] = useState(false);
   const [showRthVwap, setShowRthVwap] = useState(true);
   const [showBands, setShowBands] = useState(false);
+  const [showVP, setShowVP] = useState(true);
+
+  // Filter state
+  const [levelFilter, setLevelFilter] = useState<string>("all");   // "all"|"vwap:full_session"|"vwap:rth"|"orh:rth"|"orl:rth"
+  const [sessionFilter, setSessionFilter] = useState<string>("all");  // "all"|"full_session"|"rth"
+  const [minDuration, setMinDuration] = useState(0);
+  const [showLabels, setShowLabels] = useState(false);
+  const [showAllVP, setShowAllVP] = useState(false);
 
   // Discover symbols from research storage rather than duplicating a
   // hard-coded contract list in the UI. Prefer the currently-active MNQ
@@ -303,15 +391,55 @@ export function ResearchChart() {
     };
   }, [symbol, selectedDate]);
 
+  const filteredEpisodes = useMemo(() => {
+    if (!payload) return [];
+    return payload.episodes.filter((ep) => {
+      if (levelFilter !== "all" && levelKey(ep.level_type, ep.session_scope) !== levelFilter) return false;
+      if (sessionFilter !== "all" && ep.session_scope !== sessionFilter) return false;
+      if (ep.bar_count < minDuration) return false;
+      return true;
+    });
+  }, [payload, levelFilter, sessionFilter, minDuration]);
+
   const overlays = useMemo(() => {
     if (!payload) return [];
-    const out: { label: string; price: number; color: string }[] = [];
+    const out: { label: string; price: number; color: string; style?: number }[] = [];
+
     if (payload.orb_high != null) out.push({ label: "ORH", price: payload.orb_high, color: LEVEL_STYLE["orh:rth"].color });
     if (payload.orb_low != null) out.push({ label: "ORL", price: payload.orb_low, color: LEVEL_STYLE["orl:rth"].color });
-    return out;
-  }, [payload]);
 
-  const markers = useMemo(() => (payload ? buildMarkers(payload.episodes) : []), [payload]);
+    if (showVP && payload.vp_rth) {
+      const vp = payload.vp_rth;
+      const lastClose = payload.bars.length > 0 ? payload.bars[payload.bars.length - 1].close : null;
+
+      // Primary VP levels
+      out.push({ label: "POC", price: vp.poc, color: VP_COLORS.poc });
+      out.push({ label: "VAH", price: vp.vah, color: VP_COLORS.vah });
+      out.push({ label: "VAL", price: vp.val, color: VP_COLORS.val });
+
+      // Secondary HVN/LVN: nearest 2 by default, all if showAllVP
+      const hvnsToShow = showAllVP || lastClose == null
+        ? vp.hvn_levels
+        : [...vp.hvn_levels].sort((a, b) => Math.abs(a - lastClose) - Math.abs(b - lastClose)).slice(0, 2);
+      const lvnsToShow = showAllVP || lastClose == null
+        ? vp.lvn_levels
+        : [...vp.lvn_levels].sort((a, b) => Math.abs(a - lastClose) - Math.abs(b - lastClose)).slice(0, 2);
+
+      hvnsToShow.forEach((p, i) => out.push({ label: `HVN${i + 1}`, price: p, color: VP_COLORS.hvn, style: LineStyle.Dashed }));
+      lvnsToShow.forEach((p, i) => out.push({ label: `LVN${i + 1}`, price: p, color: VP_COLORS.lvn, style: LineStyle.Dashed }));
+    }
+
+    if (showVP && payload.vp_globex) {
+      out.push({ label: "GPOC", price: payload.vp_globex.poc, color: VP_COLORS.globex_poc, style: LineStyle.Dashed });
+    }
+
+    return out;
+  }, [payload, showVP, showAllVP]);
+
+  const markers = useMemo(
+    () => buildMarkers(filteredEpisodes, selectedEpisodeId, showLabels),
+    [filteredEpisodes, selectedEpisodeId, showLabels]
+  );
 
   // RTH VWAP line + dynamic ATR-proximity bands around VWAP / RTH VWAP / ORH / ORL —
   // this is literally the same threshold LevelInteractionEngine uses to decide when an
@@ -353,7 +481,8 @@ export function ResearchChart() {
 
   return (
     <div style={{ padding: 20, background: "#0a0a0a", minHeight: "100vh", color: "#fff" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 12 }}>
+      {/* Header bar */}
+      <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 8, flexWrap: "wrap" }}>
         <h1 style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 14, letterSpacing: "0.08em", margin: 0 }}>
           RESEARCH — LEVEL INTERACTION VIEWER
         </h1>
@@ -386,6 +515,10 @@ export function ResearchChart() {
           <input type="checkbox" checked={showBands} onChange={(e) => setShowBands(e.target.checked)} />
           Proximity bands
         </label>
+        <label style={checkboxLabelStyle}>
+          <input type="checkbox" checked={showVP} onChange={(e) => setShowVP(e.target.checked)} />
+          VP levels
+        </label>
         {loading && <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>loading…</span>}
         {payload && (
           <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
@@ -393,6 +526,53 @@ export function ResearchChart() {
           </span>
         )}
       </div>
+
+      {/* Filter bar — only show when payload exists */}
+      {payload && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+          {/* Level type filter buttons */}
+          <span style={filterLabelStyle}>Level:</span>
+          {[
+            { key: "all", label: "All" },
+            { key: "vwap:full_session", label: "V" },
+            { key: "vwap:rth", label: "R" },
+            { key: "orh:rth", label: "H" },
+            { key: "orl:rth", label: "L" },
+          ].map(({ key, label }) => (
+            <button key={key} onClick={() => setLevelFilter(key)} style={filterBtnStyle(levelFilter === key)}>{label}</button>
+          ))}
+          <span style={{ ...filterLabelStyle, marginLeft: 8 }}>Session:</span>
+          {[
+            { key: "all", label: "All" },
+            { key: "full_session", label: "Full" },
+            { key: "rth", label: "RTH" },
+          ].map(({ key, label }) => (
+            <button key={key} onClick={() => setSessionFilter(key)} style={filterBtnStyle(sessionFilter === key)}>{label}</button>
+          ))}
+          <span style={{ ...filterLabelStyle, marginLeft: 8 }}>Min bars:</span>
+          <input
+            type="number"
+            min={0}
+            max={100}
+            value={minDuration}
+            onChange={(e) => setMinDuration(Math.max(0, parseInt(e.target.value) || 0))}
+            style={{ ...selectStyle, width: 48, padding: "3px 6px" }}
+          />
+          <label style={{ ...checkboxLabelStyle, marginLeft: 8 }}>
+            <input type="checkbox" checked={showLabels} onChange={(e) => setShowLabels(e.target.checked)} />
+            Labels
+          </label>
+          {showVP && (
+            <label style={{ ...checkboxLabelStyle }}>
+              <input type="checkbox" checked={showAllVP} onChange={(e) => setShowAllVP(e.target.checked)} />
+              All VP
+            </label>
+          )}
+          <span style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", marginLeft: 4 }}>
+            {filteredEpisodes.length} / {payload.episodes.length} episodes
+          </span>
+        </div>
+      )}
 
       {error && (
         <div style={{ padding: 10, marginBottom: 12, background: "rgba(239,68,68,0.1)", border: "0.5px solid rgba(239,68,68,0.3)", borderRadius: 6, fontSize: 12, fontFamily: "monospace" }}>
@@ -402,32 +582,54 @@ export function ResearchChart() {
 
       {payload && payload.bars.length > 0 && (
         <>
-          <div style={{ border: "0.5px solid rgba(255,255,255,0.08)", borderRadius: 6, overflow: "hidden" }}>
-            <CandlesChart
-              bars={payload.bars}
-              overlays={overlays}
-              emas={RESEARCH_EMAS}
-              extraLines={extraLines}
-              markers={markers}
-              viewportKey={`${payload.symbol}:${payload.session_date}`}
-              onMarkerClick={(id) => setSelectedEpisodeId(id)}
-              is24h
-              prevDayDate={priorCalendarDate(payload.session_date)}
-              sessionStartEpoch={cmeSessionStartEpoch(payload.session_date)}
+          {/* Two-column: chart + right inspector */}
+          <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ border: "0.5px solid rgba(255,255,255,0.08)", borderRadius: 6, overflow: "hidden" }}>
+                <CandlesChart
+                  bars={payload.bars}
+                  overlays={overlays}
+                  emas={RESEARCH_EMAS}
+                  extraLines={extraLines}
+                  markers={markers}
+                  viewportKey={`${payload.symbol}:${payload.session_date}`}
+                  onMarkerClick={(id) => setSelectedEpisodeId(prev => prev === id ? null : id)}
+                  is24h
+                  prevDayDate={priorCalendarDate(payload.session_date)}
+                  sessionStartEpoch={cmeSessionStartEpoch(payload.session_date)}
+                />
+              </div>
+              {/* Legend below chart */}
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 10, fontSize: 11, color: "rgba(255,255,255,0.45)" }}>
+                <LegendDot color={LEVEL_STYLE["vwap:full_session"].color} label="VWAP" />
+                <LegendDot color={LEVEL_STYLE["vwap:rth"].color} label="VWAP RTH" />
+                <LegendDot color={LEVEL_STYLE["orh:rth"].color} label="ORH" />
+                <LegendDot color={LEVEL_STYLE["orl:rth"].color} label="ORL" />
+                <LegendDot color="#60a5fa" label="EMA 9" />
+                <LegendDot color="#fbbf24" label="EMA 21" />
+                {showVP && payload.vp_rth && (
+                  <>
+                    <LegendDot color={VP_COLORS.poc} label="POC" />
+                    <LegendDot color={VP_COLORS.vah} label="VAH" />
+                    <LegendDot color={VP_COLORS.val} label="VAL" />
+                    <LegendDot color={VP_COLORS.hvn} label="HVN" />
+                    <LegendDot color={VP_COLORS.lvn} label="LVN" />
+                  </>
+                )}
+                {showVP && payload.vp_globex && <LegendDot color={VP_COLORS.globex_poc} label="Globex POC" />}
+                <span style={{ color: "rgba(255,255,255,0.3)" }}>
+                  ● open · ■ close · click to inspect
+                </span>
+              </div>
+            </div>
+
+            {/* Right inspector panel — always rendered to keep chart width stable */}
+            <EpisodeInspector
+              episode={selectedEpisode}
+              tickSize={payload.bars[0]?.tick_size ?? 0.25}
+              onClose={() => setSelectedEpisodeId(null)}
             />
           </div>
-
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 16, marginTop: 12, fontSize: 11, color: "rgba(255,255,255,0.5)" }}>
-            <LegendDot color={LEVEL_STYLE["vwap:full_session"].color} label="VWAP (full session)" />
-            <LegendDot color={LEVEL_STYLE["vwap:rth"].color} label="VWAP (RTH)" />
-            <LegendDot color={LEVEL_STYLE["orh:rth"].color} label="ORH" />
-            <LegendDot color={LEVEL_STYLE["orl:rth"].color} label="ORL" />
-            <LegendDot color="#60a5fa" label="EMA 9" />
-            <LegendDot color="#fbbf24" label="EMA 21" />
-            <span>circle = episode open · square = episode close (click a marker for detail) · dotted = ±proximity band (entry threshold, narrower) · dashed = ±separation band (exit threshold, wider — must clear for 3 consecutive bars)</span>
-          </div>
-
-          {selectedEpisode && <EpisodeDetail episode={selectedEpisode} onClose={() => setSelectedEpisodeId(null)} />}
         </>
       )}
     </div>
@@ -443,39 +645,121 @@ function LegendDot({ color, label }: { color: string; label: string }) {
   );
 }
 
-function EpisodeDetail({ episode, onClose }: { episode: Episode; onClose: () => void }) {
+function EpisodeInspector({
+  episode,
+  tickSize,
+  onClose,
+}: {
+  episode: Episode | null;
+  tickSize: number;
+  onClose: () => void;
+}) {
+  const panelStyle: React.CSSProperties = {
+    width: 272,
+    flexShrink: 0,
+    background: "#0f0f0f",
+    border: "0.5px solid rgba(255,255,255,0.08)",
+    borderRadius: 6,
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: 11,
+    minHeight: 200,
+    maxHeight: "calc(100vh - 180px)",
+    overflowY: "auto",
+  };
+
+  if (!episode) {
+    return (
+      <div style={{ ...panelStyle, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <span style={{ color: "rgba(255,255,255,0.2)", textAlign: "center", padding: 20 }}>
+          Select an episode marker to inspect
+        </span>
+      </div>
+    );
+  }
+
+  const style = styleFor(episode.level_type, episode.session_scope);
+  const anchorPrice = episode.bars.length > 0 ? episode.bars[0].level_value_at_timestamp : null;
+  const durationMins = episode.bar_count; // 1 bar = 1 min
+  const maxAbovePts = (episode.max_above_ticks * tickSize).toFixed(2);
+  const maxBelowPts = (episode.max_below_ticks * tickSize).toFixed(2);
+
+  const startTime = episode.started_at.slice(11, 16);
+  const endTime = episode.ended_at?.slice(11, 16) ?? "—";
+
   return (
-    <div style={{
-      marginTop: 16, padding: 14, background: "#111111",
-      border: "0.5px solid rgba(255,255,255,0.08)", borderRadius: 6,
-      fontFamily: "'IBM Plex Mono', monospace", fontSize: 12,
-    }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-        <strong>
-          {styleFor(episode.level_type, episode.session_scope).label} interaction #{episode.interaction_index}
-          {!episode.is_valid_for_research && (
-            <span style={{ color: "#f59e0b", marginLeft: 8 }}>(excluded from research — gap detected)</span>
-          )}
-        </strong>
-        <button onClick={onClose} style={{ background: "none", border: "none", color: "rgba(255,255,255,0.5)", cursor: "pointer", fontSize: 14 }}>×</button>
+    <div style={panelStyle}>
+      <div style={{
+        padding: "10px 12px 8px",
+        borderBottom: "0.5px solid rgba(255,255,255,0.06)",
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        position: "sticky",
+        top: 0,
+        background: "#0f0f0f",
+      }}>
+        <span style={{ color: style.color, fontWeight: "bold", fontSize: 12 }}>
+          {style.label} #{episode.interaction_index}
+        </span>
+        <button
+          onClick={onClose}
+          style={{ background: "none", border: "none", color: "rgba(255,255,255,0.4)", cursor: "pointer", fontSize: 14, padding: 0 }}
+        >×</button>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, color: "rgba(255,255,255,0.75)" }}>
-        <Field label="Started" value={episode.started_at.slice(11, 16)} />
-        <Field label="Ended" value={episode.ended_at?.slice(11, 16) ?? "—"} />
-        <Field label="Approach" value={episode.approach_side} />
-        <Field label="End reason" value={episode.end_reason} />
-        <Field label="Bars" value={String(episode.bar_count)} />
-        <Field label="Range-spans-level bars" value={String(episode.range_span_count)} />
-        <Field label="Max above (ticks)" value={String(episode.max_above_ticks)} />
-        <Field label="Max below (ticks)" value={String(episode.max_below_ticks)} />
-        <Field label="Close-side flips" value={String(episode.close_side_flip_count)} />
-        <Field label="Max consec. closes above" value={String(episode.max_consecutive_closes_above)} />
-        <Field label="Max consec. closes below" value={String(episode.max_consecutive_closes_below)} />
-        <Field label="End side" value={episode.end_side ?? "—"} />
+
+      {!episode.is_valid_for_research && (
+        <div style={{ padding: "6px 12px", background: "rgba(245,158,11,0.1)", fontSize: 10, color: "#f59e0b" }}>
+          excluded from research — gap detected
+        </div>
+      )}
+
+      <div style={{ padding: "10px 12px", display: "flex", flexDirection: "column", gap: 10 }}>
+
+        {/* Anchor */}
+        <InspectorSection label="Anchor">
+          <Field label="Level" value={style.label} />
+          <Field label="Price at open" value={anchorPrice != null ? anchorPrice.toFixed(2) : "—"} />
+        </InspectorSection>
+
+        {/* Timing */}
+        <InspectorSection label="Timing">
+          <Field label="Start" value={startTime} />
+          <Field label="End" value={endTime} />
+          <Field label="Duration" value={`${durationMins} bars · ${durationMins} min`} />
+          <Field label="Phase" value={`${episode.start_session_phase}${episode.end_session_phase && episode.end_session_phase !== episode.start_session_phase ? ` → ${episode.end_session_phase}` : ""}`} />
+        </InspectorSection>
+
+        {/* Geometry */}
+        <InspectorSection label="Geometry">
+          <Field label="Approach" value={episode.approach_side} />
+          <Field label="End side" value={episode.end_side ?? "—"} />
+          <Field label="End reason" value={episode.end_reason} />
+          <Field label="Max above" value={`+${maxAbovePts} pts`} />
+          <Field label="Max below" value={`−${maxBelowPts} pts`} />
+          <Field label="Range-spans" value={`${episode.range_span_count} bars`} />
+        </InspectorSection>
+
+        {/* Behaviour */}
+        <InspectorSection label="Behaviour">
+          <Field label="Flip count" value={String(episode.close_side_flip_count)} />
+          <Field label="Consec. above" value={String(episode.max_consecutive_closes_above)} />
+          <Field label="Consec. below" value={String(episode.max_consecutive_closes_below)} />
+          <Field label="Bar records" value={String(episode.bars.length)} />
+        </InspectorSection>
+
       </div>
-      <div style={{ marginTop: 10, color: "rgba(255,255,255,0.4)", fontSize: 10 }}>
-        {episode.bars.length} bar records · session_scope={episode.session_scope} ·
-        {" "}{episode.start_session_phase} → {episode.end_session_phase ?? "—"}
+    </div>
+  );
+}
+
+function InspectorSection({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.1em", color: "rgba(255,255,255,0.25)", marginBottom: 6 }}>
+        {label}
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 8px" }}>
+        {children}
       </div>
     </div>
   );
@@ -484,28 +768,8 @@ function EpisodeDetail({ episode, onClose }: { episode: Episode; onClose: () => 
 function Field({ label, value }: { label: string; value: string }) {
   return (
     <div>
-      <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: "rgba(255,255,255,0.35)" }}>{label}</div>
-      <div>{value}</div>
+      <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.06em", color: "rgba(255,255,255,0.3)" }}>{label}</div>
+      <div style={{ color: "rgba(255,255,255,0.8)", fontSize: 11, wordBreak: "break-word" }}>{value}</div>
     </div>
   );
 }
-
-const selectStyle: React.CSSProperties = {
-  background: "#111111",
-  color: "#fff",
-  border: "0.5px solid rgba(255,255,255,0.15)",
-  borderRadius: 4,
-  padding: "4px 8px",
-  fontFamily: "'IBM Plex Mono', monospace",
-  fontSize: 12,
-};
-
-const checkboxLabelStyle: React.CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  gap: 6,
-  fontSize: 11,
-  color: "rgba(255,255,255,0.6)",
-  fontFamily: "'IBM Plex Mono', monospace",
-  cursor: "pointer",
-};

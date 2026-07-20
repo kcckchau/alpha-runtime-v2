@@ -35,9 +35,11 @@ from alpha.features.slope import (
     SLOPE_FLAT_THRESHOLD_5M,
     classify_slope,
 )
+from alpha.features.volume_profile_loader import VolumeProfileLoader
 from alpha.models.enums import AssetClass, BarTimeframe, EventType, HealthStatus, SessionPhase
 from alpha.models.events import AnyEvent, BarBundleEvent, BarEvent, QuoteEvent
 from alpha.models.snapshot import BarSnapshot
+from alpha.models.volume_profile import VolumeProfile
 
 logger = logging.getLogger(__name__)
 
@@ -353,6 +355,11 @@ class FeatureEngine(BaseEngine):
         self._d1_ema: dict[str, _HTFEMAState] = {}
         self._pipeline_mode: bool = False  # set True by BarPipeline before engine.start()
         self._pending_m5: dict[str, list[BarEvent]] = {}  # M5 bars buffered until process_bar flushes
+        self._vp_loader = VolumeProfileLoader(settings.storage.volume_profiles_root)
+        # Per-symbol VP profiles — loaded at session open, held for the session.
+        self._vp_rth: dict[str, VolumeProfile | None] = {}    # prior RTH profile
+        self._vp_globex: dict[str, VolumeProfile | None] = {} # overnight Globex profile
+        self._vp_session_key: dict[str, str | None] = {}      # tracks when to reload
 
     @property
     def name(self) -> str:
@@ -519,6 +526,13 @@ class FeatureEngine(BaseEngine):
                 datetime.min.time(),
                 tzinfo=bar.timestamp.tzinfo,
             )
+            # Load VP profiles once per session at the session boundary.
+            sym = bar.symbol
+            if self._vp_session_key.get(sym) != session_key:
+                self._vp_session_key[sym] = session_key
+                rth, globex = self._vp_loader.load_session_pair(sym, session_date)
+                self._vp_rth[sym] = rth
+                self._vp_globex[sym] = globex
 
         state.bars.append(bar)
 
@@ -1079,7 +1093,53 @@ class FeatureEngine(BaseEngine):
             rth_median_1m_range=state.rth_median_1m_range,
             rth_p75_1m_range=state.rth_p75_1m_range,
             rth_p90_1m_range=state.rth_p90_1m_range,
+            **self._compute_vp_fields(bar.symbol, bar.close, state.atr_30),
         )
+
+    # ── Volume Profile helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def _vp_location(close: Decimal, profile: VolumeProfile) -> str:
+        if close == profile.poc:
+            return "at_poc"
+        if close >= profile.val and close <= profile.vah:
+            return "inside_va"
+        if close > profile.vah:
+            return "above_va"
+        return "below_va"
+
+    @staticmethod
+    def _nearest_level_distance(close: Decimal, levels: list[Decimal], atr: Decimal) -> float | None:
+        if not levels:
+            return None
+        nearest = min(levels, key=lambda lvl: abs(close - lvl))
+        return float((close - nearest) / atr)
+
+    def _compute_vp_fields(self, symbol: str, close: Decimal, atr: Decimal | None) -> dict:
+        """Return VP snapshot fields. All None when profile or ATR is unavailable."""
+        rth = self._vp_rth.get(symbol)
+        globex = self._vp_globex.get(symbol)
+
+        if atr is None or atr <= _ZERO:
+            return {}
+
+        result: dict = {}
+
+        if rth is not None:
+            result["vp_source"] = rth.source
+            result["vp_poc_distance_atr"] = float((close - rth.poc) / atr)
+            result["vp_vah_distance_atr"] = float((close - rth.vah) / atr)
+            result["vp_val_distance_atr"] = float((close - rth.val) / atr)
+            result["vp_location"] = self._vp_location(close, rth)
+            result["vp_nearest_hvn_distance_atr"] = self._nearest_level_distance(close, rth.hvn_levels, atr)
+            result["vp_nearest_lvn_distance_atr"] = self._nearest_level_distance(close, rth.lvn_levels, atr)
+
+        if globex is not None:
+            result["vp_globex_source"] = globex.source
+            result["vp_globex_poc_distance_atr"] = float((close - globex.poc) / atr)
+            result["vp_globex_location"] = self._vp_location(close, globex)
+
+        return result
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

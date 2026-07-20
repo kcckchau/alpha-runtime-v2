@@ -244,6 +244,26 @@ class BarSnapshot(BaseModel):
     rth_p75_1m_range: Decimal | None = None     # 75th pct — "large but normal" candle
     rth_p90_1m_range: Decimal | None = None     # 90th pct — "abnormally large" candle
 
+    # ── Volume Profile levels (prior RTH session) ─────────────────────────────
+    # Loaded once at session open from pre-built JSON profiles.
+    # All None when no profile exists (first session of data set, or profile not yet built).
+    # source: "trades" | "bars" — indicates profile quality.
+    # Distances: signed ATR units, normalised by atr_30. Positive = price above level.
+    vp_source: str | None = None                   # "trades" | "bars" | None
+    vp_poc_distance_atr: float | None = None       # (close - poc) / atr_30
+    vp_vah_distance_atr: float | None = None       # (close - vah) / atr_30
+    vp_val_distance_atr: float | None = None       # (close - val) / atr_30
+    vp_location: str | None = None                 # "above_va" | "inside_va" | "below_va" | "at_poc"
+    vp_nearest_hvn_distance_atr: float | None = None  # signed dist to nearest HVN; None if no HVNs
+    vp_nearest_lvn_distance_atr: float | None = None  # signed dist to nearest LVN; None if no LVNs
+
+    # ── Volume Profile levels (Globex overnight session) ──────────────────────
+    # Profile covers 18:00 ET prior day → 09:30 ET current day.
+    # Same convention: signed ATR units vs atr_30.
+    vp_globex_source: str | None = None
+    vp_globex_poc_distance_atr: float | None = None
+    vp_globex_location: str | None = None          # "above_va" | "inside_va" | "below_va" | "at_poc"
+
     # ── Intrabar flow context (populated by BarFlowAggregator) ───────────────
     # None when running without full-signals data (historical bars, no trades/quotes cache).
     flow: BarFlowContext | None = None

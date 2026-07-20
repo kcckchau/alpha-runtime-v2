@@ -21,8 +21,11 @@ router = APIRouter(prefix="/research", tags=["research"])
 
 
 def _research_root() -> Path:
-    settings = get_settings()
-    return Path(settings.storage.parquet_root).parent / "research"
+    return Path(get_settings().storage.parquet_root).parent / "research"
+
+
+def _profiles_root() -> Path:
+    return Path(get_settings().storage.volume_profiles_root)
 
 
 @router.get("/symbols")
@@ -46,7 +49,7 @@ async def get_chart(symbol: str, date: str) -> dict:
     """Chart-ready payload: reconstructed M1 bars + ORH/ORL + episodes for one session."""
     loop = asyncio.get_running_loop()
     payload = await loop.run_in_executor(
-        None, build_chart_payload, _research_root(), symbol, date
+        None, build_chart_payload, _research_root(), symbol, date, _profiles_root()
     )
     if not payload["bars"]:
         raise HTTPException(
