@@ -204,7 +204,7 @@ class LevelObserver:
         # contaminates dates already covered by research_replay.py with a second
         # run_id starting mid-session (wherever catchup began). State is still
         # maintained (session rollover detection below runs unconditionally).
-        write_obs = not event.is_replay
+        write_obs = not getattr(event, "is_replay", False)
 
         symbol = event.symbol
         bar_timestamp = event.timestamp
