@@ -26,13 +26,17 @@ Policy definitions (vp_v1):
     value_area_target:      math.ceil(total_volume * pct)  — ensures true ≥70%
     value_area_tie_break:   expand upward when vol_above == vol_below
     poc_tie_break:          lowest price wins when two bins share max volume
-    hvn_definition:         strict local maximum (both neighbours strictly lower)
-    lvn_definition:         strict local minimum (both neighbours strictly higher)
-    hvn/lvn note:           single-bin, no smoothing, no prominence filter.
-                            Treat as research visualization only; not suitable
-                            as trading level triggers without further filtering.
+    hvn_definition:         strict local maximum (both neighbours strictly lower),
+                            then adjacent peaks within min_merge_distance merged
+                            using volume-weighted center.
+    lvn_definition:         strict local minimum (both neighbours strictly higher),
+                            then adjacent troughs within min_merge_distance merged
+                            using volume-weighted center (lowest vol trough wins).
+    min_merge_distance:     8.0 points default. Peaks/troughs closer than this
+                            are the same auction zone, not independent nodes.
+                            Set to 0 to disable merging (research/debug only).
 
-HVN/LVN are capped at max_hvn / max_lvn. Default 5 each.
+HVN/LVN are capped at max_hvn / max_lvn (applied after merging). Default 5 each.
 Bin size: 1.0 MNQ point (4 ticks) by default. Configurable.
 """
 
@@ -52,6 +56,7 @@ DEFAULT_BIN_SIZE: Decimal = Decimal("1.0")
 VALUE_AREA_PCT: float = 0.70
 DEFAULT_MAX_HVN: int = 5
 DEFAULT_MAX_LVN: int = 5
+DEFAULT_MIN_MERGE_DISTANCE: Decimal = Decimal("8.0")  # MNQ points
 
 
 class VolumeProfileBuilder:
@@ -61,11 +66,13 @@ class VolumeProfileBuilder:
         value_area_pct: float = VALUE_AREA_PCT,
         max_hvn: int = DEFAULT_MAX_HVN,
         max_lvn: int = DEFAULT_MAX_LVN,
+        min_merge_distance: Decimal = DEFAULT_MIN_MERGE_DISTANCE,
     ) -> None:
         self.bin_size = bin_size
         self.value_area_pct = value_area_pct
         self.max_hvn = max_hvn
         self.max_lvn = max_lvn
+        self.min_merge_distance = min_merge_distance
 
     def build(
         self,
@@ -231,33 +238,71 @@ class VolumeProfileBuilder:
 
         return sorted_levels[hi_idx], sorted_levels[lo_idx], va_volume
 
+    def _merge_nodes(
+        self,
+        nodes: list[tuple[Decimal, int]],
+        descending_vol: bool,
+    ) -> list[tuple[Decimal, int]]:
+        """Merge adjacent nodes within min_merge_distance into one node.
+
+        Nodes are sorted by price before merging. Adjacent nodes whose price
+        gap is <= min_merge_distance are combined into a single node at the
+        volume-weighted center, with combined volume. After merging, nodes are
+        re-sorted by volume (descending for HVN, ascending for LVN).
+        """
+        if not nodes or self.min_merge_distance <= 0:
+            nodes_sorted = sorted(nodes, key=lambda x: x[1], reverse=descending_vol)
+            return nodes_sorted
+
+        by_price = sorted(nodes, key=lambda x: x[0])
+
+        clusters: list[list[tuple[Decimal, int]]] = [[by_price[0]]]
+        for price, vol in by_price[1:]:
+            if price - clusters[-1][-1][0] <= self.min_merge_distance:
+                clusters[-1].append((price, vol))
+            else:
+                clusters.append([(price, vol)])
+
+        merged: list[tuple[Decimal, int]] = []
+        for cluster in clusters:
+            total_vol = sum(v for _, v in cluster)
+            # Volume-weighted center, snapped to nearest bin
+            wsum = sum(p * v for p, v in cluster)
+            center = wsum / total_vol
+            n_bins = round(float(center) / float(self.bin_size))
+            center_snapped = Decimal(str(n_bins)) * self.bin_size
+            merged.append((center_snapped, total_vol))
+
+        merged.sort(key=lambda x: x[1], reverse=descending_vol)
+        return merged
+
     def _hvn(
         self,
         dist: dict[Decimal, int],
         sorted_levels: list[Decimal],
         poc: Decimal,
     ) -> list[Decimal]:
-        """Local maxima excluding POC, ranked by volume descending."""
-        hvns: list[tuple[Decimal, int]] = []
+        """Local maxima excluding POC, merged within min_merge_distance, ranked by volume descending."""
+        raw: list[tuple[Decimal, int]] = []
         for i in range(1, len(sorted_levels) - 1):
             level = sorted_levels[i]
             if level == poc:
                 continue
             if dist[level] > dist[sorted_levels[i - 1]] and dist[level] > dist[sorted_levels[i + 1]]:
-                hvns.append((level, dist[level]))
-        hvns.sort(key=lambda x: x[1], reverse=True)
-        return [lvl for lvl, _ in hvns]
+                raw.append((level, dist[level]))
+        merged = self._merge_nodes(raw, descending_vol=True)
+        return [lvl for lvl, _ in merged]
 
     def _lvn(
         self,
         dist: dict[Decimal, int],
         sorted_levels: list[Decimal],
     ) -> list[Decimal]:
-        """Local minima, ranked by volume ascending (lowest volume first)."""
-        lvns: list[tuple[Decimal, int]] = []
+        """Local minima, merged within min_merge_distance, ranked by volume ascending."""
+        raw: list[tuple[Decimal, int]] = []
         for i in range(1, len(sorted_levels) - 1):
             level = sorted_levels[i]
             if dist[level] < dist[sorted_levels[i - 1]] and dist[level] < dist[sorted_levels[i + 1]]:
-                lvns.append((level, dist[level]))
-        lvns.sort(key=lambda x: x[1])
-        return [lvl for lvl, _ in lvns]
+                raw.append((level, dist[level]))
+        merged = self._merge_nodes(raw, descending_vol=False)
+        return [lvl for lvl, _ in merged]

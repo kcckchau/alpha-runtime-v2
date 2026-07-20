@@ -146,7 +146,8 @@ def test_hvn_are_local_maxima():
     """
     Manually construct a distribution with a clear local maximum.
     Bins: 100=100, 101=500, 102=100, 103=800(POC), 104=100, 105=400, 106=100
-    Local maxima (not POC): bin 101 (500 > 100 on both sides), bin 105 (400 > 100 on both sides)
+    Local maxima (not POC): bin 101 and 105. With min_merge_distance=0 (disabled)
+    they stay as separate nodes (only 4 pts apart, well within default 8-pt merge).
     """
     bars = [
         _bar(100.0, 100.0, 100),
@@ -157,12 +158,34 @@ def test_hvn_are_local_maxima():
         _bar(105.0, 105.0, 400),
         _bar(106.0, 106.0, 100),
     ]
-    p = _builder().build(bars, "MNQ-09", _DATE)
+    from decimal import Decimal as D
+    builder = VolumeProfileBuilder(bin_size=_BIN, min_merge_distance=D("0"))
+    p = builder.build(bars, "MNQ-09", _DATE)
     assert p.poc == Decimal("103.0")
     assert Decimal("101.0") in p.hvn_levels
     assert Decimal("105.0") in p.hvn_levels
     # POC not in HVN list
     assert p.poc not in p.hvn_levels
+
+
+def test_hvn_merge_close_peaks():
+    """Two peaks within min_merge_distance collapse to one volume-weighted node."""
+    # Peaks at 101 (vol=400) and 105 (vol=600) are 4 pts apart; merge_distance=8
+    # Weighted center = (101*400 + 105*600) / 1000 = (40400 + 63000) / 1000 = 103.4 → 103
+    bars = [
+        _bar(100.0, 100.0, 50),
+        _bar(101.0, 101.0, 400),
+        _bar(102.0, 102.0, 50),
+        _bar(103.0, 103.0, 50),   # not POC
+        _bar(104.0, 104.0, 50),
+        _bar(105.0, 105.0, 600),
+        _bar(106.0, 106.0, 50),
+        _bar(115.0, 115.0, 900),  # POC far away
+    ]
+    p = _builder().build(bars, "MNQ-09", _DATE)
+    assert p.poc == Decimal("115.0")
+    # Only one merged HVN from the 101+105 cluster — not two separate ones
+    assert len([h for h in p.hvn_levels if Decimal("99") < h < Decimal("108")]) == 1
 
 
 def test_hvn_ranked_by_volume_descending():
@@ -186,6 +209,7 @@ def test_hvn_ranked_by_volume_descending():
 def test_lvn_are_local_minima():
     """
     Bins: 100=500, 101=50(LVN), 102=500, 103=800(POC), 104=500, 105=30(LVN), 106=500
+    With min_merge_distance=0 (disabled) the two LVNs stay separate.
     """
     bars = [
         _bar(100.0, 100.0, 500),
@@ -196,7 +220,9 @@ def test_lvn_are_local_minima():
         _bar(105.0, 105.0, 30),
         _bar(106.0, 106.0, 500),
     ]
-    p = _builder().build(bars, "MNQ-09", _DATE)
+    from decimal import Decimal as D
+    builder = VolumeProfileBuilder(bin_size=_BIN, min_merge_distance=D("0"))
+    p = builder.build(bars, "MNQ-09", _DATE)
     assert Decimal("101.0") in p.lvn_levels
     assert Decimal("105.0") in p.lvn_levels
 
