@@ -111,13 +111,21 @@ def _to_decimal(raw: int) -> Decimal:
 
 
 def _map_taker_side(side: object) -> TakerSide:
-    # Databento side: 'A' = aggressor hit the ask (buyer) → BUY
-    #                 'B' = aggressor hit the bid (seller) → SELL
+    # Empirically verified (2026-07-12, see the identical fix and its
+    # methodology note in historical/sources/databento.py's _map_taker_side)
+    # by joining trades against quotes and checking which side of the book
+    # each print actually landed on: 'A'-tagged prints land at the bid and
+    # 'B'-tagged prints land at the ask — the reverse of Databento's schema
+    # docs as previously (and wrongly) understood here. This is a SEPARATE
+    # copy of that function for the live ingestion path — confirmed
+    # 2026-07-21 via a live-vs-backfill split cross-check on the same day
+    # (MNQ-09 2026-07-10) that this copy still had the old, inverted
+    # mapping while the historical one had already been fixed.
     s = str(side) if side is not None else ""
     if "A" in s:
-        return TakerSide.BUY
-    if "B" in s:
         return TakerSide.SELL
+    if "B" in s:
+        return TakerSide.BUY
     return TakerSide.UNKNOWN
 
 
