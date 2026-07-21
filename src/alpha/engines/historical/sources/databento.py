@@ -534,6 +534,58 @@ class DatabentoHistoricalDataSource(HistoricalDataSource):
                 "ask_exchange": None,
             }
 
+    async def fetch_mbo_raw(self, symbol: str, start: datetime, end: datetime) -> int:
+        """Download and archive raw MBO (market-by-order, full depth) data.
+
+        Archive-only, no decode: MBO is the densest schema Databento offers
+        (every individual order add/cancel/modify/fill, not aggregated to
+        top-of-book like mbp-1) — there's no MBOEvent model or Parquet
+        destination for it, and decoding it into per-record Python objects
+        the way fetch_quotes/fetch_trades do would repeat the exact
+        Pydantic/list-of-dicts memory problems already hit and fixed for
+        mbp-1 at a schema that's denser still. This mirrors download_raw.py's
+        philosophy: get the compressed bytes onto local disk via
+        store.to_file(), nothing else. Returns the archived size in bytes
+        for logging (DBNStore has no cheap record count — .nbytes is a
+        metadata lookup, not a full decode; counting records would require
+        iterating the whole store).
+        """
+        db_symbol = self._databento_symbol(symbol)
+        end = self._safe_end(end, schema="mbo")
+
+        if start >= end:
+            return 0
+
+        loop = asyncio.get_running_loop()
+        store = await loop.run_in_executor(None, self._load_from_archive, "mbo", db_symbol, start, end)
+        from_cache = store is not None
+        if store is None:
+            await loop.run_in_executor(None, self._log_cost_estimate, "mbo", db_symbol, start, end)
+            try:
+                store = self._client.timeseries.get_range(
+                    dataset=self._settings.dataset,
+                    schema="mbo",
+                    symbols=[db_symbol],
+                    start=start.isoformat(),
+                    end=end.isoformat(),
+                    stype_in=self._settings.stype_in,
+                )
+            except Exception as exc:
+                msg = str(exc)
+                if "data_schema_not_fully_available" in msg or "data_end_after_available_end" in msg:
+                    logger.debug("Databento fetch_mbo_raw: %s schema not yet available at end=%s", symbol, end.isoformat())
+                else:
+                    logger.exception("Databento mbo fetch failed for %s", symbol)
+                return 0
+            await loop.run_in_executor(None, self._archive_raw, store, "mbo", db_symbol, start, end)
+
+        nbytes = store.nbytes
+        logger.info(
+            "Databento fetch_mbo_raw: %s — %.1f MB archived%s",
+            symbol, nbytes / 1e6, " [cache]" if from_cache else "",
+        )
+        return nbytes
+
 
 def _map_taker_side(raw: str | None) -> TakerSide:
     # Empirically verified (2026-07-12) by joining trades against quotes and

@@ -81,8 +81,11 @@ async def _download_day(
             async for _ in source.fetch_quotes(symbol, day_start, day_end):
                 n += 1
             print(f"  {d.isoformat()} mbp-1          archived {n:>10,}")
+        elif schema == "mbo":
+            nbytes = await source.fetch_mbo_raw(symbol, day_start, day_end)
+            print(f"  {d.isoformat()} mbo            archived {nbytes / 1e6:>9,.1f} MB")
         else:
-            print(f"  {d.isoformat()} {schema}: unsupported — only {list(_TIMEFRAME_SCHEMAS)} + trades/mbp-1 are wired")
+            print(f"  {d.isoformat()} {schema}: unsupported — only {list(_TIMEFRAME_SCHEMAS)} + trades/mbp-1/mbo are wired")
 
 
 async def _run(symbol: str, start: date, end: date, schemas: list[str]) -> None:
@@ -113,7 +116,9 @@ def main() -> None:
     parser.add_argument("--end", required=True, help="End date YYYY-MM-DD")
     parser.add_argument(
         "--schemas", default=None,
-        help="Comma-separated: 1s,1m,5m,1h,1d,trades,mbp-1 (default with --ticks: trades,mbp-1; otherwise 1m)",
+        help="Comma-separated: 1s,1m,5m,1h,1d,trades,mbp-1,mbo (default with --ticks: trades,mbp-1; otherwise 1m). "
+             "mbo is archive-only (raw .dbn.zst, no Parquet decode) and is the densest schema Databento offers — "
+             "expect a large download.",
     )
     parser.add_argument(
         "--ticks", action="store_true",
