@@ -320,6 +320,104 @@ def cross_validate_bars_trades(
     return failures, warnings
 
 
+# ── DBN vs Parquet cross-check ────────────────────────────────────────────────
+
+def _find_overlapping_archives(archive_dir: Path, d: date) -> list[Path]:
+    """Return ohlcv-1m archives whose timestamp range overlaps the target calendar date."""
+    day_start = datetime(d.year, d.month, d.day, tzinfo=_UTC)
+    day_end = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=_UTC)
+    result = []
+    for f in sorted(archive_dir.glob("*.dbn.zst")):
+        name = f.name
+        stem = name[:-8] if name.endswith(".dbn.zst") else (name[:-4] if name.endswith(".dbn") else None)
+        if stem is None:
+            continue
+        parts = stem.split("_")
+        if len(parts) != 2:
+            continue
+        try:
+            arch_start = datetime.strptime(parts[0], "%Y%m%dT%H%M%S").replace(tzinfo=_UTC)
+            arch_end = datetime.strptime(parts[1], "%Y%m%dT%H%M%S").replace(tzinfo=_UTC)
+        except ValueError:
+            continue
+        if arch_start <= day_end and arch_end >= day_start:
+            result.append(f)
+    return result
+
+
+def check_bars_vs_dbn(
+    raw_root: Path, parquet_root: Path, symbol: str, db_symbol: str, d: date, verbose: bool
+) -> tuple[bool, list[str]]:
+    """Verify every 1m bar in local DBN ohlcv-1m archives exists in Parquet.
+
+    Scans all archives overlapping the target calendar date, extracts bar
+    timestamps for that date, and checks that Parquet contains all of them.
+    Extra bars in Parquet (from the live feed) are not flagged — only bars
+    present in DBN but absent from Parquet are hard failures.
+
+    Returns (ok, issues).
+    """
+    import databento as db
+    import pandas as pd
+
+    archive_dir = raw_root / "ohlcv-1m" / db_symbol
+    if not archive_dir.exists():
+        return True, []
+
+    day_start = datetime(d.year, d.month, d.day, tzinfo=_UTC)
+    day_end = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=_UTC)
+
+    matching = _find_overlapping_archives(archive_dir, d)
+    if not matching:
+        return True, []  # no local archives for this date — skip
+
+    dbn_timestamps: set[datetime] = set()
+    for f in matching:
+        try:
+            store = db.DBNStore.from_file(str(f))
+        except Exception as e:
+            return False, [f"failed to open archive {f.name}: {e}"]
+        for rec in store:
+            rtype = getattr(rec, "rtype", None)
+            if rtype in (21, 22, 23):  # error/mapping/system records
+                continue
+            ts_ns = getattr(rec, "ts_event", None)
+            if ts_ns is None:
+                continue
+            ts = datetime.fromtimestamp(ts_ns / 1e9, tz=_UTC)
+            if day_start <= ts <= day_end:
+                dbn_timestamps.add(ts)
+
+    if not dbn_timestamps:
+        return True, []
+
+    if verbose:
+        print(f"      archives checked: {len(matching)}")
+        print(f"      DBN bars for {d}: {len(dbn_timestamps)}")
+
+    parquet_path = _parquet_path(parquet_root, "bars/1m", symbol, d)
+    if not parquet_path.exists():
+        return False, [f"Parquet missing — DBN has {len(dbn_timestamps)} bars for this date"]
+
+    try:
+        df = pd.read_parquet(parquet_path, columns=["timestamp"])
+    except Exception as e:
+        return False, [f"failed to read Parquet: {e}"]
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True)
+    parquet_timestamps = set(df["timestamp"].dt.to_pydatetime())
+
+    missing = dbn_timestamps - parquet_timestamps
+    if not missing:
+        if verbose:
+            print(f"      Parquet bars: {len(parquet_timestamps)} — all {len(dbn_timestamps)} DBN bars present")
+        return True, []
+
+    sample = [t.isoformat() for t in sorted(missing)[:3]]
+    detail = f"first 3: {sample}" if len(missing) > 3 else str(sample)
+    return False, [f"{len(missing)} bar(s) in DBN archive missing from Parquet — {detail}"]
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 _SCHEMA_TO_DB_SYMBOL = {
@@ -390,6 +488,17 @@ def run_checks(symbol: str, d: date, schemas: list[str], verbose: bool) -> int:
             else:
                 for issue in issues:
                     print(_fmt("trades parquet", FAIL, issue))
+                failures += 1
+
+    # ── DBN vs Parquet ────────────────────────────────────────────
+    if "1m" in schemas and raw_root is not None:
+        print("\nDBN vs Parquet:")
+        ok, issues = check_bars_vs_dbn(raw_root, parquet_root, symbol, db_symbol, d, verbose)
+        if ok:
+            print(_fmt("bars/1m vs ohlcv-1m archive", PASS))
+        else:
+            for issue in issues:
+                print(_fmt("bars/1m vs ohlcv-1m archive", FAIL, issue))
                 failures += 1
 
     # ── Cross-validation ──────────────────────────────────────────
