@@ -405,7 +405,7 @@ def check_bars_vs_dbn(
         return False, [f"failed to read Parquet: {e}"]
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True)
-    parquet_timestamps = set(df["timestamp"].dt.to_pydatetime())
+    parquet_timestamps = set(df["timestamp"].dt.to_pydatetime().tolist())
 
     missing = dbn_timestamps - parquet_timestamps
     if not missing:
