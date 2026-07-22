@@ -63,7 +63,7 @@ def _timeframe_delta(timeframe: BarTimeframe) -> timedelta:
     return mapping[timeframe]
 
 
-def _resample_m5(m1_bars: list[Any]) -> list[BarEvent]:
+def resample_m5(m1_bars: list[Any]) -> list[BarEvent]:
     """Aggregate M1 bars into M5 bars by 5-minute boundary.
 
     Databento has no ohlcv-5m schema — M5 is always derived from M1.
@@ -169,7 +169,7 @@ class CatchupService:
                         symbol, len(m1_bars), m1_start.date(), m1_end.isoformat())
 
             # Persist M1 bars to Parquet so the chart shows the full session on
-            # next open. Unlike H1/D1 (_load_or_fetch_bars handles their storage),
+            # next open. Unlike H1/D1 (load_or_fetch_bars handles their storage),
             # M1 has no Parquet cache — it's always fetched fresh. Without this
             # step the StorageEngine's is_replay skip means M1 catchup bars never
             # land on disk, so the chart only shows data from when the live feed
@@ -183,7 +183,7 @@ class CatchupService:
             self._build_vp_profiles(symbol, m1_bars)
 
             # ── H1/D1: Parquet cache with gap-fill ────────────────────────────
-            hourly_bars = await self._load_or_fetch_bars(
+            hourly_bars = await self.load_or_fetch_bars(
                 symbol=symbol,
                 timeframe=BarTimeframe.H1,
                 start=h1_start,
@@ -193,7 +193,7 @@ class CatchupService:
             symbol_d1_start = d1_start
             if symbol_def.asset_class == AssetClass.FUTURE:
                 symbol_d1_start = max(d1_start, d1_end - timedelta(days=45))
-            daily_bars = await self._load_or_fetch_bars(
+            daily_bars = await self.load_or_fetch_bars(
                 symbol=symbol,
                 timeframe=BarTimeframe.D1,
                 start=symbol_d1_start,
@@ -202,7 +202,7 @@ class CatchupService:
             )
 
             # ── M5: resample from M1 ──────────────────────────────────────────
-            minute5_bars = _resample_m5(m1_bars)
+            minute5_bars = resample_m5(m1_bars)
 
             # ── Emit in dependency order ──────────────────────────────────────
             for bar in daily_bars:
@@ -227,22 +227,6 @@ class CatchupService:
             }
 
         return result, m1_end
-
-    async def fetch_range(
-        self,
-        symbol: str,
-        timeframe: BarTimeframe,
-        start: datetime,
-        end: datetime,
-    ) -> list[Any]:
-        """Fetch a bar range without emitting. Used by BackfillEngine."""
-        return await self._load_or_fetch_bars(
-            symbol=symbol,
-            timeframe=timeframe,
-            start=start,
-            end=end,
-            emit=False,
-        )
 
     # ── Volume Profile auto-build ─────────────────────────────────────────────
 
@@ -349,7 +333,7 @@ class CatchupService:
         d1_end = source.availability_end("ohlcv-1d")
         return m1_end, h1_end, d1_end
 
-    async def _load_or_fetch_bars(
+    async def load_or_fetch_bars(
         self,
         symbol: str,
         timeframe: BarTimeframe,

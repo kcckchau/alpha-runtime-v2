@@ -270,6 +270,16 @@ class StorageEngine(BaseEngine):
         otherwise the new rows would just append on top of the old ones."""
         self._parquet.delete("quotes", symbol, d)
 
+    async def clear_bars(self, symbol: str, timeframe: BarTimeframe, d: date) -> None:
+        """Delete a day's bar file for the given timeframe.
+
+        Used when rewriting M5 bars from resampled M1 — prior backfill runs
+        may have stored M5-labeled bars with 1-minute timestamps (wrong), which
+        won't collide with correct 5-minute timestamps on dedup, so the old file
+        must be wiped before writing the resampled bars.
+        """
+        self._parquet.delete(f"bars/{timeframe}", symbol, d)
+
     async def list_bar_dates(self, symbol: str, timeframe: BarTimeframe) -> list[date]:
         return self._parquet.list_dates(f"bars/{timeframe}", symbol)
 
