@@ -103,7 +103,7 @@ def main() -> None:
             _PYTHON, "scripts/validate_data.py",
             "--symbol", args.symbol,
             "--date", target.isoformat(),
-            "--schemas", "1m,trades",
+            "--schemas", "1m,1h,1d,trades",
         ],
     )
     if rc != 0:

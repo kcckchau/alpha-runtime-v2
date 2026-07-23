@@ -322,8 +322,15 @@ def cross_validate_bars_trades(
 
 # ── DBN vs Parquet cross-check ────────────────────────────────────────────────
 
+_TIMEFRAME_TO_DBN_SCHEMA = {
+    "1m": "ohlcv-1m",
+    "1h": "ohlcv-1h",
+    "1d": "ohlcv-1d",
+}
+
+
 def _find_overlapping_archives(archive_dir: Path, d: date) -> list[Path]:
-    """Return ohlcv-1m archives whose timestamp range overlaps the target calendar date."""
+    """Return OHLCV archives whose timestamp range overlaps the target calendar date."""
     day_start = datetime(d.year, d.month, d.day, tzinfo=_UTC)
     day_end = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=_UTC)
     result = []
@@ -346,21 +353,25 @@ def _find_overlapping_archives(archive_dir: Path, d: date) -> list[Path]:
 
 
 def check_bars_vs_dbn(
-    raw_root: Path, parquet_root: Path, symbol: str, db_symbol: str, d: date, verbose: bool
+    raw_root: Path, parquet_root: Path, symbol: str, db_symbol: str, d: date, verbose: bool,
+    timeframe: str = "1m",
 ) -> tuple[bool, list[str]]:
-    """Verify every 1m bar in local DBN ohlcv-1m archives exists in Parquet.
+    """Verify every bar in local DBN OHLCV archives exists in Parquet.
 
     Scans all archives overlapping the target calendar date, extracts bar
     timestamps for that date, and checks that Parquet contains all of them.
     Extra bars in Parquet (from the live feed) are not flagged — only bars
     present in DBN but absent from Parquet are hard failures.
 
+    timeframe: "1m", "1h", or "1d"
+
     Returns (ok, issues).
     """
     import databento as db
     import pandas as pd
 
-    archive_dir = raw_root / "ohlcv-1m" / db_symbol
+    dbn_schema = _TIMEFRAME_TO_DBN_SCHEMA.get(timeframe, f"ohlcv-{timeframe}")
+    archive_dir = raw_root / dbn_schema / db_symbol
     if not archive_dir.exists():
         return True, []
 
@@ -395,7 +406,7 @@ def check_bars_vs_dbn(
         print(f"      archives checked: {len(matching)}")
         print(f"      DBN bars for {d}: {len(dbn_timestamps)}")
 
-    parquet_path = _parquet_path(parquet_root, "bars/1m", symbol, d)
+    parquet_path = _parquet_path(parquet_root, f"bars/{timeframe}", symbol, d)
     if not parquet_path.exists():
         return False, [f"Parquet missing — DBN has {len(dbn_timestamps)} bars for this date"]
 
@@ -463,7 +474,7 @@ def run_checks(symbol: str, d: date, schemas: list[str], verbose: bool) -> int:
                             failures += 1
 
     # ── Parquet ───────────────────────────────────────────────────
-    parquet_schemas = [s for s in schemas if s in ("1m", "trades")]
+    parquet_schemas = [s for s in schemas if s in ("1m", "1h", "1d", "trades")]
     if parquet_schemas:
         print("\nParquet:")
 
@@ -481,6 +492,26 @@ def run_checks(symbol: str, d: date, schemas: list[str], verbose: bool) -> int:
                     else:
                         warnings += 1
 
+        for tf in ("1h", "1d"):
+            if tf in parquet_schemas:
+                path = _parquet_path(parquet_root, f"bars/{tf}", symbol, d)
+                if not path.exists():
+                    # H1/D1 may be absent on non-trading days — treat as warning not failure
+                    print(_fmt(f"bars/{tf}", WARN, f"missing: {path}"))
+                    warnings += 1
+                else:
+                    try:
+                        import pandas as pd
+                        df = pd.read_parquet(path)
+                        if len(df) == 0:
+                            print(_fmt(f"bars/{tf}", FAIL, "0 rows"))
+                            failures += 1
+                        else:
+                            print(_fmt(f"bars/{tf}", PASS, f"{len(df)} bar(s)"))
+                    except Exception as e:
+                        print(_fmt(f"bars/{tf}", FAIL, f"failed to read: {e}"))
+                        failures += 1
+
         if "trades" in parquet_schemas:
             ok, issues = check_trades_parquet(parquet_root, symbol, d, verbose)
             if ok:
@@ -491,15 +522,18 @@ def run_checks(symbol: str, d: date, schemas: list[str], verbose: bool) -> int:
                 failures += 1
 
     # ── DBN vs Parquet ────────────────────────────────────────────
-    if "1m" in schemas and raw_root is not None:
+    bar_tfs = [s for s in ("1m", "1h", "1d") if s in schemas]
+    if bar_tfs and raw_root is not None:
         print("\nDBN vs Parquet:")
-        ok, issues = check_bars_vs_dbn(raw_root, parquet_root, symbol, db_symbol, d, verbose)
-        if ok:
-            print(_fmt("bars/1m vs ohlcv-1m archive", PASS))
-        else:
-            for issue in issues:
-                print(_fmt("bars/1m vs ohlcv-1m archive", FAIL, issue))
-                failures += 1
+        for tf in bar_tfs:
+            dbn_schema = _TIMEFRAME_TO_DBN_SCHEMA.get(tf, f"ohlcv-{tf}")
+            ok, issues = check_bars_vs_dbn(raw_root, parquet_root, symbol, db_symbol, d, verbose, timeframe=tf)
+            if ok:
+                print(_fmt(f"bars/{tf} vs {dbn_schema} archive", PASS))
+            else:
+                for issue in issues:
+                    print(_fmt(f"bars/{tf} vs {dbn_schema} archive", FAIL, issue))
+                    failures += 1
 
     # ── Cross-validation ──────────────────────────────────────────
     if "1m" in schemas and "trades" in schemas:
@@ -531,8 +565,8 @@ def main() -> None:
     parser.add_argument("--symbol", default="MNQ-09")
     parser.add_argument("--date", required=True, help="Date to validate YYYY-MM-DD")
     parser.add_argument(
-        "--schemas", default="1m,trades,mbp-1,mbo",
-        help="Comma-separated schemas to check (default: 1m,trades,mbp-1,mbo)",
+        "--schemas", default="1m,1h,1d,trades,mbp-1,mbo",
+        help="Comma-separated schemas to check (default: 1m,1h,1d,trades,mbp-1,mbo)",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
