@@ -429,6 +429,82 @@ def check_bars_vs_dbn(
     return False, [f"{len(missing)} bar(s) in DBN archive missing from Parquet — {detail}"]
 
 
+# ── Trades DBN vs Parquet cross-check ────────────────────────────────────────
+
+def check_trades_vs_dbn(
+    raw_root: Path, parquet_root: Path, symbol: str, db_symbol: str, d: date, verbose: bool
+) -> tuple[bool, list[str]]:
+    """Verify every trade in the local DBN trades archive exists in Parquet.
+
+    Matches on sequence number (stored as trade_id in Parquet). Trades in Parquet
+    that have no DBN record (e.g. live-feed trades outside the archive window)
+    are not flagged — only DBN trades missing from Parquet are hard failures.
+
+    Note: one CME order can produce multiple fills, each with a distinct sequence
+    number — these are expected and each should appear once in Parquet.
+    """
+    import databento as db
+    import pandas as pd
+
+    archive_dir = raw_root / "trades" / db_symbol
+    if not archive_dir.exists():
+        return True, []
+
+    day_start = datetime(d.year, d.month, d.day, tzinfo=_UTC)
+    day_end = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=_UTC)
+
+    matching = _find_overlapping_archives(archive_dir, d)
+    if not matching:
+        return True, []
+
+    dbn_sequences: set[str] = set()
+    for f in matching:
+        try:
+            store = db.DBNStore.from_file(str(f))
+        except Exception as e:
+            return False, [f"failed to open archive {f.name}: {e}"]
+        for rec in store:
+            rtype = getattr(rec, "rtype", None)
+            if rtype in (21, 22, 23):
+                continue
+            ts_ns = getattr(rec, "ts_event", None)
+            if ts_ns is None:
+                continue
+            ts = datetime.fromtimestamp(ts_ns / 1e9, tz=_UTC)
+            if day_start <= ts <= day_end:
+                seq = getattr(rec, "sequence", None)
+                if seq is not None:
+                    dbn_sequences.add(str(seq))
+
+    if not dbn_sequences:
+        return True, []
+
+    if verbose:
+        print(f"      archives checked: {len(matching)}")
+        print(f"      DBN trades for {d}: {len(dbn_sequences):,}")
+
+    parquet_path = _parquet_path(parquet_root, "trades", symbol, d)
+    if not parquet_path.exists():
+        return False, [f"Parquet missing — DBN has {len(dbn_sequences):,} trades for this date"]
+
+    try:
+        df = pd.read_parquet(parquet_path, columns=["trade_id"])
+    except Exception as e:
+        return False, [f"failed to read Parquet: {e}"]
+
+    parquet_sequences = set(df["trade_id"].astype(str))
+
+    missing = dbn_sequences - parquet_sequences
+    if not missing:
+        if verbose:
+            print(f"      Parquet trades: {len(parquet_sequences):,} — all {len(dbn_sequences):,} DBN trades present")
+        return True, []
+
+    sample = sorted(missing)[:3]
+    detail = f"first 3 sequences: {sample}" if len(missing) > 3 else f"sequences: {sample}"
+    return False, [f"{len(missing):,} trade(s) in DBN archive missing from Parquet — {detail}"]
+
+
 # ── M5 bars check ────────────────────────────────────────────────────────────
 
 def check_m5_bars_parquet(parquet_root: Path, symbol: str, d: date, verbose: bool) -> tuple[bool, list[str]]:
@@ -670,7 +746,8 @@ def run_checks(symbol: str, d: date, schemas: list[str], verbose: bool) -> int:
 
     # ── DBN vs Parquet ────────────────────────────────────────────
     bar_tfs = [s for s in ("1m", "1h", "1d") if s in schemas]
-    if bar_tfs and raw_root is not None:
+    has_trades_xcheck = "trades" in schemas and raw_root is not None
+    if (bar_tfs or has_trades_xcheck) and raw_root is not None:
         print("\nDBN vs Parquet:")
         for tf in bar_tfs:
             dbn_schema = _TIMEFRAME_TO_DBN_SCHEMA.get(tf, f"ohlcv-{tf}")
@@ -680,6 +757,14 @@ def run_checks(symbol: str, d: date, schemas: list[str], verbose: bool) -> int:
             else:
                 for issue in issues:
                     print(_fmt(f"bars/{tf} vs {dbn_schema} archive", FAIL, issue))
+                    failures += 1
+        if has_trades_xcheck:
+            ok, issues = check_trades_vs_dbn(raw_root, parquet_root, symbol, db_symbol, d, verbose)
+            if ok:
+                print(_fmt("trades vs dbn/trades archive", PASS))
+            else:
+                for issue in issues:
+                    print(_fmt("trades vs dbn/trades archive", FAIL, issue))
                     failures += 1
 
     # ── Cross-validation ──────────────────────────────────────────
