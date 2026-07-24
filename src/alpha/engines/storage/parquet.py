@@ -82,19 +82,27 @@ class ParquetStore:
                 )
                 if has_dedup_key:
                     import pyarrow.compute as pc
+                    # Cast both dedup columns to the same type before comparison.
+                    # pc.is_in() silently returns all-False when types differ
+                    # (e.g. string vs large_string across PyArrow versions or
+                    # write paths), causing the dedup to drop nothing and
+                    # leaving both old and new copies in the file.
+                    def _dedup_col(tbl: pa.Table) -> pa.Array:
+                        return tbl.column(dedup_key).cast(pa.string())
+
                     if (
                         prefer_live
                         and "is_replay" in existing.schema.names
                         and "is_replay" in table.schema.names
                     ):
                         live_rows = existing.filter(pc.invert(existing.column("is_replay")))
-                        live_keys = live_rows.column(dedup_key)
-                        new_key_col = table.column(dedup_key)
+                        live_keys = _dedup_col(live_rows)
+                        new_key_col = _dedup_col(table)
                         table = table.filter(pc.invert(pc.is_in(new_key_col, value_set=live_keys)))
                     # Remove existing rows whose dedup_key appears in the (possibly
                     # now-filtered) new table.
-                    new_keys = table.column(dedup_key)
-                    mask = pc.invert(pc.is_in(existing.column(dedup_key), value_set=new_keys))
+                    new_keys = _dedup_col(table)
+                    mask = pc.invert(pc.is_in(_dedup_col(existing), value_set=new_keys))
                     existing = existing.filter(mask)
                 # Use "permissive" so null-typed columns (e.g. optional string fields
                 # that happen to be None on the first write) merge cleanly with typed

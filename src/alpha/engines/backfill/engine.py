@@ -143,14 +143,48 @@ class BackfillEngine(BaseEngine):
             starts[BarTimeframe.D1].date().isoformat(),
         )
 
+        from alpha.engines.bootstrap.catchup import resample_m5
+
         for symbol in self._settings.runtime.symbols:
             logger.info("Backfilling %s", symbol)
-            for timeframe in (BarTimeframe.M1, BarTimeframe.M5, BarTimeframe.H1, BarTimeframe.D1):
-                await catchup.fetch_range(
+
+            # M1: one bulk fetch for the full window — no gap-diff.
+            # Gap-diffing M1 fires one API call per missing minute (quiet overnight
+            # bars have no record in Databento), turning a single fetch into dozens
+            # of round-trips that each return 0 bars.
+            m1_bars = await self._historical.fetch_bars(
+                symbol=symbol,
+                timeframe=BarTimeframe.M1,
+                start=starts[BarTimeframe.M1],
+                end=end,
+                emit=False,
+            )
+            for bar in m1_bars:
+                await self._storage.save_bar(bar)
+            logger.info("M1 backfill complete | %s | bars=%d", symbol, len(m1_bars))
+
+            # M5: resample from M1 — Databento has no native 5m schema.
+            # Wipe existing M5 partitions first: prior backfill runs may have stored
+            # M5-labeled bars with 1-minute timestamps (wrong schema fallback), which
+            # won't collide with correct 5-minute timestamps on dedup.
+            m5_bars = resample_m5(m1_bars)
+            m5_days = {bar.timestamp.date() for bar in m5_bars}
+            for day in m5_days:
+                await self._storage.clear_bars(symbol, BarTimeframe.M5, day)
+            for bar in m5_bars:
+                await self._storage.save_bar(bar)
+            logger.info("M5 backfill complete | %s | bars=%d", symbol, len(m5_bars))
+
+            # H1/D1: gap-diff is appropriate — windows span months and a full
+            # refetch would be expensive. Session-boundary gaps are skipped by
+            # the calendar-aware check in CatchupService._missing_ranges().
+            for timeframe in (BarTimeframe.H1, BarTimeframe.D1):
+                await catchup.load_or_fetch_bars(
                     symbol=symbol,
                     timeframe=timeframe,
                     start=starts[timeframe],
                     end=end,
+                    emit=False,
                 )
 
         if self._fetch_ticks:
