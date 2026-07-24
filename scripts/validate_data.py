@@ -429,6 +429,126 @@ def check_bars_vs_dbn(
     return False, [f"{len(missing)} bar(s) in DBN archive missing from Parquet — {detail}"]
 
 
+# ── M5 bars check ────────────────────────────────────────────────────────────
+
+def check_m5_bars_parquet(parquet_root: Path, symbol: str, d: date, verbose: bool) -> tuple[bool, list[str]]:
+    import pandas as pd
+
+    path = _parquet_path(parquet_root, "bars/5m", symbol, d)
+    issues: list[str] = []
+
+    if not path.exists():
+        return False, [f"missing: {path}"]
+
+    try:
+        df = pd.read_parquet(path)
+    except Exception as e:
+        return False, [f"failed to read: {e}"]
+
+    if len(df) == 0:
+        return False, ["0 rows"]
+
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    bad_ohlc = (
+        (df["high"] < df["low"]) |
+        (df["high"] < df["open"]) |
+        (df["high"] < df["close"]) |
+        (df["low"] > df["open"]) |
+        (df["low"] > df["close"])
+    ).sum()
+    if bad_ohlc > 0:
+        issues.append(f"{bad_ohlc} bars with invalid OHLC (high < low or similar)")
+
+    zero_prices = (df["close"] <= 0).sum()
+    if zero_prices > 0:
+        issues.append(f"{zero_prices} bars with zero/negative close")
+
+    # Verify bar timestamps are on 5-minute boundaries (resampling bug detection)
+    bad_ts = (df["timestamp"].dt.minute % 5 != 0).sum()
+    if bad_ts > 0:
+        issues.append(f"{bad_ts} bar(s) with non-5-minute timestamps — likely resampled from wrong schema")
+
+    if verbose:
+        print(f"      file: {path}")
+        print(f"      rows: {len(df):,}  range: {df['close'].min():.2f}–{df['close'].max():.2f}")
+
+    return len(issues) == 0, issues
+
+
+# ── Quotes existence check ────────────────────────────────────────────────────
+
+def check_quotes_parquet(parquet_root: Path, symbol: str, d: date, verbose: bool) -> tuple[bool, list[str]]:
+    import pandas as pd
+
+    path = _parquet_path(parquet_root, "quotes", symbol, d)
+
+    if not path.exists():
+        return False, [f"missing: {path}"]
+
+    try:
+        pf = __import__("pyarrow.parquet", fromlist=["ParquetFile"]).ParquetFile(path)
+        n_rows = pf.metadata.num_rows
+    except Exception as e:
+        return False, [f"failed to read: {e}"]
+
+    if n_rows == 0:
+        return False, ["0 rows"]
+
+    if verbose:
+        print(f"      file: {path}")
+        print(f"      rows: {n_rows:,}")
+
+    return True, []
+
+
+# ── Volume profile check ──────────────────────────────────────────────────────
+
+def check_volume_profiles(vp_root: Path, symbol: str, d: date, verbose: bool) -> tuple[bool, list[str]]:
+    import json
+
+    issues: list[str] = []
+    symbol_dir = vp_root / symbol
+
+    for session in ("rth", "globex"):
+        path = symbol_dir / f"{d.isoformat()}_{session}.json"
+        if not path.exists():
+            issues.append(f"{session}: JSON missing")
+            continue
+        try:
+            with path.open() as f:
+                data = json.load(f)
+        except Exception as e:
+            issues.append(f"{session}: failed to parse JSON — {e}")
+            continue
+
+        try:
+            poc = float(data["poc"])
+            vah = float(data["vah"])
+            val = float(data["val"])
+            total_vol = int(data["total_volume"])
+        except (KeyError, ValueError) as e:
+            issues.append(f"{session}: missing or non-numeric field — {e}")
+            continue
+
+        if poc <= 0 or vah <= 0 or val <= 0:
+            issues.append(f"{session}: zero/negative POC/VAH/VAL (poc={poc}, vah={vah}, val={val})")
+        elif not (val <= poc <= vah):
+            issues.append(f"{session}: VAL/POC/VAH order invalid (val={val}, poc={poc}, vah={vah})")
+
+        if total_vol <= 0:
+            issues.append(f"{session}: total_volume is zero")
+
+        if verbose:
+            print(f"      {session}: poc={poc} val={val} vah={vah} vol={total_vol:,} source={data.get('source', '?')}")
+
+    return len(issues) == 0, issues
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 _SCHEMA_TO_DB_SYMBOL = {
@@ -474,7 +594,7 @@ def run_checks(symbol: str, d: date, schemas: list[str], verbose: bool) -> int:
                             failures += 1
 
     # ── Parquet ───────────────────────────────────────────────────
-    parquet_schemas = [s for s in schemas if s in ("1m", "1h", "1d", "trades")]
+    parquet_schemas = [s for s in schemas if s in ("1m", "5m", "1h", "1d", "trades", "quotes")]
     if parquet_schemas:
         print("\nParquet:")
 
@@ -512,6 +632,19 @@ def run_checks(symbol: str, d: date, schemas: list[str], verbose: bool) -> int:
                         print(_fmt(f"bars/{tf}", FAIL, f"failed to read: {e}"))
                         failures += 1
 
+        if "5m" in parquet_schemas:
+            ok, issues = check_m5_bars_parquet(parquet_root, symbol, d, verbose)
+            if ok:
+                print(_fmt("bars/5m", PASS))
+            else:
+                for issue in issues:
+                    severity = FAIL if ("missing" in issue or "OHLC" in issue or "timestamps" in issue) else WARN
+                    print(_fmt("bars/5m", severity, issue))
+                    if severity == FAIL:
+                        failures += 1
+                    else:
+                        warnings += 1
+
         if "trades" in parquet_schemas:
             ok, issues = check_trades_parquet(parquet_root, symbol, d, verbose)
             if ok:
@@ -520,6 +653,20 @@ def run_checks(symbol: str, d: date, schemas: list[str], verbose: bool) -> int:
                 for issue in issues:
                     print(_fmt("trades parquet", FAIL, issue))
                 failures += 1
+
+        if "quotes" in parquet_schemas:
+            ok, issues = check_quotes_parquet(parquet_root, symbol, d, verbose)
+            if ok:
+                print(_fmt("quotes parquet", PASS))
+            else:
+                for issue in issues:
+                    # Missing quotes = warning (not all days have quotes downloaded)
+                    severity = WARN if "missing" in issue else FAIL
+                    print(_fmt("quotes parquet", severity, issue))
+                    if severity == FAIL:
+                        failures += 1
+                    else:
+                        warnings += 1
 
     # ── DBN vs Parquet ────────────────────────────────────────────
     bar_tfs = [s for s in ("1m", "1h", "1d") if s in schemas]
@@ -549,6 +696,23 @@ def run_checks(symbol: str, d: date, schemas: list[str], verbose: bool) -> int:
         if xv_failures:
             failures += 1
 
+    # ── Volume profiles ───────────────────────────────────────────
+    if "vp" in schemas:
+        print("\nVolume Profiles:")
+        vp_root_path = _REPO / "data" / "volume_profiles"
+        ok, issues = check_volume_profiles(vp_root_path, symbol, d, verbose)
+        if ok:
+            print(_fmt("volume profiles", PASS))
+        else:
+            for issue in issues:
+                # Missing = warning (non-trading days have no profile)
+                severity = WARN if "missing" in issue else FAIL
+                print(_fmt("volume profiles", severity, issue))
+                if severity == FAIL:
+                    failures += 1
+                else:
+                    warnings += 1
+
     print()
     if failures == 0 and warnings == 0:
         print(f"Result: {PASS} — all checks passed")
@@ -565,8 +729,8 @@ def main() -> None:
     parser.add_argument("--symbol", default="MNQ-09")
     parser.add_argument("--date", required=True, help="Date to validate YYYY-MM-DD")
     parser.add_argument(
-        "--schemas", default="1m,1h,1d,trades,mbp-1,mbo",
-        help="Comma-separated schemas to check (default: 1m,1h,1d,trades,mbp-1,mbo)",
+        "--schemas", default="1m,5m,1h,1d,trades,quotes,vp,mbp-1,mbo",
+        help="Comma-separated schemas to check (default: 1m,5m,1h,1d,trades,quotes,vp,mbp-1,mbo)",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
