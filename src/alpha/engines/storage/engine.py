@@ -97,6 +97,7 @@ class StorageEngine(BaseEngine):
         self._write_queue: asyncio.Queue[AnyEvent] = asyncio.Queue(maxsize=10_000)
         self._writer_task: asyncio.Task[None] | None = None
         self._flush_task: asyncio.Task[None] | None = None
+        self._stopping = asyncio.Event()
         self._writes_total: int = 0
         # Buffered rows awaiting flush, keyed by (data_type, symbol, date).
         # Populated synchronously (no I/O) by the writer loop; drained by _flush_loop.
@@ -127,8 +128,15 @@ class StorageEngine(BaseEngine):
         if self._writer_task and not self._writer_task.done():
             await self._write_queue.join()
             self._writer_task.cancel()
+        # Signal _flush_loop to stop rather than cancelling it directly: a
+        # forceful cancel() can land while it's mid-write inside _flush_due()
+        # — _flush_due() has already popped that partition's rows out of
+        # self._buffers by that point, so a cancelled write loses them for
+        # good (neither buffered nor on disk). Awaiting the task lets any
+        # in-flight _flush_due() call finish before the loop exits.
+        self._stopping.set()
         if self._flush_task and not self._flush_task.done():
-            self._flush_task.cancel()
+            await self._flush_task
         # Final flush so nothing buffered in memory is lost on shutdown.
         await self._flush_all()
 
@@ -371,8 +379,20 @@ class StorageEngine(BaseEngine):
         # cheap timestamp comparison per buffered key (see _flush_due). Only
         # keys whose own interval has elapsed, or whose buffer has grown past
         # _MAX_BUFFERED_ROWS, actually trigger a write this tick.
-        while True:
-            await asyncio.sleep(self._FLUSH_INTERVAL_SECONDS)
+        #
+        # Waits on _stopping instead of a plain sleep so _on_stop() can wake
+        # this loop early rather than blocking shutdown for up to a full
+        # interval — but only *between* iterations: once a _flush_due() call
+        # starts, this loop runs it to completion before checking _stopping
+        # again, since a write already popped its rows out of self._buffers
+        # (see _on_stop()).
+        while not self._stopping.is_set():
+            try:
+                await asyncio.wait_for(self._stopping.wait(), timeout=self._FLUSH_INTERVAL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+            if self._stopping.is_set():
+                break
             await self._flush_due()
 
     async def _flush_due(self) -> None:
