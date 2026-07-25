@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+import exchange_calendars as xcals  # type: ignore[import]
+
 from alpha.calendar.base import SessionCalendar
 from alpha.models.enums import SessionPhase
 
@@ -18,11 +20,23 @@ _ET = ZoneInfo("America/New_York")
 _SESSION_START = time(18, 0)
 _MAINTENANCE_START = time(17, 0)
 
+# CME equity-index futures (ES/NQ/MES/MNQ) fully close only for New Year's Day,
+# Good Friday, and Christmas — everything else is a trading day (other US
+# holidays are early-close only, not modeled here since this only answers
+# "does a bar exist for this date at all", not intraday hours).
+_CAL_START = "2015-01-01"
+_CAL_END = "2060-12-31"  # explicit wide bound — the library default is only
+# ~1 year out from instantiation, which would raise DateOutOfBounds partway
+# through a long-running live process.
+
 
 class CMEEqIndexCalendar(SessionCalendar):
     """Session calendar for CME equity-index futures such as ES/NQ/MES/MNQ."""
 
     _ORB_MINUTES = 5
+
+    def __init__(self) -> None:
+        self._cal = xcals.get_calendar("CMES", start=_CAL_START, end=_CAL_END)
 
     @property
     def name(self) -> str:
@@ -45,19 +59,14 @@ class CMEEqIndexCalendar(SessionCalendar):
         return datetime(d.year, d.month, d.day, 17, 0, tzinfo=_ET)
 
     def is_trading_day(self, d: date) -> bool:
-        return d.weekday() < 5
+        return self._cal.is_session(d.isoformat())
 
     def is_holiday(self, d: date) -> bool:
-        return False
+        return d.weekday() < 5 and not self.is_trading_day(d)
 
     def trading_days(self, start: date, end: date) -> list[date]:
-        days: list[date] = []
-        current = start
-        while current <= end:
-            if self.is_trading_day(current):
-                days.append(current)
-            current += timedelta(days=1)
-        return days
+        sessions = self._cal.sessions_in_range(start.isoformat(), end.isoformat())
+        return [s.date() for s in sessions]
 
     def next_trading_day(self, d: date) -> date:
         candidate = d + timedelta(days=1)
