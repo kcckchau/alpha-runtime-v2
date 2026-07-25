@@ -382,7 +382,11 @@ def check_bars_vs_dbn(
     if not matching:
         return True, []  # no local archives for this date — skip
 
-    dbn_timestamps: set[datetime] = set()
+    # Collect DBN bar timestamps as nanosecond integers (avoids datetime comparison issues)
+    day_start_ns = int(day_start.timestamp() * 1e9)
+    day_end_ns = int(day_end.timestamp() * 1e9)
+
+    dbn_ts_ns: set[int] = set()
     for f in matching:
         try:
             store = db.DBNStore.from_file(str(f))
@@ -395,37 +399,34 @@ def check_bars_vs_dbn(
             ts_ns = getattr(rec, "ts_event", None)
             if ts_ns is None:
                 continue
-            ts = datetime.fromtimestamp(ts_ns / 1e9, tz=_UTC)
-            if day_start <= ts <= day_end:
-                dbn_timestamps.add(ts)
+            if day_start_ns <= ts_ns <= day_end_ns:
+                dbn_ts_ns.add(ts_ns)
 
-    if not dbn_timestamps:
+    if not dbn_ts_ns:
         return True, []
 
     if verbose:
         print(f"      archives checked: {len(matching)}")
-        print(f"      DBN bars for {d}: {len(dbn_timestamps)}")
+        print(f"      DBN bars for {d}: {len(dbn_ts_ns)}")
 
     parquet_path = _parquet_path(parquet_root, f"bars/{timeframe}", symbol, d)
     if not parquet_path.exists():
-        return False, [f"Parquet missing — DBN has {len(dbn_timestamps)} bars for this date"]
+        return False, [f"Parquet missing — DBN has {len(dbn_ts_ns)} bars for this date"]
 
     try:
         df = pd.read_parquet(parquet_path, columns=["timestamp"])
     except Exception as e:
         return False, [f"failed to read Parquet: {e}"]
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True)
-    import numpy as np
-    parquet_timestamps = set(np.array(df["timestamp"].dt.to_pydatetime()))
+    parquet_ts_ns = set(pd.to_datetime(df["timestamp"], utc=True).astype("int64").tolist())
 
-    missing = dbn_timestamps - parquet_timestamps
+    missing = dbn_ts_ns - parquet_ts_ns
     if not missing:
         if verbose:
-            print(f"      Parquet bars: {len(parquet_timestamps)} — all {len(dbn_timestamps)} DBN bars present")
+            print(f"      Parquet bars: {len(parquet_ts_ns)} — all {len(dbn_ts_ns)} DBN bars present")
         return True, []
 
-    sample = [t.isoformat() for t in sorted(missing)[:3]]
+    sample = [datetime.fromtimestamp(t / 1e9, tz=_UTC).isoformat() for t in sorted(missing)[:3]]
     detail = f"first 3: {sample}" if len(missing) > 3 else str(sample)
     return False, [f"{len(missing)} bar(s) in DBN archive missing from Parquet — {detail}"]
 
