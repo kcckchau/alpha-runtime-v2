@@ -410,7 +410,19 @@ class CatchupService:
         for left, right in zip(relevant, relevant[1:]):
             expected_next = left.timestamp + step
             if right.timestamp > expected_next:
-                if timeframe in {BarTimeframe.H1, BarTimeframe.D1}:
+                if timeframe == BarTimeframe.D1:
+                    # Each D1 bar is its own session, so comparing left/right's own
+                    # session_key (like H1 below) would always differ and always skip —
+                    # that would make internal D1 gaps undetectable. Check instead
+                    # whether any real trading day falls strictly between them.
+                    left_date = calendar.session_date(left.timestamp)
+                    right_date = calendar.session_date(right.timestamp)
+                    between = calendar.trading_days(
+                        left_date + timedelta(days=1), right_date - timedelta(days=1)
+                    )
+                    if not between:
+                        continue
+                elif timeframe == BarTimeframe.H1:
                     if calendar.session_key(left.timestamp) != calendar.session_key(right.timestamp):
                         continue
                 missing.append((expected_next, right.timestamp - step))

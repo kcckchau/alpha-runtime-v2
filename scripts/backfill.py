@@ -81,10 +81,10 @@ def _print_dry_run(settings: AlphaSettings, ticks: bool) -> None:
         print(f"  ticks   : trades + quotes(mbp-1) for {explicit_start} → {end_dt.date()}")
 
 
-async def _run_backfill(settings: AlphaSettings, ticks: bool, force: bool) -> None:
+async def _run_backfill(settings: AlphaSettings, bars: bool, ticks: bool, force: bool) -> None:
     from alpha.engines.backfill.engine import BackfillEngine
 
-    engine = BackfillEngine(settings, fetch_ticks=ticks, force=force)
+    engine = BackfillEngine(settings, fetch_bars=bars, fetch_ticks=ticks, force=force)
     try:
         await engine.initialize()
         await engine.start()
@@ -104,6 +104,13 @@ def main() -> None:
              "Requires --start (ticks are not warmup-driven).",
     )
     parser.add_argument(
+        "--ticks-only", action="store_true",
+        help="Skip the bar backfill section entirely — only fetch/save trades + quotes for "
+             "--start..--end. Implies --ticks. Useful when bars were already backfilled "
+             "separately in the same run (e.g. daily_update.py) and re-running the full "
+             "M1/M5/H1/D1 fetch a second time would just be wasted API calls.",
+    )
+    parser.add_argument(
         "--force", action="store_true",
         help="Refetch --ticks days even if already stored (default: skip days already on disk). "
              "Trades upsert safely by trade_id; quotes have no per-row key, so the day's file is "
@@ -118,20 +125,24 @@ def main() -> None:
     overrides["runtime"]["mode"] = RuntimeMode.HISTORICAL_BACKFILL
     if args.symbol:
         overrides["runtime"]["symbols"] = [args.symbol]
-    if args.start:
-        overrides["replay"]["start_date"] = args.start
-    if args.end:
-        overrides["replay"]["end_date"] = args.end
+    # Always set explicitly (not just when passed) so an ambient REPLAY__START_DATE/
+    # END_DATE left over from a REPLAY-mode session can't silently hijack the
+    # "no --start/--end" warmup-driven default window.
+    overrides["replay"]["start_date"] = args.start or None
+    overrides["replay"]["end_date"] = args.end or None
     backfill_settings = AlphaSettings.model_validate(overrides)
 
-    if args.ticks and not args.start:
-        parser.error("--ticks requires --start (tick backfill is not warmup-driven)")
+    fetch_ticks = args.ticks or args.ticks_only
+    fetch_bars = not args.ticks_only
+
+    if fetch_ticks and not args.start:
+        parser.error("--ticks/--ticks-only requires --start (tick backfill is not warmup-driven)")
 
     if args.dry_run:
-        _print_dry_run(backfill_settings, args.ticks)
+        _print_dry_run(backfill_settings, fetch_ticks)
         return
 
-    asyncio.run(_run_backfill(backfill_settings, args.ticks, args.force))
+    asyncio.run(_run_backfill(backfill_settings, fetch_bars, fetch_ticks, args.force))
 
 
 if __name__ == "__main__":
