@@ -118,10 +118,11 @@ def main() -> None:
     overrides["runtime"]["mode"] = RuntimeMode.HISTORICAL_BACKFILL
     if args.symbol:
         overrides["runtime"]["symbols"] = [args.symbol]
-    if args.start:
-        overrides["replay"]["start_date"] = args.start
-    if args.end:
-        overrides["replay"]["end_date"] = args.end
+    # Always set explicitly (not just when passed) so an ambient REPLAY__START_DATE/
+    # END_DATE left over from a REPLAY-mode session can't silently hijack the
+    # "no --start/--end" warmup-driven default window.
+    overrides["replay"]["start_date"] = args.start or None
+    overrides["replay"]["end_date"] = args.end or None
     backfill_settings = AlphaSettings.model_validate(overrides)
 
     if args.ticks and not args.start:
