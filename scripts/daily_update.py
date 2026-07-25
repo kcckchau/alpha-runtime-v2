@@ -87,8 +87,12 @@ def main() -> None:
             "--symbol", args.symbol,
             "--start", target.isoformat(),
             "--end", target.isoformat(),
-            "--ticks",
         ]
+        # --date defaults to yesterday, which step 1's warmup window always covers
+        # (M1/M5 ~3-7 days back) — skip step 1's redundant bar refetch there.
+        # An explicitly-passed --date may be older than that window (e.g. backfilling
+        # a day missed weeks ago), so keep the full bar+tick fetch in that case.
+        tick_cmd.append("--ticks-only" if args.date is None else "--ticks")
         if args.force_ticks:
             tick_cmd.append("--force")
         rc = _run(f"Tick backfill ({target.isoformat()})", tick_cmd)

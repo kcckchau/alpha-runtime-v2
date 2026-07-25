@@ -34,10 +34,16 @@ class BackfillEngine(BaseEngine):
     """Standalone engine that fetches missing bar gaps and writes them to Parquet cache."""
 
     def __init__(
-        self, settings: AlphaSettings | None = None, *, fetch_ticks: bool = False, force: bool = False
+        self,
+        settings: AlphaSettings | None = None,
+        *,
+        fetch_bars: bool = True,
+        fetch_ticks: bool = False,
+        force: bool = False,
     ) -> None:
         super().__init__()
         self._settings = settings or get_settings()
+        self._fetch_bars = fetch_bars
         self._fetch_ticks = fetch_ticks
         self._force = force
         self._event_bus = EventBus()
@@ -89,16 +95,6 @@ class BackfillEngine(BaseEngine):
         await self._storage.start()
         await self._historical.start()
 
-        from alpha.engines.bootstrap.catchup import CatchupService
-
-        catchup = CatchupService(
-            settings=self._settings,
-            storage=self._storage,
-            historical=self._historical,
-            event_bus=self._event_bus,
-            registry=self._registry,
-        )
-
         hist = self._settings.historical
         replay = self._settings.replay
 
@@ -112,80 +108,91 @@ class BackfillEngine(BaseEngine):
             else now
         )
 
-        # Warmup-driven start dates (calendar-day adjusted: ≈1.4× trading days for weekends)
-        default_starts: dict[BarTimeframe, datetime] = {
-            BarTimeframe.M1: end - timedelta(days=max(3, hist.minute1_warmup_bars // 390 + 1)),
-            BarTimeframe.M5: end - timedelta(days=max(7, hist.minute5_warmup_bars // 78 + 2)),
-            BarTimeframe.H1: end - timedelta(days=int(hist.hourly_warmup_bars * 0.22) + 30),
-            BarTimeframe.D1: end - timedelta(days=int(hist.daily_warmup_bars * 1.5)),
-        }
+        if self._fetch_bars:
+            from alpha.engines.bootstrap.catchup import CatchupService, resample_m5
 
-        # An explicit --start extends the window further back on all timeframes
-        if replay.start_date:
-            explicit = datetime(
-                replay.start_date.year, replay.start_date.month, replay.start_date.day,
-                tzinfo=timezone.utc,
+            catchup = CatchupService(
+                settings=self._settings,
+                storage=self._storage,
+                historical=self._historical,
+                event_bus=self._event_bus,
+                registry=self._registry,
             )
-            starts: dict[BarTimeframe, datetime] = {
-                tf: min(default, explicit) for tf, default in default_starts.items()
+
+            # Warmup-driven start dates (calendar-day adjusted: ≈1.4× trading days for weekends)
+            default_starts: dict[BarTimeframe, datetime] = {
+                BarTimeframe.M1: end - timedelta(days=max(3, hist.minute1_warmup_bars // 390 + 1)),
+                BarTimeframe.M5: end - timedelta(days=max(7, hist.minute5_warmup_bars // 78 + 2)),
+                BarTimeframe.H1: end - timedelta(days=int(hist.hourly_warmup_bars * 0.22) + 30),
+                BarTimeframe.D1: end - timedelta(days=int(hist.daily_warmup_bars * 1.5)),
             }
-        else:
-            starts = default_starts
 
-        logger.info(
-            "Running full historical backfill | symbols=%s | end=%s"
-            " | 1m_start=%s | 5m_start=%s | 1h_start=%s | 1d_start=%s",
-            self._settings.runtime.symbols,
-            end.date().isoformat(),
-            starts[BarTimeframe.M1].date().isoformat(),
-            starts[BarTimeframe.M5].date().isoformat(),
-            starts[BarTimeframe.H1].date().isoformat(),
-            starts[BarTimeframe.D1].date().isoformat(),
-        )
+            # An explicit --start extends the window further back on all timeframes
+            if replay.start_date:
+                explicit = datetime(
+                    replay.start_date.year, replay.start_date.month, replay.start_date.day,
+                    tzinfo=timezone.utc,
+                )
+                starts: dict[BarTimeframe, datetime] = {
+                    tf: min(default, explicit) for tf, default in default_starts.items()
+                }
+            else:
+                starts = default_starts
 
-        from alpha.engines.bootstrap.catchup import resample_m5
-
-        for symbol in self._settings.runtime.symbols:
-            logger.info("Backfilling %s", symbol)
-
-            # M1: one bulk fetch for the full window — no gap-diff.
-            # Gap-diffing M1 fires one API call per missing minute (quiet overnight
-            # bars have no record in Databento), turning a single fetch into dozens
-            # of round-trips that each return 0 bars.
-            m1_bars = await self._historical.fetch_bars(
-                symbol=symbol,
-                timeframe=BarTimeframe.M1,
-                start=starts[BarTimeframe.M1],
-                end=end,
-                emit=False,
+            logger.info(
+                "Running full historical backfill | symbols=%s | end=%s"
+                " | 1m_start=%s | 5m_start=%s | 1h_start=%s | 1d_start=%s",
+                self._settings.runtime.symbols,
+                end.date().isoformat(),
+                starts[BarTimeframe.M1].date().isoformat(),
+                starts[BarTimeframe.M5].date().isoformat(),
+                starts[BarTimeframe.H1].date().isoformat(),
+                starts[BarTimeframe.D1].date().isoformat(),
             )
-            for bar in m1_bars:
-                await self._storage.save_bar(bar)
-            logger.info("M1 backfill complete | %s | bars=%d", symbol, len(m1_bars))
 
-            # M5: resample from M1 — Databento has no native 5m schema.
-            # Wipe existing M5 partitions first: prior backfill runs may have stored
-            # M5-labeled bars with 1-minute timestamps (wrong schema fallback), which
-            # won't collide with correct 5-minute timestamps on dedup.
-            m5_bars = resample_m5(m1_bars)
-            m5_days = {bar.timestamp.date() for bar in m5_bars}
-            for day in m5_days:
-                await self._storage.clear_bars(symbol, BarTimeframe.M5, day)
-            for bar in m5_bars:
-                await self._storage.save_bar(bar)
-            logger.info("M5 backfill complete | %s | bars=%d", symbol, len(m5_bars))
+            for symbol in self._settings.runtime.symbols:
+                logger.info("Backfilling %s", symbol)
 
-            # H1/D1: gap-diff is appropriate — windows span months and a full
-            # refetch would be expensive. Session-boundary gaps are skipped by
-            # the calendar-aware check in CatchupService._missing_ranges().
-            for timeframe in (BarTimeframe.H1, BarTimeframe.D1):
-                await catchup.load_or_fetch_bars(
+                # M1: one bulk fetch for the full window — no gap-diff.
+                # Gap-diffing M1 fires one API call per missing minute (quiet overnight
+                # bars have no record in Databento), turning a single fetch into dozens
+                # of round-trips that each return 0 bars.
+                m1_bars = await self._historical.fetch_bars(
                     symbol=symbol,
-                    timeframe=timeframe,
-                    start=starts[timeframe],
+                    timeframe=BarTimeframe.M1,
+                    start=starts[BarTimeframe.M1],
                     end=end,
                     emit=False,
                 )
+                for bar in m1_bars:
+                    await self._storage.save_bar(bar)
+                logger.info("M1 backfill complete | %s | bars=%d", symbol, len(m1_bars))
+
+                # M5: resample from M1 — Databento has no native 5m schema.
+                # Wipe existing M5 partitions first: prior backfill runs may have stored
+                # M5-labeled bars with 1-minute timestamps (wrong schema fallback), which
+                # won't collide with correct 5-minute timestamps on dedup.
+                m5_bars = resample_m5(m1_bars)
+                m5_days = {bar.timestamp.date() for bar in m5_bars}
+                for day in m5_days:
+                    await self._storage.clear_bars(symbol, BarTimeframe.M5, day)
+                for bar in m5_bars:
+                    await self._storage.save_bar(bar)
+                logger.info("M5 backfill complete | %s | bars=%d", symbol, len(m5_bars))
+
+                # H1/D1: gap-diff is appropriate — windows span months and a full
+                # refetch would be expensive. Session-boundary gaps are skipped by
+                # the calendar-aware check in CatchupService._missing_ranges().
+                for timeframe in (BarTimeframe.H1, BarTimeframe.D1):
+                    await catchup.load_or_fetch_bars(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        start=starts[timeframe],
+                        end=end,
+                        emit=False,
+                    )
+        else:
+            logger.info("Skipping bar backfill (fetch_bars=False) | symbols=%s", self._settings.runtime.symbols)
 
         if self._fetch_ticks:
             # Ticks use the explicit --start/--end range only (not the
