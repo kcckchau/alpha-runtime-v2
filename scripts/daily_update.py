@@ -10,8 +10,14 @@ Or for a specific date:
 Steps:
   1. Backfill bars (M1/M5/H1/D1) for the warmup window — idempotent, fills gaps only
   2. Backfill ticks (trades + quotes) for the target date — skipped if already stored
-  3. Validate target date: 1m Parquet integrity, DBN cross-check, bars vs trades range
-  4. Exit non-zero if any validation hard-failure is detected
+  3. Build RTH + Globex volume profiles for the target date — skipped if already built.
+     FeatureEngine reads the prior session's profile live as a reference level, but
+     only the bootstrap-catchup path builds these automatically, and only once at
+     process startup — a long-running live process won't get fresh ones on its own,
+     so this step is what keeps them current.
+  4. Validate target date: 1m Parquet integrity, DBN cross-check, bars vs trades range,
+     volume profile presence
+  5. Exit non-zero if any validation hard-failure is detected
 
 Intended for use as a cron job or post-session maintenance script. All steps
 are idempotent — safe to run multiple times.
@@ -100,7 +106,22 @@ def main() -> None:
             print(f"\n[daily_update] FAIL: tick backfill exited {rc}")
             failures += 1
 
-    # ── Step 3: Validate ──────────────────────────────────────────────────────
+    # ── Step 3: Volume profiles for target date ────────────────────────────────
+    vp_cmd = [
+        _PYTHON, "scripts/build_volume_profiles.py",
+        "--symbol", args.symbol,
+        "--date", target.isoformat(),
+    ]
+    if args.force_ticks:
+        # Ticks were just force-refreshed — a profile already built from the old
+        # (possibly untrusted) trade data would otherwise be left stale.
+        vp_cmd.append("--force")
+    rc = _run(f"Volume profiles ({target.isoformat()})", vp_cmd)
+    if rc != 0:
+        print(f"\n[daily_update] FAIL: volume profile build exited {rc}")
+        failures += 1
+
+    # ── Step 4: Validate ──────────────────────────────────────────────────────
     rc = _run(
         f"Validate {target.isoformat()}",
         [
