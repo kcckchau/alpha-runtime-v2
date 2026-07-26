@@ -38,20 +38,16 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "src"))
 
 from alpha.calendar.base import SessionCalendar
-from alpha.calendar.resolver import calendar_for_symbol
-from replay_common import config_fingerprint_lines, default_m1_warmup_days, load_m1_bars
+from replay_common import (
+    config_fingerprint_lines,
+    default_m1_warmup_days,
+    build_replay_pipeline,
+    load_m1_bars,
+    stop_replay_pipeline,
+)
 from alpha.config.settings import AlphaSettings, RuntimeSettings, StorageSettings
-from alpha.core.clock import WallClock
-from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
-from alpha.engines.context.engine import ContextEngine
-from alpha.engines.feature.engine import FeatureEngine
-from alpha.engines.flow.aggregator import BarFlowAggregator
-from alpha.engines.flow.pipeline import BarPipeline
 from alpha.engines.historical.sources.databento import DatabentoHistoricalDataSource as DatabentoHistoricalSource
-from alpha.engines.market_state.engine import MarketStateEngine
-from alpha.engines.setup.engine import SetupEngine
-from alpha.engines.thesis.engine import ThesisEngine
 from alpha.models.enums import AssetClass, BarTimeframe, RuntimeMode
 from alpha.models.events import BarEvent, QuoteEvent, TradeEvent
 from alpha.models.symbol import Symbol
@@ -320,64 +316,22 @@ async def replay(
         tick_size=Decimal("0.25") if "MNQ" in symbol else Decimal("0.01"),
         point_value=Decimal("2.0") if "MNQ" in symbol else Decimal("1.0"),
     )
-    registry = SymbolRegistry()
-    registry.register(sym_obj)
-
-    calendar = calendar_for_symbol(sym_obj)
-    bus = EventBus(queue_size=5000)
-    await bus.start()
-
-    clock = WallClock()
-    feature_engine      = FeatureEngine(settings, bus, registry, calendar, clock)
-    context_engine      = ContextEngine(settings, bus, registry, calendar, clock)
-    market_state_engine = MarketStateEngine(settings, bus, registry)
-    setup_engine        = SetupEngine(settings, bus, registry)
-    thesis_engine       = ThesisEngine(settings, bus, registry)
-
-    market_state_engine.set_feature_engine(feature_engine)
-    setup_engine.set_feature_engine(feature_engine)
-    setup_engine.set_market_state_engine(market_state_engine)
-    thesis_engine.set_feature_engine(feature_engine)
-    context_engine.set_feature_engine(feature_engine)
-    market_state_engine.set_context_engine(context_engine)
-    setup_engine.set_context_engine(context_engine)
-    thesis_engine.set_context_engine(context_engine)
-
-    # Wire BarFlowAggregator + BarPipeline (same as backtest.py / live) — replaces
-    # the old direct-subscription pattern (each engine self-subscribing to raw BAR
-    # events, relying on .start() call order for dependency ordering). BarPipeline
-    # calls each stage explicitly in sequence, removing that ordering fragility.
-    # No ScoringEngine here — unchanged from before the migration: replay_day.py
-    # intentionally shows SetupEngine's raw score, not a final letter grade.
-    agg = BarFlowAggregator(
-        symbol=symbol,
-        event_bus=bus,
-        large_trade_threshold=getattr(settings.runtime, "large_trade_threshold", 10),
-    )
-    agg.attach()
-
-    pipeline = BarPipeline(bus)
-    pipeline.set_feature_engine(feature_engine)
-    pipeline.set_market_state_engine(market_state_engine)
-    pipeline.set_thesis_engine(thesis_engine)
-    pipeline.set_setup_engine(setup_engine)
-    pipeline.attach()
-
-    await feature_engine.initialize()
-    await context_engine.initialize()
-    await market_state_engine.initialize()
-    await setup_engine.initialize()
-    await thesis_engine.initialize()
-
-    # ContextEngine must start AFTER FeatureEngine so its BAR subscription
-    # fires second — guaranteeing FeatureEngine.get_snapshot() is current.
-    # (ContextEngine is not yet migrated onto BarPipeline, so it still relies on
-    # this ordering — same as before.)
-    await feature_engine.start()
-    await context_engine.start()
-    await market_state_engine.start()
-    await setup_engine.start()
-    await thesis_engine.start()
+    # Shared with backtest.py — wires FeatureEngine/ContextEngine/MarketStateEngine/
+    # SetupEngine/ThesisEngine onto BarFlowAggregator + BarPipeline (same
+    # sequential-stage pattern as live), replacing the old direct-subscription
+    # pattern this script used before (each engine self-subscribing to raw BAR
+    # events, relying on .start() call order for dependency ordering).
+    # No ScoringEngine — replay_day.py intentionally shows SetupEngine's raw
+    # score, not a final letter grade.
+    bundle = await build_replay_pipeline(settings, symbol, sym_obj, include_scoring=False)
+    registry             = bundle.registry
+    calendar             = bundle.calendar
+    bus                  = bundle.bus
+    feature_engine       = bundle.feature
+    context_engine       = bundle.context
+    market_state_engine  = bundle.market_state
+    setup_engine         = bundle.setup
+    thesis_engine        = bundle.thesis
 
     # ── Cache setup ───────────────────────────────────────────────────────────
     cache: ReplayCache | None = None
@@ -667,12 +621,7 @@ async def replay(
         print(f"  JSON → {json_path}")
         print(f"  CSV  → {csv_path}")
 
-    await thesis_engine.stop()
-    await setup_engine.stop()
-    await market_state_engine.stop()
-    await context_engine.stop()
-    await feature_engine.stop()
-    await bus.stop()
+    await stop_replay_pipeline(bundle)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
