@@ -332,12 +332,16 @@ def dataset_manifest(
 
 def default_m1_warmup_days(settings: AlphaSettings) -> int:
     """
-    Same formula backfill.py uses for its own default (warmup-driven) M1 fetch
-    window, so backtest.py/replay_day.py's --warmup default tracks
-    settings.historical.minute1_warmup_bars instead of an unrelated flat
-    constant that silently drifts if that config changes.
+    backtest.py/replay_day.py's --warmup default: the M1 entry of
+    BackfillEngine's default_warmup_days() — the actual single source of
+    truth (also used by BackfillEngine._on_start() and backfill.py --dry-run)
+    — instead of an unrelated flat constant that would silently drift if
+    settings.historical.minute1_warmup_bars changes.
     """
-    return max(3, settings.historical.minute1_warmup_bars // 390 + 1)
+    from alpha.engines.backfill.engine import default_warmup_days
+    from alpha.models.enums import BarTimeframe
+
+    return default_warmup_days(settings.historical)[BarTimeframe.M1]
 
 
 def load_m1_bars(

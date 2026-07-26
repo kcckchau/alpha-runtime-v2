@@ -34,8 +34,10 @@ from replay_common import (
     build_resolved_config,
     config_hash,
     dataset_manifest,
+    default_m1_warmup_days,
 )
 from alpha.calendar.resolver import calendar_for_symbol
+from alpha.engines.backfill.engine import default_warmup_days
 from alpha.models.enums import AssetClass
 from alpha.models.symbol import Symbol
 
@@ -251,3 +253,29 @@ def test_dataset_manifest_no_gaps_when_fully_covered():
     manifest = dataset_manifest(bars, calendar, start, end, SYM)
     assert manifest["missing_days"] == []
     assert manifest["trading_days_with_bars"] == manifest["expected_trading_days"]
+
+
+# ── warmup single-source-of-truth ───────────────────────────────────────────
+
+def test_default_m1_warmup_days_matches_backfill_engine():
+    """
+    Regression test for the warmup single-source-of-truth fix: backtest.py/
+    replay_day.py's --warmup default must be the same number BackfillEngine
+    itself uses for its M1 fetch window — not an independent copy of the
+    formula that could silently drift.
+    """
+    settings = AlphaSettings()
+    assert (
+        default_m1_warmup_days(settings)
+        == default_warmup_days(settings.historical)[BarTimeframe.M1]
+    )
+
+
+def test_default_warmup_days_matches_docstring_defaults():
+    """Sanity check against backfill.py's documented defaults (~3/7/250/1500 days)."""
+    settings = AlphaSettings()
+    days = default_warmup_days(settings.historical)
+    assert days[BarTimeframe.M1] == 3
+    assert days[BarTimeframe.M5] == 7
+    assert days[BarTimeframe.H1] == 250
+    assert days[BarTimeframe.D1] == 1500

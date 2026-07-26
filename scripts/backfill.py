@@ -55,6 +55,9 @@ def _configure_logging(level: str) -> None:
 
 
 def _print_dry_run(settings: AlphaSettings, ticks: bool) -> None:
+    from alpha.engines.backfill.engine import default_warmup_days
+    from alpha.models.enums import BarTimeframe
+
     hist = settings.historical
     now = datetime.now(_UTC)
     end_dt = (
@@ -65,10 +68,11 @@ def _print_dry_run(settings: AlphaSettings, ticks: bool) -> None:
         if settings.replay.end_date
         else now
     )
-    m1_days = max(3, hist.minute1_warmup_bars // 390 + 1)
-    m5_days = max(7, hist.minute5_warmup_bars // 78 + 2)
-    h1_days = int(hist.hourly_warmup_bars * 0.22) + 30
-    d1_days = int(hist.daily_warmup_bars * 1.5)
+    warmup = default_warmup_days(hist)
+    m1_days = warmup[BarTimeframe.M1]
+    m5_days = warmup[BarTimeframe.M5]
+    h1_days = warmup[BarTimeframe.H1]
+    d1_days = warmup[BarTimeframe.D1]
     explicit_start = settings.replay.start_date
     print("Dry-run backfill plan (no requests will be made):")
     print(f"  Symbols : {settings.runtime.symbols}")
