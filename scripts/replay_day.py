@@ -39,9 +39,12 @@ sys.path.insert(0, str(_REPO / "src"))
 
 from alpha.calendar.base import SessionCalendar
 from replay_common import (
-    config_fingerprint_lines,
-    default_m1_warmup_days,
+    build_config_fingerprint,
     build_replay_pipeline,
+    build_resolved_config,
+    config_fingerprint_lines,
+    config_hash,
+    default_m1_warmup_days,
     load_m1_bars,
     stop_replay_pipeline,
 )
@@ -605,6 +608,15 @@ async def replay(
         thesis_final = thesis_engine.get_thesis(symbol)
         snap_final   = feature_engine.get_snapshot(symbol)
         active_setups_final = setup_engine.active_setups(symbol)
+        resolved_config = build_resolved_config(settings, {
+            "symbol": symbol,
+            "session_date": str(session_date),
+            "warmup_days": warmup_days,
+            "source": source,
+            "full_signals": full_signals,
+            "no_cache": no_cache,
+            "record_interactions": record_interactions,
+        })
         json_path, csv_path = saver.save(
             meta={
                 "symbol": symbol,
@@ -612,6 +624,9 @@ async def replay(
                 "source": source,
                 "warmup_days": warmup_days,
             },
+            fingerprint=build_config_fingerprint(),
+            config=resolved_config,
+            config_hash_value=config_hash(resolved_config),
             full_signals=full_signals,
             thesis_final=thesis_final.dominant if thesis_final else None,
             snap_final=snap_final,

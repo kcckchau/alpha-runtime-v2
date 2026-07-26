@@ -57,8 +57,11 @@ from alpha.config.settings import AlphaSettings, RuntimeSettings, StorageSetting
 from alpha.research.interaction.engine import LevelInteractionEngine
 from replay_common import (
     EngineBundle,
+    build_config_fingerprint,
     build_replay_pipeline,
+    build_resolved_config,
     config_fingerprint_lines,
+    config_hash,
     default_m1_warmup_days,
     load_m1_bars,
     stop_replay_pipeline,
@@ -553,6 +556,8 @@ def _save(
     start: str,
     end: str,
     meta: dict,
+    settings: AlphaSettings,
+    cli_args: dict,
 ) -> Path:
     out_dir = _REPO / "data" / "backtest_results" / symbol / f"{start}_{end}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -563,8 +568,17 @@ def _save(
         for s in signals:
             f.write(json.dumps(s.__dict__) + "\n")
 
-    # summary.json
-    summary = {"meta": meta, "stats": stats}
+    # summary.json — meta/fingerprint/config three-layer provenance, so a
+    # summary.json opened later is self-contained: what ran, what code
+    # produced it, and what parameters/settings were actually resolved.
+    resolved_config = build_resolved_config(settings, cli_args)
+    summary = {
+        "meta": meta,
+        "fingerprint": build_config_fingerprint(),
+        "config": resolved_config,
+        "config_hash": config_hash(resolved_config),
+        "stats": stats,
+    }
     summary_path = out_dir / "summary.json"
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
@@ -746,7 +760,16 @@ async def run(
             "sessions": session_count,
             "generated_at": datetime.now(_UTC).isoformat(),
         }
-        _save(all_signals, stats, symbol, str(start_date), str(end_date), meta)
+        cli_args = {
+            "symbol": symbol,
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+            "min_grade": str(min_grade),
+            "warmup_days": warmup_days,
+            "max_hold_bars": max_hold_bars,
+            "record_interactions": record_interactions,
+        }
+        _save(all_signals, stats, symbol, str(start_date), str(end_date), meta, settings, cli_args)
 
 
 def main() -> None:

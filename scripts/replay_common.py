@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from alpha.calendar.base import SessionCalendar
@@ -157,11 +157,21 @@ async def stop_replay_pipeline(bundle: EngineBundle) -> None:
 _TRADING_LOGIC_PATHS = ("src/alpha/engines/", "src/alpha/features/", "scripts/")
 
 
-def config_fingerprint_lines() -> list[str]:
+def build_config_fingerprint() -> dict:
     """
-    Human-readable lines identifying exactly what setup/context code produced
-    a replay/backtest run, so a later run with different code (even
-    uncommitted) doesn't get silently compared as if it used the same logic.
+    Structured provenance for exactly what code produced a replay/backtest run.
+
+    NOTE on completeness: SetupEngine/ScoringEngine/ThesisEngine/MarketStateEngine
+    thresholds are hardcoded Python literals inline in each engine's detector/
+    scoring methods — there is no settings object or version string for them
+    (unlike FeatureEngine's norm3/ribbon policies below, which are real). That
+    means git_commit + dirty_files is not one signal among several for those
+    engines — it is the *only* signal. There is deliberately no
+    "setup_engine_version"/"scoring_policy_version" field here: fabricating one
+    would claim a completeness this data doesn't have.
+
+    On git command failure, returns available=False with null commit/dirty
+    fields rather than raising — a broken git call must never crash a backtest.
     """
     from alpha.features.slope import (
         EMA_1H_RIBBON_POLICY_VERSION,
@@ -169,39 +179,121 @@ def config_fingerprint_lines() -> list[str]:
         SLOPE_POLICY_VERSION,
     )
 
+    commit: str | None = None
+    dirty_files: list[str] | None = None
+    available = True
     try:
-        commit = subprocess.run(
+        result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=_REPO, capture_output=True, text=True, timeout=5,
-        ).stdout.strip() or "unknown"
+        )
+        commit = result.stdout.strip() or None
+        if commit is None:
+            available = False
     except Exception:
-        commit = "unknown"
+        available = False
 
-    dirty_files: list[str] = []
-    try:
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=_REPO, capture_output=True, text=True, timeout=5,
-        ).stdout
-        for line in status.splitlines():
-            path = line[3:].strip()
-            if path.startswith(_TRADING_LOGIC_PATHS):
-                dirty_files.append(path)
-    except Exception:
-        pass
+    if available:
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=_REPO, capture_output=True, text=True, timeout=5,
+            ).stdout
+            dirty_files = [
+                line[3:].strip() for line in status.splitlines()
+                if line[3:].strip().startswith(_TRADING_LOGIC_PATHS)
+            ]
+        except Exception:
+            dirty_files = None
+            available = False
 
+    return {
+        "available": available,
+        "git_commit": commit,
+        "git_dirty": (len(dirty_files) > 0) if dirty_files is not None else None,
+        "dirty_trading_logic_files": dirty_files,
+        "policy_versions": {
+            "slope": SLOPE_POLICY_VERSION,
+            "ema_1h_ribbon": EMA_1H_RIBBON_POLICY_VERSION,
+            "ema_1h_slope": EMA_1H_SLOPE_POLICY_VERSION,
+        },
+        "fingerprint_generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def config_fingerprint_lines() -> list[str]:
+    """Human-readable rendering of build_config_fingerprint() for console output."""
+    fp = build_config_fingerprint()
+    if not fp["available"]:
+        return ["Config fingerprint: unavailable (git command failed)"]
+
+    dirty_files = fp["dirty_trading_logic_files"] or []
     dirty_label = (
         f"DIRTY — {len(dirty_files)} uncommitted trading-logic file(s)"
-        if dirty_files else "clean"
+        if fp["git_dirty"] else "clean"
     )
-    lines = [f"Config fingerprint: commit={commit} ({dirty_label})"]
+    lines = [f"Config fingerprint: commit={fp['git_commit']} ({dirty_label})"]
     for f in dirty_files:
         lines.append(f"  uncommitted: {f}")
+    pv = fp["policy_versions"]
     lines.append(
-        f"  policy versions: slope={SLOPE_POLICY_VERSION} "
-        f"1h_ribbon={EMA_1H_RIBBON_POLICY_VERSION} 1h_slope={EMA_1H_SLOPE_POLICY_VERSION}"
+        f"  policy versions: slope={pv['slope']} "
+        f"1h_ribbon={pv['ema_1h_ribbon']} 1h_slope={pv['ema_1h_slope']}"
     )
     return lines
+
+
+# Key names (case-insensitive substring match) redacted from build_resolved_config()'s
+# settings dump. Defense in depth on top of pydantic SecretStr's own masking
+# (AlphaSettings.model_dump(mode="json") already renders SecretStr as "**********")
+# — this also catches any field holding a secret that isn't typed SecretStr.
+_SENSITIVE_KEY_MARKERS = ("key", "token", "secret", "password", "database_url", "dsn")
+
+
+def _redact(obj):
+    if isinstance(obj, dict):
+        return {
+            k: ("***REDACTED***" if any(m in k.lower() for m in _SENSITIVE_KEY_MARKERS) else _redact(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_redact(v) for v in obj]
+    return obj
+
+
+def build_resolved_config(settings: AlphaSettings, cli_args: dict) -> dict:
+    """
+    The actual resolved parameters a run used — not a config file path, since
+    env vars / CLI overrides / code-default changes can all make the file on
+    disk diverge from what actually executed. Two layers:
+
+    - "settings": AlphaSettings.model_dump(), redacted — the pydantic-resolved
+      config (runtime/storage/historical/etc). Does NOT include SetupEngine/
+      ScoringEngine thresholds; see build_config_fingerprint()'s docstring for
+      why those aren't representable as config at all in this codebase.
+    - "cli_args": the exact resolved arguments this run was invoked with
+      (after defaults like --warmup's backfill.py-formula resolution are
+      applied) — e.g. symbol, date range, min_grade, warmup_days.
+    """
+    return {
+        "settings": _redact(settings.model_dump(mode="json")),
+        "cli_args": cli_args,
+    }
+
+
+def config_hash(resolved_config: dict) -> str:
+    """
+    sha256 over the resolved config's stable content (canonical/sorted JSON).
+    Two runs with the same config_hash used identical settings+CLI args;
+    combined with git_commit from build_config_fingerprint(), this lets you
+    tell apart a parameter experiment (same commit, different hash) from a
+    pure code change (different commit, same hash).
+    """
+    import hashlib
+    import json as _json
+
+    canonical = _json.dumps(resolved_config, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def default_m1_warmup_days(settings: AlphaSettings) -> int:

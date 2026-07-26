@@ -383,7 +383,11 @@ class ReplayResultSaver:
                 "vwap_deviation_pct": round(snap.vwap_deviation_pct, 4),
                 "ema9": _dec(snap.ema_9),
                 "ema21": _dec(snap.ema_21),
-                "ema20": _dec(snap.ema_20),
+                # BarSnapshot has no ema_20 field (only ema_21) — same fix as
+                # replay_day.py's console output. Duplicates "ema21" rather than
+                # dropping the "ema20" key, to avoid a schema change downstream
+                # consumers of this JSON/CSV might depend on.
+                "ema20": _dec(snap.ema_21),
                 "ema50": _dec(snap.ema_50),
                 "ema9_5m": _dec(snap.ema9_5m),
                 "ema21_5m": _dec(snap.ema21_5m),
@@ -530,7 +534,12 @@ class ReplayResultSaver:
                 "trend": str(market_state.trend),
                 "trend_strength": round(market_state.trend_strength, 3),
                 "vwap_state": str(market_state.vwap_state),
-                "orb_state": str(market_state.orb_state),
+                # MarketState.orb_state (ORBState enum) was replaced by or_position
+                # (str | None) in commit 7851642 (2026-07-18) — this line was never
+                # updated. Not str()-wrapped: or_position is already a plain string,
+                # and None is a meaningful value here ("OR not yet established"),
+                # not something to collapse into the literal string "None".
+                "orb_state": market_state.or_position,
                 "day_type": str(market_state.day_type),
                 "day_type_status": str(market_state.day_type_status),
                 "live_bias": str(market_state.live_bias),
@@ -559,6 +568,9 @@ class ReplayResultSaver:
         thesis_final: object | None,
         snap_final: "BarSnapshot | None",
         active_setups_at_close: list,
+        fingerprint: dict | None = None,
+        config: dict | None = None,
+        config_hash_value: str | None = None,
     ) -> tuple[Path, Path]:
         """Write JSON + CSV results. Returns (json_path, csv_path)."""
         self._out_dir.mkdir(parents=True, exist_ok=True)
@@ -598,7 +610,8 @@ class ReplayResultSaver:
                 "vwap": _dec(snap_final.vwap),
                 "ema9": _dec(snap_final.ema_9),
                 "ema21": _dec(snap_final.ema_21),
-                "ema20": _dec(snap_final.ema_20),
+                # Same fix as record_bar() above — no ema_20 field exists.
+                "ema20": _dec(snap_final.ema_21),
                 "ema50": _dec(snap_final.ema_50),
                 "ema9_5m": _dec(snap_final.ema9_5m),
                 "ema21_5m": _dec(snap_final.ema21_5m),
@@ -640,6 +653,9 @@ class ReplayResultSaver:
 
         result = {
             "meta": {**meta, "generated_at": now.isoformat(), "full_signals": full_signals},
+            "fingerprint": fingerprint,
+            "config": config,
+            "config_hash": config_hash_value,
             "session_summary": session_summary,
             "bars": self._bars,
         }
