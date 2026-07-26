@@ -30,14 +30,18 @@ from alpha.models.market_state import MarketState
 from alpha.models.snapshot import BarSnapshot
 
 from replay_common import (
+    _read_partition_file,
     build_config_fingerprint,
     build_resolved_config,
+    clear_persisted_replay,
     config_hash,
     dataset_manifest,
     default_m1_warmup_days,
+    find_existing_persisted_replay,
 )
 from alpha.calendar.resolver import calendar_for_symbol
 from alpha.engines.backfill.engine import default_warmup_days
+from alpha.engines.storage.parquet import ParquetStore
 from alpha.models.enums import AssetClass
 from alpha.models.symbol import Symbol
 
@@ -279,3 +283,72 @@ def test_default_warmup_days_matches_docstring_defaults():
     assert days[BarTimeframe.M5] == 7
     assert days[BarTimeframe.H1] == 250
     assert days[BarTimeframe.D1] == 1500
+
+
+# ── --persist idempotency guard ─────────────────────────────────────────────
+
+def _write_synthetic_partition(root: Path, data_type: str, symbol: str, d: date, is_replay_values: list[bool]) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from alpha.engines.storage.parquet import _partition_path
+
+    part_dir = _partition_path(root, data_type, symbol, d)
+    part_dir.mkdir(parents=True, exist_ok=True)
+    table = pa.table({
+        "event_id": [f"id-{i}" for i in range(len(is_replay_values))],
+        "is_replay": is_replay_values,
+    })
+    pq.write_table(table, part_dir / "data.parquet")
+
+
+def test_find_existing_persisted_replay_detects_prior_reconstruction(tmp_path):
+    settings = AlphaSettings(storage={"parquet_root": tmp_path})
+    d = date(2024, 2, 6)
+    _write_synthetic_partition(tmp_path, "setups", SYM, d, [True, True])
+    _write_synthetic_partition(tmp_path, "market_states", SYM, d, [True] * 5)
+
+    found = find_existing_persisted_replay(SYM, [d], settings)
+    assert found == {"setups": [d], "market_states": [d]}
+
+
+def test_find_existing_persisted_replay_ignores_live_only_days(tmp_path):
+    """A day with only is_replay=False (live-captured) rows is not a prior
+    --persist run — must not be flagged as something a rerun would duplicate."""
+    settings = AlphaSettings(storage={"parquet_root": tmp_path})
+    d = date(2026, 7, 24)
+    _write_synthetic_partition(tmp_path, "setups", SYM, d, [False, False, False])
+
+    found = find_existing_persisted_replay(SYM, [d], settings)
+    assert found == {}
+
+
+def test_clear_persisted_replay_preserves_live_rows_only(tmp_path):
+    """The exact safety property --persist-force depends on: clearing a prior
+    reconstruction must never remove is_replay=False (live-captured) rows,
+    even when they share a file with is_replay=True rows — the real shape of
+    data/parquet/setups/MNQ-09/.../2026-07-24 today (mixed from live
+    bootstrap's own catchup-replay at startup)."""
+    settings = AlphaSettings(storage={"parquet_root": tmp_path})
+    d = date(2026, 7, 24)
+    _write_synthetic_partition(tmp_path, "setups", SYM, d, [False, True, False, True, True])
+
+    clear_persisted_replay(SYM, [d], settings)
+
+    remaining = _read_partition_file(tmp_path, "setups", SYM, d, columns=["is_replay"])
+    assert remaining.column("is_replay").to_pylist() == [False, False]
+
+    # Second call is a no-op — nothing left to clear, must not error or delete the file.
+    clear_persisted_replay(SYM, [d], settings)
+    still_there = _read_partition_file(tmp_path, "setups", SYM, d, columns=["is_replay"])
+    assert still_there.num_rows == 2
+
+
+def test_clear_persisted_replay_deletes_file_when_all_rows_were_replay(tmp_path):
+    settings = AlphaSettings(storage={"parquet_root": tmp_path})
+    d = date(2024, 2, 6)
+    _write_synthetic_partition(tmp_path, "market_states", SYM, d, [True, True, True])
+
+    clear_persisted_replay(SYM, [d], settings)
+
+    from alpha.engines.storage.parquet import _partition_path
+    assert not (_partition_path(tmp_path, "market_states", SYM, d) / "data.parquet").exists()

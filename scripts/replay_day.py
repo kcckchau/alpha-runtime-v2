@@ -42,10 +42,12 @@ from replay_common import (
     build_config_fingerprint,
     build_replay_pipeline,
     build_resolved_config,
+    clear_persisted_replay,
     config_fingerprint_lines,
     config_hash,
     dataset_manifest,
     default_m1_warmup_days,
+    find_existing_persisted_replay,
     load_m1_bars,
     stop_replay_pipeline,
 )
@@ -296,6 +298,7 @@ async def replay(
     save_results: bool = False,
     record_interactions: bool = False,
     persist: bool = False,
+    persist_force: bool = False,
 ) -> None:
 
     settings = AlphaSettings(
@@ -385,6 +388,25 @@ async def replay(
             print(f"  python scripts/backfill.py --symbol {symbol} --start {gap_start} --end {gap_end}")
             print(f"{_DIM}(backfill.py is idempotent — safe to run even where data already exists){_RESET}")
             sys.exit(1)
+
+    if persist:
+        persist_dates = [warmup_start + timedelta(days=i) for i in range((session_date - warmup_start).days + 1)]
+        existing = find_existing_persisted_replay(symbol, persist_dates, settings)
+        if existing and not persist_force:
+            print(f"\n{_RED}--persist would duplicate existing reconstructed data:{_RESET}")
+            for data_type, dates in existing.items():
+                print(f"  {data_type}: {', '.join(str(d) for d in dates)}")
+            print(f"{_YELLOW}setup_id is a fresh UUID per run (not content-derived) and "
+                  f"market_states has no dedup key — rerunning would append a full duplicate "
+                  f"set on top of the last one, not replace it.{_RESET}")
+            print(f"{_DIM}Pass --persist-force to clear the prior reconstruction for these "
+                  f"dates first (live-captured is_replay=False rows are never touched).{_RESET}")
+            sys.exit(1)
+        elif existing:
+            clear_dates = sorted({d for dates in existing.values() for d in dates})
+            print(f"\n{_YELLOW}--persist-force: clearing prior reconstruction for "
+                  f"{len(clear_dates)} date(s) before rerunning{_RESET}")
+            clear_persisted_replay(symbol, clear_dates, settings)
 
     # Split into warmup (before session date) and session bars
     # For CME futures, the session date's bars start at 18:00 ET the prior calendar day.
@@ -699,6 +721,10 @@ def _parse_args() -> argparse.Namespace:
                    help="Also write reconstructed setups/market_states to "
                         "data/parquet/setups|market_states/ (same tables live uses), "
                         "tagged is_replay=True so they're distinguishable from live-captured rows")
+    p.add_argument("--persist-force", action="store_true",
+                   help="With --persist: clear any prior reconstruction (is_replay=True rows) "
+                        "for the affected dates before rerunning, instead of blocking. "
+                        "Never touches live-captured (is_replay=False) rows.")
     return p.parse_args()
 
 
@@ -729,6 +755,7 @@ def main() -> None:
         save_results=args.save_results,
         record_interactions=args.record_interactions,
         persist=args.persist,
+        persist_force=args.persist_force,
     ))
 
 

@@ -177,6 +177,103 @@ async def stop_replay_pipeline(bundle: EngineBundle) -> None:
     await bundle.feature.stop()
     await bundle.bus.stop()
 
+
+_PERSISTED_DATA_TYPES = ("setups", "market_states")
+
+
+def _read_partition_file(root: Path, data_type: str, symbol: str, d: date, columns: list[str] | None = None):
+    """
+    Read one partition's data.parquet directly via pq.ParquetFile(...).read(),
+    not the higher-level pq.read_table()/ParquetStore.read() — those go
+    through pyarrow's dataset API, which does hive-partition schema inference
+    from the path itself (this partition layout is literally .../year=YYYY/
+    month=MM/day=DD/...) and can throw a spurious ArrowTypeError merging the
+    inferred partition-column type against the file's actual schema. Mirrors
+    exactly what ParquetStore.write() already does internally to read the
+    existing file before a dedup merge — proven safe, since that's the path
+    every write in this codebase already goes through.
+    """
+    import pyarrow.parquet as pq
+    from alpha.engines.storage.parquet import _partition_path
+
+    file_path = _partition_path(root, data_type, symbol, d) / "data.parquet"
+    if not file_path.exists():
+        return None
+    try:
+        table = pq.ParquetFile(file_path).read()
+    except Exception:
+        return None
+    return table.select(columns) if columns is not None else table
+
+
+def find_existing_persisted_replay(symbol: str, dates: list[date], settings: AlphaSettings) -> dict[str, list[date]]:
+    """
+    Which of `dates` already have reconstructed (is_replay=True) rows in
+    data/parquet/setups|market_states/ — i.e. a previous --persist run already
+    wrote here.
+
+    Necessary because --persist is not idempotent on rerun: setup_id is a
+    fresh uuid4() per SetupEngine detection (not derived from
+    symbol/timestamp/setup_type), so the dedup-by-setup_id upsert in
+    ParquetStore.write() never matches a prior run's rows — and
+    market_states has no dedup key at all (see _DEDUP_KEYS in
+    storage/engine.py). Every rerun over the same range would silently
+    append a full duplicate set on top of the last one.
+    """
+    import pyarrow.compute as pc
+
+    found: dict[str, list[date]] = {}
+    for data_type in _PERSISTED_DATA_TYPES:
+        hits = []
+        for d in dates:
+            table = _read_partition_file(settings.storage.parquet_root, data_type, symbol, d, columns=["is_replay"])
+            if table is not None and table.num_rows > 0:
+                if pc.any(table.column("is_replay")).as_py():
+                    hits.append(d)
+        if hits:
+            found[data_type] = hits
+    return found
+
+
+def clear_persisted_replay(symbol: str, dates: list[date], settings: AlphaSettings) -> None:
+    """
+    Strip is_replay=True rows from setups/market_states for `dates`, keeping
+    any is_replay=False (live-captured) rows untouched — e.g. 2026-07-24
+    already mixes both from live bootstrap's own catchup-replay at startup.
+    Called before a --persist-force rerun so it replaces rather than
+    duplicates a prior reconstruction.
+    """
+    import os
+    import tempfile
+
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+    from alpha.engines.storage.parquet import _partition_path
+
+    parquet = ParquetStore(settings.storage)
+    for data_type in _PERSISTED_DATA_TYPES:
+        for d in dates:
+            table = _read_partition_file(settings.storage.parquet_root, data_type, symbol, d)
+            if table is None:
+                continue
+            kept = table.filter(pc.invert(table.column("is_replay")))
+            if kept.num_rows == table.num_rows:
+                continue  # nothing was_replay=True here — leave file untouched
+            if kept.num_rows == 0:
+                parquet.delete(data_type, symbol, d)
+                continue
+            part_dir = _partition_path(parquet._root, data_type, symbol, d)
+            file_path = part_dir / "data.parquet"
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=part_dir, suffix=".parquet.tmp")
+            try:
+                os.close(tmp_fd)
+                pq.write_table(kept, tmp_path, compression=parquet._compress, row_group_size=parquet._row_group_size)
+                os.replace(tmp_path, file_path)
+            except Exception:
+                os.unlink(tmp_path)
+                raise
+
+
 # Paths where a code change would silently change replay/backtest output
 # without touching AlphaSettings — most SetupEngine/ScoringEngine/ThesisEngine/
 # MarketStateEngine thresholds are hardcoded Python literals with no version
