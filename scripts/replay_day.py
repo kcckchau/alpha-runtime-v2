@@ -37,22 +37,25 @@ from typing import AsyncIterator
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "src"))
 
+from alpha.calendar.base import SessionCalendar
 from alpha.calendar.resolver import calendar_for_symbol
+from replay_common import load_m1_bars
 from alpha.config.settings import AlphaSettings, RuntimeSettings, StorageSettings
 from alpha.core.clock import WallClock
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
 from alpha.engines.context.engine import ContextEngine
 from alpha.engines.feature.engine import FeatureEngine
+from alpha.engines.flow.aggregator import BarFlowAggregator
+from alpha.engines.flow.pipeline import BarPipeline
 from alpha.engines.historical.sources.databento import DatabentoHistoricalDataSource as DatabentoHistoricalSource
 from alpha.engines.market_state.engine import MarketStateEngine
 from alpha.engines.setup.engine import SetupEngine
-from alpha.engines.storage.engine import StorageEngine
-from alpha.engines.storage.parquet import ParquetStore
 from alpha.engines.thesis.engine import ThesisEngine
 from alpha.models.enums import AssetClass, BarTimeframe, RuntimeMode
 from alpha.models.events import BarEvent, QuoteEvent, TradeEvent
 from alpha.models.symbol import Symbol
+from alpha.research.interaction.engine import LevelInteractionEngine
 from replay_cache import ReplayCache, ReplayResultSaver
 
 _UTC = timezone.utc
@@ -90,35 +93,13 @@ def _fmt_pct(v: float | None) -> str:
     return f"{v*100:.1f}%"
 
 
-# ── Bar loading ───────────────────────────────────────────────────────────────
-
-def _load_from_parquet(
-    symbol: str,
-    warmup_start: date,
-    session_date: date,
-    settings: AlphaSettings,
-) -> list[BarEvent]:
-    parquet = ParquetStore(settings.storage)
-    bars: list[BarEvent] = []
-    d = warmup_start
-    while d <= session_date:
-        table = parquet.read_range(f"bars/{BarTimeframe.M1}", symbol, d, d)
-        for row in table.to_pylist():
-            bar = StorageEngine._row_to_bar_event(row, BarTimeframe.M1)
-            if bar.symbol != symbol:
-                bar = bar.model_copy(update={"symbol": symbol})
-            bars.append(bar)
-        d += timedelta(days=1)
-    bars.sort(key=lambda b: b.timestamp)
-    return bars
-
-
 async def _load_from_databento(
     symbol: str,
     warmup_start: date,
     session_date: date,
     settings: AlphaSettings,
     registry: SymbolRegistry,
+    calendar: SessionCalendar,
     cache: ReplayCache | None = None,
     warmup_days: int = 5,
     no_cache: bool = False,
@@ -130,14 +111,10 @@ async def _load_from_databento(
     """
     source: DatabentoHistoricalSource | None = None
 
-    start_utc = datetime(
-        warmup_start.year, warmup_start.month, warmup_start.day,
-        22, 0, 0, tzinfo=_UTC,
-    ) - timedelta(days=1)
-    end_utc = datetime(
-        session_date.year, session_date.month, session_date.day,
-        21, 0, 0, tzinfo=_UTC,
-    )
+    # ZoneInfo-based (DST-safe) rather than a hardcoded UTC offset — see the
+    # same fix in the warmup/session split below.
+    start_utc = calendar.pre_market_open(warmup_start)
+    end_utc = calendar.after_hours_close(session_date)
 
     # ── M1 bars ───────────────────────────────────────────────────────────────
     if cache is not None and not no_cache and cache.bars_cached(symbol, session_date, warmup_days):
@@ -177,10 +154,9 @@ async def _load_from_databento(
     # SMA200 on H1 requires 200 bars ≈ 8.5 trading days. We always fetch at
     # least 12 calendar days back so the SMA200 is warm by RTH open.
     h1_warmup_days = max(warmup_days, 12)
-    h1_start_utc = datetime(
-        warmup_start.year, warmup_start.month, warmup_start.day,
-        22, 0, 0, tzinfo=_UTC,
-    ) - timedelta(days=max(0, h1_warmup_days - warmup_days) + 1)
+    h1_start_utc = calendar.pre_market_open(warmup_start) - timedelta(
+        days=max(0, h1_warmup_days - warmup_days)
+    )
 
     if cache is not None and not no_cache and cache.h1_bars_cached(symbol, session_date, warmup_days):
         print("  H1 bars: loading from cache…", end="", flush=True)
@@ -318,6 +294,7 @@ async def replay(
     full_signals: bool = False,
     no_cache: bool = False,
     save_results: bool = False,
+    record_interactions: bool = False,
 ) -> None:
 
     settings = AlphaSettings(
@@ -366,6 +343,26 @@ async def replay(
     setup_engine.set_context_engine(context_engine)
     thesis_engine.set_context_engine(context_engine)
 
+    # Wire BarFlowAggregator + BarPipeline (same as backtest.py / live) — replaces
+    # the old direct-subscription pattern (each engine self-subscribing to raw BAR
+    # events, relying on .start() call order for dependency ordering). BarPipeline
+    # calls each stage explicitly in sequence, removing that ordering fragility.
+    # No ScoringEngine here — unchanged from before the migration: replay_day.py
+    # intentionally shows SetupEngine's raw score, not a final letter grade.
+    agg = BarFlowAggregator(
+        symbol=symbol,
+        event_bus=bus,
+        large_trade_threshold=getattr(settings.runtime, "large_trade_threshold", 10),
+    )
+    agg.attach()
+
+    pipeline = BarPipeline(bus)
+    pipeline.set_feature_engine(feature_engine)
+    pipeline.set_market_state_engine(market_state_engine)
+    pipeline.set_thesis_engine(thesis_engine)
+    pipeline.set_setup_engine(setup_engine)
+    pipeline.attach()
+
     await feature_engine.initialize()
     await context_engine.initialize()
     await market_state_engine.initialize()
@@ -374,6 +371,8 @@ async def replay(
 
     # ContextEngine must start AFTER FeatureEngine so its BAR subscription
     # fires second — guaranteeing FeatureEngine.get_snapshot() is current.
+    # (ContextEngine is not yet migrated onto BarPipeline, so it still relies on
+    # this ordering — same as before.)
     await feature_engine.start()
     await context_engine.start()
     await market_state_engine.start()
@@ -395,11 +394,11 @@ async def replay(
     if source == "databento":
         print("  Loading bars…")
         all_bars, all_m5_bars, all_h1_bars, all_d1_bars = await _load_from_databento(
-            symbol, warmup_start, session_date, settings, registry,
+            symbol, warmup_start, session_date, settings, registry, calendar,
             cache=cache, warmup_days=warmup_days, no_cache=no_cache,
         )
     else:
-        all_bars = _load_from_parquet(symbol, warmup_start, session_date, settings)
+        all_bars = load_m1_bars(symbol, warmup_start, session_date, settings, skip_read_errors=False)
         all_m5_bars = []
         all_h1_bars = []
         all_d1_bars = []
@@ -412,17 +411,13 @@ async def replay(
     # For CME futures, the session date's bars start at 18:00 ET the prior calendar day.
     # We define "session" as bars whose ET date equals session_date OR the overnight
     # window that belongs to this CME session (18:00–23:59 ET on the prior calendar day).
-    session_date_utc_start = datetime(
-        session_date.year, session_date.month, session_date.day,
-        22, 0, 0, tzinfo=_UTC,
-    ) - timedelta(days=1)   # 18:00 ET prior day = session open
+    # Computed via CMEEqIndexCalendar.pre_market_open() (ZoneInfo-based) rather than a
+    # hardcoded UTC offset — a fixed 22:00 UTC is EDT-only and drifts an hour off in EST.
+    session_date_utc_start = calendar.pre_market_open(session_date)   # 18:00 ET prior day = session open
 
-    # Cap at 18:00 ET on session_date (= 22:00 UTC) — the next CME session starts
-    # there and would trigger ContextEngine.rollover(), resetting rth_open/ONH/ONL.
-    session_date_utc_end = datetime(
-        session_date.year, session_date.month, session_date.day,
-        22, 0, 0, tzinfo=_UTC,
-    )   # 18:00 ET session_date = exclusive upper bound
+    # Cap at 18:00 ET on session_date — the next CME session starts there and would
+    # trigger ContextEngine.rollover(), resetting rth_open/ONH/ONL.
+    session_date_utc_end = calendar.pre_market_open(session_date + timedelta(days=1))   # 18:00 ET session_date = exclusive upper bound
 
     warmup_bars  = [b for b in all_bars    if b.timestamp < session_date_utc_start]
     session_bars = [b for b in all_bars    if session_date_utc_start <= b.timestamp < session_date_utc_end]
@@ -441,10 +436,7 @@ async def replay(
         return
 
     # ── Optionally load order-flow data ───────────────────────────────────────
-    session_end_utc = datetime(
-        session_date.year, session_date.month, session_date.day,
-        21, 0, 0, tzinfo=_UTC,
-    )
+    session_end_utc = calendar.after_hours_close(session_date)
     session_trades: list[TradeEvent] = []
     session_quotes: list[QuoteEvent] = []
     if full_signals:
@@ -472,6 +464,19 @@ async def replay(
         await bus.publish(bar)
         await bus.flush()
     print(f" done.{_RESET}\n")
+
+    # Level interactions: shadow research subscriber, never influences trades.
+    # Attached only now (target date only, after warmup) — matching backtest.py /
+    # research_replay.py — so warmup days aren't recorded as episodes.
+    interaction_engine: LevelInteractionEngine | None = None
+    if record_interactions:
+        interaction_engine = LevelInteractionEngine(
+            event_bus=bus,
+            registry=registry,
+            research_root=_REPO / "data" / "research",
+            run_id=f"replay-{session_date}",
+        )
+        interaction_engine.attach()
 
     # ── Build merged session event stream (bars + optional trades/quotes) ─────
     # Priority for same-timestamp ties: trades(0) → quotes(1) → bars(2)
@@ -559,7 +564,7 @@ async def replay(
         if verbose and snap:
             print(f"         EMA9={_fmt_dec(snap.ema_9)}  EMA20={_fmt_dec(snap.ema_20)}  "
                   f"ATR14={_fmt_dec(snap.atr_14)}  AboveVWAP={'Y' if snap.is_above_vwap else 'N'}  "
-                  f"ORBhigh={_fmt_dec(snap.orb_high)}  ORBlow={_fmt_dec(snap.orb_low)}")
+                  f"ORBhigh={_fmt_dec(snap.or_high)}  ORBlow={_fmt_dec(snap.or_low)}")
         if verbose and ctx:
             wz = f"{ctx.nearest_war_zone}@{_fmt_dec(ctx.nearest_war_zone_price)} ({_fmt_dec(ctx.nearest_war_zone_dist, 1)}pts)" if ctx.nearest_war_zone else "—"
             gap_str = f"{ctx.gap_points:+.2f}pts ({ctx.gap_pct:+.2f}%)" if ctx.gap_points is not None else "—"
@@ -621,16 +626,21 @@ async def replay(
         if ctx_final.nearest_war_zone:
             print(f"  Nearest WZ: {ctx_final.nearest_war_zone} @ {_fmt_dec(ctx_final.nearest_war_zone_price)}")
 
+    if interaction_engine is not None:
+        interaction_engine.flush()
+        print(f"\n{_DIM}Level interactions: {interaction_engine.episodes_written} episodes "
+              f"written to data/research/interaction/ (run_id=replay-{session_date}){_RESET}")
+
     snap = feature_engine.get_snapshot(symbol)
     if snap:
         print(f"\nFinal indicators:")
         print(f"  VWAP     : {_fmt_dec(snap.vwap)}")
         print(f"  EMA9     : {_fmt_dec(snap.ema_9)}")
-        print(f"  EMA20    : {_fmt_dec(snap.ema_20)}")
+        print(f"  EMA21    : {_fmt_dec(snap.ema_21)}")
         print(f"  EMA50    : {_fmt_dec(snap.ema_50)}")
         print(f"  ATR14    : {_fmt_dec(snap.atr_14)}")
-        print(f"  ORB H    : {_fmt_dec(snap.orb_high)}")
-        print(f"  ORB L    : {_fmt_dec(snap.orb_low)}")
+        print(f"  ORB H    : {_fmt_dec(snap.or_high)}")
+        print(f"  ORB L    : {_fmt_dec(snap.or_low)}")
         print(f"  EMA10 1d : {_fmt_dec(snap.ema10_1d)}")
         print(f"  EMA20 1d : {_fmt_dec(snap.ema20_1d)}")
 
@@ -693,6 +703,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--save-results", action="store_true",
                    help="Save structured JSON + CSV results to data/replay_results/ after replay")
     p.add_argument("--verbose", action="store_true",  help="Print indicator snapshot each bar")
+    p.add_argument("--record-interactions", action="store_true",
+                   help="Also run LevelInteractionEngine (shadow, VWAP/OR episode geometry) "
+                        "and write to data/research/interaction/")
     return p.parse_args()
 
 
@@ -717,6 +730,7 @@ def main() -> None:
         full_signals=args.full_signals,
         no_cache=args.no_cache,
         save_results=args.save_results,
+        record_interactions=args.record_interactions,
     ))
 
 
