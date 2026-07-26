@@ -295,6 +295,7 @@ async def replay(
     no_cache: bool = False,
     save_results: bool = False,
     record_interactions: bool = False,
+    persist: bool = False,
 ) -> None:
 
     settings = AlphaSettings(
@@ -327,7 +328,7 @@ async def replay(
     # events, relying on .start() call order for dependency ordering).
     # No ScoringEngine — replay_day.py intentionally shows SetupEngine's raw
     # score, not a final letter grade.
-    bundle = await build_replay_pipeline(settings, symbol, sym_obj, include_scoring=False)
+    bundle = await build_replay_pipeline(settings, symbol, sym_obj, include_scoring=False, persist=persist)
     registry             = bundle.registry
     calendar             = bundle.calendar
     bus                  = bundle.bus
@@ -694,6 +695,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--record-interactions", action="store_true",
                    help="Also run LevelInteractionEngine (shadow, VWAP/OR episode geometry) "
                         "and write to data/research/interaction/")
+    p.add_argument("--persist", action="store_true",
+                   help="Also write reconstructed setups/market_states to "
+                        "data/parquet/setups|market_states/ (same tables live uses), "
+                        "tagged is_replay=True so they're distinguishable from live-captured rows")
     return p.parse_args()
 
 
@@ -723,6 +728,7 @@ def main() -> None:
         no_cache=args.no_cache,
         save_results=args.save_results,
         record_interactions=args.record_interactions,
+        persist=args.persist,
     ))
 
 

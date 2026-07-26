@@ -606,6 +606,7 @@ async def run(
     save: bool,
     verbose: bool,
     record_interactions: bool = False,
+    persist: bool = False,
 ) -> None:
     settings = AlphaSettings(
         runtime=RuntimeSettings(
@@ -660,7 +661,7 @@ async def run(
         print(f"\n{_YELLOW}No bars found for {symbol} {warmup_start}→{end_date}.{_R}")
         return
 
-    bundle = await build_replay_pipeline(settings, symbol, sym_obj, include_scoring=True)
+    bundle = await build_replay_pipeline(settings, symbol, sym_obj, include_scoring=True, persist=persist)
 
     # Early completeness warning (not a hard exit, unlike replay_day.py) — a
     # research backtest over a long range may deliberately tolerate some known
@@ -819,6 +820,10 @@ def main() -> None:
     p.add_argument("--record-interactions", action="store_true",
                    help="Also run LevelInteractionEngine (shadow, VWAP/OR episode geometry) "
                         "and write to data/research/interaction/")
+    p.add_argument("--persist", action="store_true",
+                   help="Also write reconstructed setups/market_states to "
+                        "data/parquet/setups|market_states/ (same tables live uses), "
+                        "tagged is_replay=True so they're distinguishable from live-captured rows")
     args = p.parse_args()
 
     grade_map = {
@@ -844,6 +849,7 @@ def main() -> None:
         save=args.save,
         verbose=args.verbose,
         record_interactions=args.record_interactions,
+        persist=args.persist,
     ))
 
 

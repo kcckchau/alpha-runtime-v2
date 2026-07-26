@@ -47,6 +47,7 @@ class EngineBundle:
     setup: SetupEngine
     thesis: ThesisEngine
     scoring: ScoringEngine | None
+    storage: StorageEngine | None
 
 
 async def build_replay_pipeline(
@@ -55,6 +56,7 @@ async def build_replay_pipeline(
     sym_obj: Symbol,
     *,
     include_scoring: bool = True,
+    persist: bool = False,
 ) -> EngineBundle:
     """
     Construct and wire FeatureEngine/ContextEngine/MarketStateEngine/SetupEngine/
@@ -63,6 +65,22 @@ async def build_replay_pipeline(
 
     include_scoring=False (replay_day.py) intentionally omits ScoringEngine —
     that script shows SetupEngine's raw score, not a final letter grade.
+
+    persist=True additionally wires a StorageEngine, subscribed to the same
+    bus like live's does — SetupEngine/MarketStateEngine already publish
+    SetupEvent/MarketStateEvent (this was never the gap), and those events
+    already cascade is_replay from the triggering bar's metadata
+    (`metadata=trigger.metadata` in both engines' _emit()) — the only thing
+    that was missing is something subscribed to receive and persist them.
+    Writes to the *same* data/parquet/setups|market_states/ tables live uses,
+    tagged is_replay=True (load_m1_bars() forces this on every bar it loads,
+    regardless of what was originally stored), so a downstream reader can
+    tell reconstructed history apart from live-captured signals in the same
+    table. BarEvent itself is NOT re-persisted — StorageEngine already skips
+    is_replay bars (they're written directly by CatchupService/backfill, and
+    re-writing them here would just be duplicate I/O of the same rows).
+    Off by default: this is an explicit choice, not automatic, since it
+    writes into the same canonical tables live uses.
 
     Caller owns feeding bars via bus.publish()/bus.flush() and must call
     stop_replay_pipeline() when done.
@@ -80,6 +98,7 @@ async def build_replay_pipeline(
     setup_engine        = SetupEngine(settings, bus, registry)
     thesis_engine       = ThesisEngine(settings, bus, registry)
     scoring_engine      = ScoringEngine(settings, bus) if include_scoring else None
+    storage_engine      = StorageEngine(settings, bus) if persist else None
 
     market_state_engine.set_feature_engine(feature_engine)
     context_engine.set_feature_engine(feature_engine)
@@ -117,6 +136,8 @@ async def build_replay_pipeline(
     await thesis_engine.initialize()
     if scoring_engine is not None:
         await scoring_engine.initialize()
+    if storage_engine is not None:
+        await storage_engine.initialize()
 
     # ContextEngine must start AFTER FeatureEngine so its BAR subscription
     # fires second — guaranteeing FeatureEngine.get_snapshot() is current.
@@ -129,16 +150,24 @@ async def build_replay_pipeline(
     await thesis_engine.start()
     if scoring_engine is not None:
         await scoring_engine.start()
+    if storage_engine is not None:
+        # Subscribes to the bus last — doesn't matter for correctness (pub/sub,
+        # not a pipeline stage), but keeps it clearly last in the startup story.
+        await storage_engine.start()
 
     return EngineBundle(
         bus=bus, registry=registry, calendar=calendar,
         feature=feature_engine, context=context_engine,
         market_state=market_state_engine, setup=setup_engine,
-        thesis=thesis_engine, scoring=scoring_engine,
+        thesis=thesis_engine, scoring=scoring_engine, storage=storage_engine,
     )
 
 
 async def stop_replay_pipeline(bundle: EngineBundle) -> None:
+    if bundle.storage is not None:
+        # Stop first so its final flush (in _on_stop) captures everything the
+        # other engines published this run, before they're torn down.
+        await bundle.storage.stop()
     if bundle.scoring is not None:
         await bundle.scoring.stop()
     await bundle.thesis.stop()
@@ -376,8 +405,20 @@ def load_m1_bars(
             table = parquet.read_range(f"bars/{BarTimeframe.M1}", symbol, d, d)
         for row in table.to_pylist():
             bar = StorageEngine._row_to_bar_event(row, BarTimeframe.M1)
+            updates: dict = {}
             if bar.symbol != symbol:
-                bar = bar.model_copy(update={"symbol": symbol})
+                updates["symbol"] = symbol
+            # Force is_replay=True regardless of what was stored: _row_to_bar_event
+            # reconstructs whatever flag the bar had at its *original* ingestion
+            # (live vs backfill), but every load_m1_bars() caller is running a
+            # replay/backtest right now — SetupEvent/MarketStateEvent cascade this
+            # flag from the triggering bar's metadata (see setup/engine.py's
+            # `metadata=trigger.metadata`), so this is what lets any persisted
+            # setup/market-state output be told apart from live-captured ones.
+            if not bar.metadata.is_replay:
+                updates["metadata"] = bar.metadata.model_copy(update={"is_replay": True})
+            if updates:
+                bar = bar.model_copy(update=updates)
             bars.append(bar)
         d += timedelta(days=1)
     bars.sort(key=lambda b: b.timestamp)
