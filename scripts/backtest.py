@@ -67,7 +67,7 @@ from alpha.engines.scoring.engine import ScoringEngine
 from alpha.engines.setup.engine import SetupEngine
 from alpha.engines.thesis.engine import ThesisEngine
 from alpha.research.interaction.engine import LevelInteractionEngine
-from replay_common import load_m1_bars
+from replay_common import config_fingerprint_lines, load_m1_bars
 from alpha.models.enums import (
     AssetClass, BarTimeframe, EventType, OrderSide, RuntimeMode, SetupGrade, SetupType,
 )
@@ -727,7 +727,10 @@ async def run(
           f"{start_date} → {end_date}  "
           f"min_grade={min_grade}  "
           f"warmup={warmup_days}d  "
-          f"timeout={max_hold_bars}bars\n")
+          f"timeout={max_hold_bars}bars")
+    for line in config_fingerprint_lines():
+        print(f"{_DIM}{line}{_R}")
+    print()
 
     print(f"{'Date':<12} {'Bars':>5}  {'Signals':>8}  {'Win':>4} {'Loss':>4}  {'P&L':>10}"
           + ("  Episodes" if record_interactions else ""))

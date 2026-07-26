@@ -39,7 +39,7 @@ sys.path.insert(0, str(_REPO / "src"))
 
 from alpha.calendar.base import SessionCalendar
 from alpha.calendar.resolver import calendar_for_symbol
-from replay_common import load_m1_bars
+from replay_common import config_fingerprint_lines, load_m1_bars
 from alpha.config.settings import AlphaSettings, RuntimeSettings, StorageSettings
 from alpha.core.clock import WallClock
 from alpha.core.event_bus import EventBus
@@ -389,7 +389,10 @@ async def replay(
     signals_label = " +full-signals" if full_signals else ""
     cache_label = " no-cache" if no_cache else ""
     print(f"\n{_BOLD}Replay: {symbol} session {session_date}  "
-          f"(source={source}{signals_label}{cache_label}, warmup from {warmup_start}){_RESET}\n")
+          f"(source={source}{signals_label}{cache_label}, warmup from {warmup_start}){_RESET}")
+    for line in config_fingerprint_lines():
+        print(f"{_DIM}{line}{_RESET}")
+    print()
 
     if source == "databento":
         print("  Loading bars…")
