@@ -571,6 +571,7 @@ class ReplayResultSaver:
         fingerprint: dict | None = None,
         config: dict | None = None,
         config_hash_value: str | None = None,
+        dataset: dict | None = None,
     ) -> tuple[Path, Path]:
         """Write JSON + CSV results. Returns (json_path, csv_path)."""
         self._out_dir.mkdir(parents=True, exist_ok=True)
@@ -656,6 +657,7 @@ class ReplayResultSaver:
             "fingerprint": fingerprint,
             "config": config,
             "config_hash": config_hash_value,
+            "dataset": dataset,
             "session_summary": session_summary,
             "bars": self._bars,
         }

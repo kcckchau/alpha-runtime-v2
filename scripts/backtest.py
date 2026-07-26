@@ -62,6 +62,7 @@ from replay_common import (
     build_resolved_config,
     config_fingerprint_lines,
     config_hash,
+    dataset_manifest,
     default_m1_warmup_days,
     load_m1_bars,
     stop_replay_pipeline,
@@ -558,6 +559,7 @@ def _save(
     meta: dict,
     settings: AlphaSettings,
     cli_args: dict,
+    manifest: dict,
 ) -> Path:
     out_dir = _REPO / "data" / "backtest_results" / symbol / f"{start}_{end}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -568,15 +570,18 @@ def _save(
         for s in signals:
             f.write(json.dumps(s.__dict__) + "\n")
 
-    # summary.json — meta/fingerprint/config three-layer provenance, so a
-    # summary.json opened later is self-contained: what ran, what code
-    # produced it, and what parameters/settings were actually resolved.
+    # summary.json — meta/fingerprint/config/dataset three-layer(+1) provenance,
+    # so a summary.json opened later is self-contained: what ran, what code
+    # produced it, what parameters/settings were resolved, and whether the
+    # requested date range actually had complete data (see dataset_manifest()'s
+    # docstring — load_m1_bars silently continues past a missing/corrupt day).
     resolved_config = build_resolved_config(settings, cli_args)
     summary = {
         "meta": meta,
         "fingerprint": build_config_fingerprint(),
         "config": resolved_config,
         "config_hash": config_hash(resolved_config),
+        "dataset": manifest,
         "stats": stats,
     }
     summary_path = out_dir / "summary.json"
@@ -742,13 +747,12 @@ async def run(
     finally:
         await stop_replay_pipeline(bundle)
 
-    if not all_signals:
-        print(f"\n{_YELLOW}No signals found. Check date range, min_grade, and parquet data.{_R}")
-        return
-
     stats = _compute_stats(all_signals)
-    _print_summary(stats, symbol, str(start_date), str(end_date))
 
+    # save runs regardless of whether any signals fired — a zero-signal run is
+    # exactly when dataset_manifest's missing_days matters most (was there
+    # really no signal, or was data silently absent?), so --save must not
+    # skip writing provenance just because there was nothing to summarize.
     if save:
         meta = {
             "symbol": symbol,
@@ -769,7 +773,14 @@ async def run(
             "max_hold_bars": max_hold_bars,
             "record_interactions": record_interactions,
         }
-        _save(all_signals, stats, symbol, str(start_date), str(end_date), meta, settings, cli_args)
+        manifest = dataset_manifest(all_bars, bundle.calendar, warmup_start, end_date, symbol)
+        _save(all_signals, stats, symbol, str(start_date), str(end_date), meta, settings, cli_args, manifest)
+
+    if not all_signals:
+        print(f"\n{_YELLOW}No signals found. Check date range, min_grade, and parquet data.{_R}")
+        return
+
+    _print_summary(stats, symbol, str(start_date), str(end_date))
 
 
 def main() -> None:

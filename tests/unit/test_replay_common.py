@@ -33,7 +33,11 @@ from replay_common import (
     build_config_fingerprint,
     build_resolved_config,
     config_hash,
+    dataset_manifest,
 )
+from alpha.calendar.resolver import calendar_for_symbol
+from alpha.models.enums import AssetClass
+from alpha.models.symbol import Symbol
 
 SYM = "MNQ-09"
 
@@ -132,16 +136,22 @@ def test_backtest_save_writes_fingerprint_and_config(tmp_path, monkeypatch):
     )
     settings = AlphaSettings()
     cli_args = {"symbol": SYM, "min_grade": "A"}
+    manifest = {
+        "source": "parquet", "symbol": SYM,
+        "coverage": {"start": "2026-07-20", "end": "2026-07-24"},
+        "expected_trading_days": 5, "trading_days_with_bars": 5, "missing_days": [],
+    }
 
     out_dir = backtest_mod._save(
         [signal], {"total_pnl_pts": -5.0}, SYM, "2026-07-20", "2026-07-24",
         {"symbol": SYM, "generated_at": "2026-07-26T00:00:00Z"},
-        settings, cli_args,
+        settings, cli_args, manifest,
     )
 
     summary = json.loads((out_dir / "summary.json").read_text())
-    assert set(summary) == {"meta", "fingerprint", "config", "config_hash", "stats"}
+    assert set(summary) == {"meta", "fingerprint", "config", "config_hash", "dataset", "stats"}
     assert summary["fingerprint"]["policy_versions"]["slope"] == "norm3_v1"
+    assert summary["dataset"] == manifest
     assert summary["config"]["cli_args"] == cli_args
     assert summary["config_hash"] == config_hash(summary["config"])
 
@@ -187,3 +197,57 @@ def test_replay_result_saver_full_path_no_crash(tmp_path):
     bar_record = result["bars"][0]
     assert bar_record["ema20"] == bar_record["ema21"]
     assert bar_record["market_state"]["orb_state"] is None  # or_established=False
+
+
+# ── dataset_manifest ─────────────────────────────────────────────────────────
+
+def test_dataset_manifest_detects_missing_days():
+    """
+    Regression test for the silent-gap risk: load_m1_bars(skip_read_errors=True)
+    continues past a missing day with no error, so dataset_manifest must be able
+    to independently flag it from the calendar, not depend on the loader to
+    have complained.
+    """
+    from types import SimpleNamespace
+
+    sym_obj = Symbol(
+        ticker=SYM, exchange="CME", asset_class=AssetClass.FUTURE,
+        root_symbol="MNQ", lot_size=1,
+        tick_size=Decimal("0.25"), point_value=Decimal("2.0"),
+    )
+    calendar = calendar_for_symbol(sym_obj)
+
+    start = date(2026, 7, 20)  # Monday
+    end = date(2026, 7, 24)    # Friday — 5 trading days expected
+    # Bars only for Mon/Tue/Fri — Wed/Thu simulate a silently-missing gap.
+    present_days = [date(2026, 7, 20), date(2026, 7, 21), date(2026, 7, 24)]
+    bars = [
+        SimpleNamespace(timestamp=calendar.session_open(d))
+        for d in present_days
+    ]
+
+    manifest = dataset_manifest(bars, calendar, start, end, SYM)
+
+    assert manifest["expected_trading_days"] == 5
+    assert manifest["trading_days_with_bars"] == 3
+    assert manifest["missing_days"] == ["2026-07-22", "2026-07-23"]
+
+
+def test_dataset_manifest_no_gaps_when_fully_covered():
+    sym_obj = Symbol(
+        ticker=SYM, exchange="CME", asset_class=AssetClass.FUTURE,
+        root_symbol="MNQ", lot_size=1,
+        tick_size=Decimal("0.25"), point_value=Decimal("2.0"),
+    )
+    calendar = calendar_for_symbol(sym_obj)
+    start = date(2026, 7, 20)
+    end = date(2026, 7, 21)
+
+    from types import SimpleNamespace
+    bars = [
+        SimpleNamespace(timestamp=calendar.session_open(d))
+        for d in calendar.trading_days(start, end)
+    ]
+    manifest = dataset_manifest(bars, calendar, start, end, SYM)
+    assert manifest["missing_days"] == []
+    assert manifest["trading_days_with_bars"] == manifest["expected_trading_days"]

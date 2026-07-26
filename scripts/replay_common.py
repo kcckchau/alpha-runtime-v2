@@ -296,6 +296,40 @@ def config_hash(resolved_config: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def dataset_manifest(
+    bars: list[BarEvent],
+    calendar: SessionCalendar,
+    start: date,
+    end: date,
+    symbol: str,
+    source: str = "parquet",
+) -> dict:
+    """
+    Coverage audit for bars actually loaded vs. what should exist for
+    [start, end] per the exchange calendar.
+
+    load_m1_bars(skip_read_errors=True) silently continues past a missing or
+    corrupt day — necessary so one bad day doesn't abort a whole multi-day
+    range, but that means a real data gap and an ordinary non-trading day are
+    otherwise indistinguishable from the output alone. This is how that
+    silence gets surfaced in saved provenance instead of just producing fewer
+    bars with no trace: "why did this run produce fewer signals?" should be
+    answerable from code changed (fingerprint) + config changed (config) +
+    data missing (this), without having to re-derive any of the three.
+    """
+    expected_days = set(calendar.trading_days(start, end))
+    actual_days = {calendar.session_date(b.timestamp) for b in bars}
+    missing_days = sorted(d.isoformat() for d in (expected_days - actual_days))
+    return {
+        "source": source,
+        "symbol": symbol,
+        "coverage": {"start": start.isoformat(), "end": end.isoformat()},
+        "expected_trading_days": len(expected_days),
+        "trading_days_with_bars": len(expected_days) - len(missing_days),
+        "missing_days": missing_days,
+    }
+
+
 def default_m1_warmup_days(settings: AlphaSettings) -> int:
     """
     Same formula backfill.py uses for its own default (warmup-driven) M1 fetch
