@@ -92,11 +92,7 @@ def main() -> None:
     args = parser.parse_args()
 
     settings = get_settings()
-    parquet_root = (
-        settings.databento.parquet_root
-        if hasattr(settings.databento, "parquet_root")
-        else Path("data/parquet")
-    )
+    parquet_root = settings.storage.parquet_root
 
     start = date.fromisoformat(args.start) if args.start else None
     end = date.fromisoformat(args.end) if args.end else None
