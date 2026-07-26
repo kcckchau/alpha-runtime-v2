@@ -67,7 +67,7 @@ from alpha.engines.scoring.engine import ScoringEngine
 from alpha.engines.setup.engine import SetupEngine
 from alpha.engines.thesis.engine import ThesisEngine
 from alpha.research.interaction.engine import LevelInteractionEngine
-from replay_common import config_fingerprint_lines, load_m1_bars
+from replay_common import config_fingerprint_lines, default_m1_warmup_days, load_m1_bars
 from alpha.models.enums import (
     AssetClass, BarTimeframe, EventType, OrderSide, RuntimeMode, SetupGrade, SetupType,
 )
@@ -820,8 +820,9 @@ def main() -> None:
     p.add_argument("--min-grade", default="A",
                    choices=["SSS", "A+", "A", "B", "C"],
                    help="Minimum setup grade to track (default: A)")
-    p.add_argument("--warmup",    type=int, default=5,
-                   help="Warmup days per session (default: 5)")
+    p.add_argument("--warmup",    type=int, default=None,
+                   help="Warmup days per session (default: derived from "
+                        "settings.historical.minute1_warmup_bars, same formula backfill.py uses)")
     p.add_argument("--timeout",   type=int, default=60,
                    help="Max bars to hold before timeout exit (default: 60 = 1 hour)")
     p.add_argument("--save",      action="store_true",
@@ -842,12 +843,16 @@ def main() -> None:
     }
     min_grade = grade_map[args.min_grade]
 
+    warmup_days = args.warmup
+    if warmup_days is None:
+        warmup_days = default_m1_warmup_days(AlphaSettings())
+
     asyncio.run(run(
         symbol=args.symbol,
         start_date=date.fromisoformat(args.start),
         end_date=date.fromisoformat(args.end),
         min_grade=min_grade,
-        warmup_days=args.warmup,
+        warmup_days=warmup_days,
         max_hold_bars=args.timeout,
         save=args.save,
         verbose=args.verbose,

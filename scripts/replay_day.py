@@ -39,7 +39,7 @@ sys.path.insert(0, str(_REPO / "src"))
 
 from alpha.calendar.base import SessionCalendar
 from alpha.calendar.resolver import calendar_for_symbol
-from replay_common import config_fingerprint_lines, load_m1_bars
+from replay_common import config_fingerprint_lines, default_m1_warmup_days, load_m1_bars
 from alpha.config.settings import AlphaSettings, RuntimeSettings, StorageSettings
 from alpha.core.clock import WallClock
 from alpha.core.event_bus import EventBus
@@ -695,7 +695,9 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Replay a single CME session through the engine pipeline")
     p.add_argument("--symbol",  default="MNQ-09",    help="Ticker (default: MNQ-09)")
     p.add_argument("--date",    default=None,         help="Session date YYYY-MM-DD")
-    p.add_argument("--warmup",  type=int, default=5,  help="Warmup days (default: 5)")
+    p.add_argument("--warmup",  type=int, default=None,
+                   help="Warmup days (default: derived from "
+                        "settings.historical.minute1_warmup_bars, same formula backfill.py uses)")
     p.add_argument("--source",  default="parquet",    choices=["parquet", "databento"],
                    help="Data source (default: parquet)")
     p.add_argument("--full-signals", action="store_true",
@@ -727,8 +729,12 @@ def main() -> None:
             sys.exit(1)
         print(f"Auto-detected most recent cached date: {session_date}")
 
+    warmup_days = args.warmup
+    if warmup_days is None:
+        warmup_days = default_m1_warmup_days(AlphaSettings())
+
     asyncio.run(replay(
-        args.symbol, session_date, args.warmup, args.verbose,
+        args.symbol, session_date, warmup_days, args.verbose,
         args.source,
         full_signals=args.full_signals,
         no_cache=args.no_cache,

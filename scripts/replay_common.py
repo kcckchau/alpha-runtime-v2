@@ -75,6 +75,16 @@ def config_fingerprint_lines() -> list[str]:
     return lines
 
 
+def default_m1_warmup_days(settings: AlphaSettings) -> int:
+    """
+    Same formula backfill.py uses for its own default (warmup-driven) M1 fetch
+    window, so backtest.py/replay_day.py's --warmup default tracks
+    settings.historical.minute1_warmup_bars instead of an unrelated flat
+    constant that silently drifts if that config changes.
+    """
+    return max(3, settings.historical.minute1_warmup_bars // 390 + 1)
+
+
 def load_m1_bars(
     symbol: str,
     start: date,
