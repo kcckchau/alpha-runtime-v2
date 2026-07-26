@@ -40,23 +40,21 @@ sys.path.insert(0, str(_REPO / "src"))
 from alpha.calendar.base import SessionCalendar
 from replay_common import (
     build_config_fingerprint,
-    build_replay_pipeline,
+    build_replay_context,
+    build_replay_settings_and_symbol,
     build_resolved_config,
-    clear_persisted_replay,
     config_fingerprint_lines,
     config_hash,
     dataset_manifest,
     default_m1_warmup_days,
-    find_existing_persisted_replay,
+    enforce_persist_guard,
     load_m1_bars,
-    stop_replay_pipeline,
 )
-from alpha.config.settings import AlphaSettings, RuntimeSettings, StorageSettings
+from alpha.config.settings import AlphaSettings
 from alpha.core.registry import SymbolRegistry
 from alpha.engines.historical.sources.databento import DatabentoHistoricalDataSource as DatabentoHistoricalSource
-from alpha.models.enums import AssetClass, BarTimeframe, RuntimeMode
+from alpha.models.enums import BarTimeframe
 from alpha.models.events import BarEvent, QuoteEvent, TradeEvent
-from alpha.models.symbol import Symbol
 from alpha.research.interaction.engine import LevelInteractionEngine
 from replay_cache import ReplayCache, ReplayResultSaver
 
@@ -301,29 +299,8 @@ async def replay(
     persist_force: bool = False,
 ) -> None:
 
-    settings = AlphaSettings(
-        runtime=RuntimeSettings(
-            mode=RuntimeMode.REPLAY,
-            symbols=[symbol],
-            orb_minutes=5,
-        ),
-        storage=StorageSettings(
-            parquet_root=_REPO / "data" / "parquet",
-        ),
-    )
+    settings, sym_obj = build_replay_settings_and_symbol(symbol)
 
-    # Symbol object — root_symbol drives Databento continuous contract lookup
-    asset_class = AssetClass.FUTURE if "-" in symbol else AssetClass.EQUITY
-    root = symbol.split("-")[0] if "-" in symbol else symbol
-    sym_obj = Symbol(
-        ticker=symbol,
-        exchange="CME" if asset_class == AssetClass.FUTURE else "NYSE",
-        asset_class=asset_class,
-        root_symbol=root,
-        lot_size=1,
-        tick_size=Decimal("0.25") if "MNQ" in symbol else Decimal("0.01"),
-        point_value=Decimal("2.0") if "MNQ" in symbol else Decimal("1.0"),
-    )
     # Shared with backtest.py — wires FeatureEngine/ContextEngine/MarketStateEngine/
     # SetupEngine/ThesisEngine onto BarFlowAggregator + BarPipeline (same
     # sequential-stage pattern as live), replacing the old direct-subscription
@@ -331,7 +308,14 @@ async def replay(
     # events, relying on .start() call order for dependency ordering).
     # No ScoringEngine — replay_day.py intentionally shows SetupEngine's raw
     # score, not a final letter grade.
-    bundle = await build_replay_pipeline(settings, symbol, sym_obj, include_scoring=False, persist=persist)
+    # Named rctx, not ctx — this script already uses `ctx` for
+    # ContextEngine.get_context()'s per-bar snapshot inside the feed loop,
+    # which would otherwise silently shadow this object before teardown.
+    rctx = await build_replay_context(
+        symbol, sym_obj, settings, include_scoring=False, persist=persist,
+        record_interactions=record_interactions, interaction_run_id=f"replay-{session_date}",
+    )
+    bundle               = rctx.bundle
     registry             = bundle.registry
     calendar             = bundle.calendar
     bus                  = bundle.bus
@@ -389,24 +373,8 @@ async def replay(
             print(f"{_DIM}(backfill.py is idempotent — safe to run even where data already exists){_RESET}")
             sys.exit(1)
 
-    if persist:
-        persist_dates = [warmup_start + timedelta(days=i) for i in range((session_date - warmup_start).days + 1)]
-        existing = find_existing_persisted_replay(symbol, persist_dates, settings)
-        if existing and not persist_force:
-            print(f"\n{_RED}--persist would duplicate existing reconstructed data:{_RESET}")
-            for data_type, dates in existing.items():
-                print(f"  {data_type}: {', '.join(str(d) for d in dates)}")
-            print(f"{_YELLOW}setup_id is a fresh UUID per run (not content-derived) and "
-                  f"market_states has no dedup key — rerunning would append a full duplicate "
-                  f"set on top of the last one, not replace it.{_RESET}")
-            print(f"{_DIM}Pass --persist-force to clear the prior reconstruction for these "
-                  f"dates first (live-captured is_replay=False rows are never touched).{_RESET}")
-            sys.exit(1)
-        elif existing:
-            clear_dates = sorted({d for dates in existing.values() for d in dates})
-            print(f"\n{_YELLOW}--persist-force: clearing prior reconstruction for "
-                  f"{len(clear_dates)} date(s) before rerunning{_RESET}")
-            clear_persisted_replay(symbol, clear_dates, settings)
+    persist_dates = [warmup_start + timedelta(days=i) for i in range((session_date - warmup_start).days + 1)]
+    enforce_persist_guard(symbol, persist_dates, settings, persist=persist, persist_force=persist_force)
 
     # Split into warmup (before session date) and session bars
     # For CME futures, the session date's bars start at 18:00 ET the prior calendar day.
@@ -469,15 +437,7 @@ async def replay(
     # Level interactions: shadow research subscriber, never influences trades.
     # Attached only now (target date only, after warmup) — matching backtest.py /
     # research_replay.py — so warmup days aren't recorded as episodes.
-    interaction_engine: LevelInteractionEngine | None = None
-    if record_interactions:
-        interaction_engine = LevelInteractionEngine(
-            event_bus=bus,
-            registry=registry,
-            research_root=_REPO / "data" / "research",
-            run_id=f"replay-{session_date}",
-        )
-        interaction_engine.attach()
+    rctx.attach_interactions()
 
     # ── Build merged session event stream (bars + optional trades/quotes) ─────
     # Priority for same-timestamp ties: trades(0) → quotes(1) → bars(2)
@@ -627,9 +587,9 @@ async def replay(
         if ctx_final.nearest_war_zone:
             print(f"  Nearest WZ: {ctx_final.nearest_war_zone} @ {_fmt_dec(ctx_final.nearest_war_zone_price)}")
 
-    if interaction_engine is not None:
-        interaction_engine.flush()
-        print(f"\n{_DIM}Level interactions: {interaction_engine.episodes_written} episodes "
+    if rctx.interaction_engine is not None:
+        episodes_written = rctx.flush_interactions()
+        print(f"\n{_DIM}Level interactions: {episodes_written} episodes "
               f"written to data/research/interaction/ (run_id=replay-{session_date}){_RESET}")
 
     snap = feature_engine.get_snapshot(symbol)
@@ -678,7 +638,7 @@ async def replay(
         print(f"  JSON → {json_path}")
         print(f"  CSV  → {csv_path}")
 
-    await stop_replay_pipeline(bundle)
+    await rctx.stop()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

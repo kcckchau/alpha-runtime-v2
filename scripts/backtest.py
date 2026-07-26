@@ -53,27 +53,24 @@ from uuid import uuid4
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "src"))
 
-from alpha.config.settings import AlphaSettings, RuntimeSettings, StorageSettings
-from alpha.research.interaction.engine import LevelInteractionEngine
+from alpha.config.settings import AlphaSettings
 from replay_common import (
     EngineBundle,
     build_config_fingerprint,
-    build_replay_pipeline,
+    build_replay_context,
+    build_replay_settings_and_symbol,
     build_resolved_config,
-    clear_persisted_replay,
     config_fingerprint_lines,
     config_hash,
     dataset_manifest,
     default_m1_warmup_days,
-    find_existing_persisted_replay,
+    enforce_persist_guard,
     load_m1_bars,
-    stop_replay_pipeline,
 )
 from alpha.models.enums import (
-    AssetClass, BarTimeframe, EventType, OrderSide, RuntimeMode, SetupGrade, SetupType,
+    EventType, OrderSide, SetupGrade, SetupType,
 )
 from alpha.models.events import BarEvent, PipelineOutputEvent
-from alpha.models.symbol import Symbol
 
 _UTC = timezone.utc
 _ET  = timezone(timedelta(hours=-4))   # EDT display
@@ -611,28 +608,7 @@ async def run(
     persist: bool = False,
     persist_force: bool = False,
 ) -> None:
-    settings = AlphaSettings(
-        runtime=RuntimeSettings(
-            mode=RuntimeMode.REPLAY,
-            symbols=[symbol],
-            orb_minutes=5,
-        ),
-        storage=StorageSettings(
-            parquet_root=_REPO / "data" / "parquet",
-        ),
-    )
-
-    asset_class = AssetClass.FUTURE if "-" in symbol else AssetClass.EQUITY
-    root = symbol.split("-")[0] if "-" in symbol else symbol
-    sym_obj = Symbol(
-        ticker=symbol,
-        exchange="CME" if asset_class == AssetClass.FUTURE else "NYSE",
-        asset_class=asset_class,
-        root_symbol=root,
-        lot_size=1,
-        tick_size=Decimal("0.25") if "MNQ" in symbol else Decimal("0.01"),
-        point_value=Decimal("2.0") if "MNQ" in symbol else Decimal("1.0"),
-    )
+    settings, sym_obj = build_replay_settings_and_symbol(symbol)
     point_value = sym_obj.point_value or Decimal("1.0")
 
     # Enumerate candidate session dates
@@ -664,26 +640,15 @@ async def run(
         print(f"\n{_YELLOW}No bars found for {symbol} {warmup_start}→{end_date}.{_R}")
         return
 
-    if persist:
-        persist_dates = [warmup_start + timedelta(days=i) for i in range((end_date - warmup_start).days + 1)]
-        existing = find_existing_persisted_replay(symbol, persist_dates, settings)
-        if existing and not persist_force:
-            print(f"\n{_RED}--persist would duplicate existing reconstructed data:{_R}")
-            for data_type, dates in existing.items():
-                print(f"  {data_type}: {', '.join(str(d) for d in dates)}")
-            print(f"{_YELLOW}setup_id is a fresh UUID per run (not content-derived) and "
-                  f"market_states has no dedup key — rerunning would append a full duplicate "
-                  f"set on top of the last one, not replace it.{_R}")
-            print(f"{_DIM}Pass --persist-force to clear the prior reconstruction for these "
-                  f"dates first (live-captured is_replay=False rows are never touched).{_R}")
-            sys.exit(1)
-        elif existing:
-            clear_dates = sorted({d for dates in existing.values() for d in dates})
-            print(f"\n{_YELLOW}--persist-force: clearing prior reconstruction for "
-                  f"{len(clear_dates)} date(s) before rerunning{_R}")
-            clear_persisted_replay(symbol, clear_dates, settings)
+    persist_dates = [warmup_start + timedelta(days=i) for i in range((end_date - warmup_start).days + 1)]
+    enforce_persist_guard(symbol, persist_dates, settings, persist=persist, persist_force=persist_force)
 
-    bundle = await build_replay_pipeline(settings, symbol, sym_obj, include_scoring=True, persist=persist)
+    interaction_run_id = f"btest-{start_date}_{end_date}"
+    ctx = await build_replay_context(
+        symbol, sym_obj, settings, include_scoring=True, persist=persist,
+        record_interactions=record_interactions, interaction_run_id=interaction_run_id,
+    )
+    bundle = ctx.bundle
 
     # Early completeness warning (not a hard exit, unlike replay_day.py) — a
     # research backtest over a long range may deliberately tolerate some known
@@ -701,16 +666,6 @@ async def run(
             print(f"{_DIM}  python scripts/download_raw.py --symbol {symbol} --start {missing[0]} --end {missing[-1]}")
             print(f"  python scripts/backfill.py --symbol {symbol} --start {missing[0]} --end {missing[-1]}{_R}\n")
 
-    interaction_run_id = f"btest-{start_date}_{end_date}"
-    interaction_engine: LevelInteractionEngine | None = None
-    if record_interactions:
-        interaction_engine = LevelInteractionEngine(
-            event_bus=bundle.bus,
-            registry=bundle.registry,
-            research_root=_REPO / "data" / "research",
-            run_id=interaction_run_id,
-        )
-
     try:
         # Initial warmup: everything before start_date's session open, fed once.
         initial_warmup_end = bundle.calendar.pre_market_open(start_date)
@@ -725,8 +680,7 @@ async def run(
         # left running continuously for the whole range — LevelInteractionEngine
         # already has its own session-rollover handling (same as live/
         # research_replay.py), so it does not need to be rebuilt per day.
-        if interaction_engine is not None:
-            interaction_engine.attach()
+        ctx.attach_interactions()
 
         session_count = 0
         for session_date in candidate_dates:
@@ -769,22 +723,20 @@ async def run(
         # Flush once, at the true end of the run — LevelInteractionEngine.flush()
         # also force-closes any still-open episode (end_reason="replay_completed"),
         # so calling it per-day would incorrectly truncate episodes that are
-        # still active when one day's bars end.
-        if interaction_engine is not None:
-            interaction_engine.flush()
-            total_episodes = interaction_engine.episodes_written
-            print("-" * 56)
-            print(f"  {session_count} trading sessions")
-            print(f"  {total_episodes} level-interaction episodes written "
-                  f"(data/research/interaction/, run_id={interaction_run_id})")
-            by_date = _episodes_by_session_date(interaction_run_id)
-            for d in sorted(by_date):
-                print(f"    {d}: {by_date[d]}")
-        else:
-            print("-" * 56)
-            print(f"  {session_count} trading sessions")
+        # still active when one day's bars end — ctx.finish() (below, in
+        # finally) only calls it once, at the true end of the run.
+        print("-" * 56)
+        print(f"  {session_count} trading sessions")
     finally:
-        await stop_replay_pipeline(bundle)
+        finish_result = await ctx.finish()
+
+    if ctx.interaction_engine is not None:
+        total_episodes = finish_result["episodes_written"]
+        print(f"  {total_episodes} level-interaction episodes written "
+              f"(data/research/interaction/, run_id={interaction_run_id})")
+        by_date = _episodes_by_session_date(interaction_run_id)
+        for d in sorted(by_date):
+            print(f"    {d}: {by_date[d]}")
 
     stats = _compute_stats(all_signals)
 

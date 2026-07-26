@@ -8,13 +8,15 @@ and replay_day.py:_load_from_parquet).
 from __future__ import annotations
 
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 from alpha.calendar.base import SessionCalendar
 from alpha.calendar.resolver import calendar_for_symbol
-from alpha.config.settings import AlphaSettings
+from alpha.config.settings import AlphaSettings, RuntimeSettings, StorageSettings
 from alpha.core.clock import WallClock
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
@@ -28,9 +30,18 @@ from alpha.engines.setup.engine import SetupEngine
 from alpha.engines.storage.engine import StorageEngine
 from alpha.engines.storage.parquet import ParquetStore
 from alpha.engines.thesis.engine import ThesisEngine
-from alpha.models.enums import BarTimeframe
+from alpha.models.enums import AssetClass, BarTimeframe, RuntimeMode
 from alpha.models.events import BarEvent
 from alpha.models.symbol import Symbol
+from alpha.research.interaction.engine import LevelInteractionEngine
+
+# ANSI codes for guard/warning messages printed from replay_common itself —
+# duplicated here rather than imported from either script (that would be a
+# backwards dependency: replay_common is imported BY both scripts).
+_RED    = "\033[31m"
+_YELLOW = "\033[33m"
+_DIM    = "\033[2m"
+_R      = "\033[0m"
 
 _REPO = Path(__file__).resolve().parent.parent
 
@@ -176,6 +187,160 @@ async def stop_replay_pipeline(bundle: EngineBundle) -> None:
     await bundle.context.stop()
     await bundle.feature.stop()
     await bundle.bus.stop()
+
+
+def build_replay_settings_and_symbol(symbol: str) -> tuple[AlphaSettings, Symbol]:
+    """
+    AlphaSettings + Symbol construction — identical in backtest.py and
+    replay_day.py before this was extracted (same RuntimeMode.REPLAY settings,
+    same asset-class-from-ticker-format heuristic, same MNQ tick/point-value
+    special case). Not engine wiring — that's build_replay_pipeline().
+    """
+    settings = AlphaSettings(
+        runtime=RuntimeSettings(mode=RuntimeMode.REPLAY, symbols=[symbol], orb_minutes=5),
+        storage=StorageSettings(parquet_root=_REPO / "data" / "parquet"),
+    )
+    asset_class = AssetClass.FUTURE if "-" in symbol else AssetClass.EQUITY
+    root = symbol.split("-")[0] if "-" in symbol else symbol
+    sym_obj = Symbol(
+        ticker=symbol,
+        exchange="CME" if asset_class == AssetClass.FUTURE else "NYSE",
+        asset_class=asset_class,
+        root_symbol=root,
+        lot_size=1,
+        tick_size=Decimal("0.25") if "MNQ" in symbol else Decimal("0.01"),
+        point_value=Decimal("2.0") if "MNQ" in symbol else Decimal("1.0"),
+    )
+    return settings, sym_obj
+
+
+@dataclass
+class ReplayContext:
+    """
+    Everything backtest.py/replay_day.py build once per run beyond the raw
+    engine bundle: the interaction engine (if requested) and its run_id.
+    Per-bar feeding stays in each script — backtest.py drives SignalTracker's
+    PnL simulation, replay_day.py drives a live console table; those are
+    genuinely different, not duplication, so this does not try to unify them
+    behind a generic feed() method.
+    """
+    settings: AlphaSettings
+    sym_obj: Symbol
+    bundle: EngineBundle
+    interaction_engine: LevelInteractionEngine | None
+    interaction_run_id: str | None
+
+    @property
+    def symbol(self) -> str:
+        return self.sym_obj.ticker
+
+    def attach_interactions(self) -> None:
+        """Call once, after the initial warmup bars are fed — matches both
+        scripts' existing rule (LevelInteractionEngine has its own session-
+        rollover handling, but warmup days should never become episodes)."""
+        if self.interaction_engine is not None:
+            self.interaction_engine.attach()
+
+    def flush_interactions(self) -> int:
+        """
+        Flush interactions (if any) — does NOT stop the pipeline. Returns
+        episodes_written. Separate from stop() because the two scripts
+        genuinely differ here: backtest.py has nothing left to do with the
+        engines afterward, so it calls both together; replay_day.py still
+        needs feature_engine/thesis_engine/setup_engine alive afterward (for
+        its "Final indicators" printout and --save-results), so it flushes
+        interactions early but stops the pipeline later, at the true end.
+
+        flush() also force-closes any still-open episode
+        (end_reason="replay_completed") — must only be called once, at the
+        true end of a run, not per-day under continuous execution.
+        """
+        if self.interaction_engine is None:
+            return 0
+        self.interaction_engine.flush()
+        return self.interaction_engine.episodes_written
+
+    async def stop(self) -> None:
+        """Tear down the engine pipeline. Call flush_interactions() first if
+        record_interactions was used — this does not flush for you."""
+        await stop_replay_pipeline(self.bundle)
+
+    async def finish(self) -> dict:
+        """flush_interactions() + stop(), for callers with nothing left to do
+        with the engines afterward (backtest.py). Returns {"episodes_written": int}
+        — callers format/print however fits their own output style; this
+        deliberately doesn't print anything itself."""
+        episodes_written = self.flush_interactions()
+        await self.stop()
+        return {"episodes_written": episodes_written}
+
+
+def enforce_persist_guard(
+    symbol: str,
+    dates: list[date],
+    settings: AlphaSettings,
+    *,
+    persist: bool,
+    persist_force: bool,
+) -> None:
+    """
+    sys.exit(1) if --persist would duplicate existing reconstructed data and
+    --persist-force wasn't passed; clears the prior reconstruction first
+    (never touching live-captured is_replay=False rows) if it was. No-op if
+    persist=False. Identical logic previously copy-pasted in both scripts.
+    """
+    if not persist:
+        return
+    existing = find_existing_persisted_replay(symbol, dates, settings)
+    if not existing:
+        return
+    if not persist_force:
+        print(f"\n{_RED}--persist would duplicate existing reconstructed data:{_R}")
+        for data_type, hit_dates in existing.items():
+            print(f"  {data_type}: {', '.join(str(d) for d in hit_dates)}")
+        print(f"{_YELLOW}setup_id is a fresh UUID per run (not content-derived) and "
+              f"market_states has no dedup key — rerunning would append a full duplicate "
+              f"set on top of the last one, not replace it.{_R}")
+        print(f"{_DIM}Pass --persist-force to clear the prior reconstruction for these "
+              f"dates first (live-captured is_replay=False rows are never touched).{_R}")
+        sys.exit(1)
+    clear_dates = sorted({d for hit_dates in existing.values() for d in hit_dates})
+    print(f"\n{_YELLOW}--persist-force: clearing prior reconstruction for "
+          f"{len(clear_dates)} date(s) before rerunning{_R}")
+    clear_persisted_replay(symbol, clear_dates, settings)
+
+
+async def build_replay_context(
+    symbol: str,
+    sym_obj: Symbol,
+    settings: AlphaSettings,
+    *,
+    include_scoring: bool,
+    persist: bool,
+    record_interactions: bool,
+    interaction_run_id: str,
+    research_root: Path | None = None,
+) -> ReplayContext:
+    """
+    build_replay_pipeline() + (optional) LevelInteractionEngine construction,
+    as one call. Does NOT attach interactions or feed any bars — call
+    ctx.attach_interactions() after your own warmup-feeding loop, matching
+    both scripts' existing rule.
+    """
+    bundle = await build_replay_pipeline(settings, symbol, sym_obj, include_scoring=include_scoring, persist=persist)
+    interaction_engine: LevelInteractionEngine | None = None
+    if record_interactions:
+        interaction_engine = LevelInteractionEngine(
+            event_bus=bundle.bus,
+            registry=bundle.registry,
+            research_root=research_root or (_REPO / "data" / "research"),
+            run_id=interaction_run_id,
+        )
+    return ReplayContext(
+        settings=settings, sym_obj=sym_obj, bundle=bundle,
+        interaction_engine=interaction_engine,
+        interaction_run_id=interaction_run_id if record_interactions else None,
+    )
 
 
 _PERSISTED_DATA_TYPES = ("setups", "market_states")
