@@ -53,21 +53,16 @@ from uuid import uuid4
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "src"))
 
-from alpha.calendar.resolver import calendar_for_symbol
 from alpha.config.settings import AlphaSettings, RuntimeSettings, StorageSettings
-from alpha.core.clock import WallClock
-from alpha.core.event_bus import EventBus
-from alpha.core.registry import SymbolRegistry
-from alpha.engines.context.engine import ContextEngine
-from alpha.engines.feature.engine import FeatureEngine
-from alpha.engines.flow.aggregator import BarFlowAggregator
-from alpha.engines.flow.pipeline import BarPipeline
-from alpha.engines.market_state.engine import MarketStateEngine
-from alpha.engines.scoring.engine import ScoringEngine
-from alpha.engines.setup.engine import SetupEngine
-from alpha.engines.thesis.engine import ThesisEngine
 from alpha.research.interaction.engine import LevelInteractionEngine
-from replay_common import config_fingerprint_lines, default_m1_warmup_days, load_m1_bars
+from replay_common import (
+    EngineBundle,
+    build_replay_pipeline,
+    config_fingerprint_lines,
+    default_m1_warmup_days,
+    load_m1_bars,
+    stop_replay_pipeline,
+)
 from alpha.models.enums import (
     AssetClass, BarTimeframe, EventType, OrderSide, RuntimeMode, SetupGrade, SetupType,
 )
@@ -353,157 +348,60 @@ class SignalTracker:
 
 # ── Per-day replay ────────────────────────────────────────────────────────────
 
-async def _replay_day(
-    symbol: str,
-    sym_obj: Symbol,
+async def _feed_session_day(
+    bundle: EngineBundle,
     session_date: date,
-    warmup_days: int,
-    settings: AlphaSettings,
+    session_bars: list[BarEvent],
     tracker: SignalTracker,
     verbose: bool,
-    record_interactions: bool = False,
-    research_root: Path | None = None,
-    interaction_run_id: str | None = None,
-) -> tuple[int, int]:
+) -> None:
     """
-    Replay one session through the full pipeline.
-    Returns (session bars processed, level-interaction episodes written).
+    Feed one day's session bars through the already-running engine bundle and
+    drive tracker's entry/exit simulation. Engines are NOT rebuilt here —
+    session-rollover (SetupEngine._roll_session_if_needed etc, the same
+    mechanism live trading relies on) is what carries state across the day
+    boundary, exactly as it does for a real multi-day live/replay process.
     """
-    # Load bars: warmup window + session
-    warmup_start = session_date - timedelta(days=warmup_days + 2)
-    all_bars = load_m1_bars(symbol, warmup_start, session_date, settings)
-    if not all_bars:
-        return 0, 0
+    sub = bundle.bus.subscribe(EventType.PIPELINE_OUTPUT, tracker.on_pipeline_output)
+    try:
+        for bar in session_bars:
+            # Exit check runs before pipeline (pre_bar is synchronous)
+            tracker.pre_bar(bar)
+            await bundle.bus.publish(bar)
+            await bundle.bus.flush()  # pipeline runs → PIPELINE_OUTPUT → tracker.on_pipeline_output
 
-    # Split warmup vs session
-    # CME futures session: 18:00 ET prior day → 18:00 ET session_date. Computed via
-    # CMEEqIndexCalendar.pre_market_open() (ZoneInfo-based) rather than a hardcoded
-    # UTC offset — a fixed 22:00 UTC is EDT-only and drifts an hour off during EST.
-    calendar = calendar_for_symbol(sym_obj)
-    session_utc_start = calendar.pre_market_open(session_date)
-    session_utc_end = calendar.pre_market_open(session_date + timedelta(days=1))
-
-    warmup_bars  = [b for b in all_bars if b.timestamp < session_utc_start]
-    session_bars = [b for b in all_bars if session_utc_start <= b.timestamp < session_utc_end]
-
-    if not session_bars:
-        return 0, 0
-
-    # ── Build engines ──────────────────────────────────────────────────────────
-    registry = SymbolRegistry()
-    registry.register(sym_obj)
-    bus = EventBus(queue_size=5000)
-    await bus.start()
-    clock = WallClock()
-
-    feature_engine      = FeatureEngine(settings, bus, registry, calendar, clock)
-    context_engine      = ContextEngine(settings, bus, registry, calendar, clock)
-    market_state_engine = MarketStateEngine(settings, bus, registry)
-    setup_engine        = SetupEngine(settings, bus, registry)
-    thesis_engine       = ThesisEngine(settings, bus, registry)
-    scoring_engine      = ScoringEngine(settings, bus)
-
-    market_state_engine.set_feature_engine(feature_engine)
-    context_engine.set_feature_engine(feature_engine)
-    market_state_engine.set_context_engine(context_engine)
-    setup_engine.set_feature_engine(feature_engine)
-    setup_engine.set_market_state_engine(market_state_engine)
-    setup_engine.set_context_engine(context_engine)
-    thesis_engine.set_feature_engine(feature_engine)
-    thesis_engine.set_context_engine(context_engine)
-    scoring_engine.set_setup_engine(setup_engine)
-    scoring_engine.set_feature_engine(feature_engine)
-
-    # Wire BarFlowAggregator + BarPipeline (same as live)
-    agg = BarFlowAggregator(
-        symbol=symbol,
-        event_bus=bus,
-        large_trade_threshold=getattr(settings.runtime, "large_trade_threshold", 10),
-    )
-    agg.attach()
-
-    pipeline = BarPipeline(bus)
-    pipeline.set_feature_engine(feature_engine)
-    pipeline.set_market_state_engine(market_state_engine)
-    pipeline.set_thesis_engine(thesis_engine)
-    pipeline.set_setup_engine(setup_engine)
-    pipeline.set_scoring_engine(scoring_engine)
-    pipeline.attach()
-
-    # Subscribe tracker to PIPELINE_OUTPUT
-    bus.subscribe(EventType.PIPELINE_OUTPUT, tracker.on_pipeline_output)
-
-    # Start engines
-    await feature_engine.initialize()
-    await context_engine.initialize()
-    await market_state_engine.initialize()
-    await setup_engine.initialize()
-    await thesis_engine.initialize()
-    await scoring_engine.initialize()
-
-    await feature_engine.start()
-    await context_engine.start()
-    await market_state_engine.start()
-    await setup_engine.start()
-    await thesis_engine.start()
-    await scoring_engine.start()
-
-    # ── Feed warmup bars ───────────────────────────────────────────────────────
-    for bar in warmup_bars:
-        await bus.publish(bar)
-        await bus.flush()
-
-    if verbose:
-        print(f"  {_DIM}Warmup: {len(warmup_bars)} bars fed{_R}")
-
-    # Level interactions: shadow research subscriber, never influences trades.
-    # Attached only now (target date only) — matching research_replay.py's pattern —
-    # so warmup days aren't re-recorded as episodes on every subsequent day's run.
-    interaction_engine: LevelInteractionEngine | None = None
-    if record_interactions:
-        interaction_engine = LevelInteractionEngine(
-            event_bus=bus,
-            registry=registry,
-            research_root=research_root or (_REPO / "data" / "research"),
-            run_id=interaction_run_id,
-        )
-        interaction_engine.attach()
-
-    # ── Feed session bars ──────────────────────────────────────────────────────
-    for bar in session_bars:
-        # Exit check runs before pipeline (pre_bar is synchronous)
-        tracker.pre_bar(bar)
-        await bus.publish(bar)
-        await bus.flush()  # pipeline runs → PIPELINE_OUTPUT → tracker.on_pipeline_output
-
-        if verbose and tracker._open:
-            pos = tracker._open
-            print(f"  {_ts(bar.timestamp)}  {_CYAN}IN POSITION{_R}  "
-                  f"{pos.setup_type} {pos.grade}  "
-                  f"entry={float(pos.entry_price):.2f}  "
-                  f"stop={float(pos.stop):.2f}  "
-                  f"target={float(pos.target):.2f}  "
-                  f"bars_held={pos.bars_held}")
+            if verbose and tracker._open:
+                pos = tracker._open
+                print(f"  {_ts(bar.timestamp)}  {_CYAN}IN POSITION{_R}  "
+                      f"{pos.setup_type} {pos.grade}  "
+                      f"entry={float(pos.entry_price):.2f}  "
+                      f"stop={float(pos.stop):.2f}  "
+                      f"target={float(pos.target):.2f}  "
+                      f"bars_held={pos.bars_held}")
+    finally:
+        bundle.bus.unsubscribe(sub)
 
     # Close any position still open at session end
     if session_bars:
         tracker.close_remaining(session_bars[-1])
 
-    episodes_written = 0
-    if interaction_engine is not None:
-        interaction_engine.flush()
-        episodes_written = interaction_engine.episodes_written
 
-    # ── Stop engines ───────────────────────────────────────────────────────────
-    await scoring_engine.stop()
-    await thesis_engine.stop()
-    await setup_engine.stop()
-    await market_state_engine.stop()
-    await context_engine.stop()
-    await feature_engine.stop()
-    await bus.stop()
+def _episodes_by_session_date(run_id: str) -> dict[str, int]:
+    """Post-hoc breakdown of episodes this run wrote, grouped by session_date.
 
-    return len(session_bars), episodes_written
+    Reads back the just-flushed Parquet files instead of counting inline per
+    day — LevelInteractionEngine.flush() also force-closes any still-open
+    episode (end_reason="replay_completed"), so it must only be called once,
+    at the very end of a continuous multi-day run, not per day.
+    """
+    import pyarrow.parquet as pq
+
+    root = _REPO / "data" / "research" / "interaction" / "episodes"
+    counts: dict[str, int] = {}
+    for path in root.glob(f"*/session_date=*/part-{run_id}-*.parquet"):
+        session_date = path.parent.name.removeprefix("session_date=")
+        counts[session_date] = counts.get(session_date, 0) + pq.ParquetFile(path).metadata.num_rows
+    return counts
 
 
 # ── Aggregate statistics ──────────────────────────────────────────────────────
@@ -732,64 +630,103 @@ async def run(
         print(f"{_DIM}{line}{_R}")
     print()
 
-    print(f"{'Date':<12} {'Bars':>5}  {'Signals':>8}  {'Win':>4} {'Loss':>4}  {'P&L':>10}"
-          + ("  Episodes" if record_interactions else ""))
-    print("-" * (56 + (10 if record_interactions else 0)))
+    print(f"{'Date':<12} {'Bars':>5}  {'Signals':>8}  {'Win':>4} {'Loss':>4}  {'P&L':>10}")
+    print("-" * 56)
+
+    # ── Load the whole range's bars once, build engines once ────────────────────
+    warmup_start = start_date - timedelta(days=warmup_days + 2)
+    all_bars = load_m1_bars(symbol, warmup_start, end_date, settings)
+
+    if not all_bars:
+        print(f"\n{_YELLOW}No bars found for {symbol} {warmup_start}→{end_date}.{_R}")
+        return
+
+    bundle = await build_replay_pipeline(settings, symbol, sym_obj, include_scoring=True)
 
     interaction_run_id = f"btest-{start_date}_{end_date}"
-    total_episodes = 0
-    session_count = 0
-    for session_date in candidate_dates:
-        tracker = SignalTracker(
-            symbol=symbol,
-            session_date=session_date,
-            min_grade=min_grade,
-            max_hold_bars=max_hold_bars,
-            point_value=point_value,
-        )
-
-        bars_processed, episodes_written = await _replay_day(
-            symbol=symbol,
-            sym_obj=sym_obj,
-            session_date=session_date,
-            warmup_days=warmup_days,
-            settings=settings,
-            tracker=tracker,
-            verbose=verbose,
-            record_interactions=record_interactions,
-            interaction_run_id=interaction_run_id,
-        )
-        total_episodes += episodes_written
-
-        if bars_processed == 0:
-            continue  # not a trading day / no data
-
-        session_count += 1
-        day_signals = tracker.signals
-        all_signals.extend(day_signals)
-
-        day_wins   = sum(1 for s in day_signals if s.outcome == "win")
-        day_losses = sum(1 for s in day_signals if s.outcome == "loss")
-        day_pnl    = sum(s.pnl_pts for s in day_signals if s.outcome != "incomplete")
-        pnl_col    = _GREEN if day_pnl >= 0 else _RED
-
-        print(
-            f"{str(session_date):<12} {bars_processed:>5}  "
-            f"{len(day_signals):>8}  "
-            f"{day_wins:>4} {day_losses:>4}  "
-            f"{pnl_col}{day_pnl:>+9.1f}pts{_R}"
-            + (f"  {episodes_written:>8}" if record_interactions else "")
-        )
-
-        if verbose and day_signals:
-            for s in day_signals:
-                _print_signal(s)
-
-    print("-" * 56)
-    print(f"  {session_count} trading sessions")
+    interaction_engine: LevelInteractionEngine | None = None
     if record_interactions:
-        print(f"  {total_episodes} level-interaction episodes written "
-              f"(data/research/interaction/, run_id={interaction_run_id})")
+        interaction_engine = LevelInteractionEngine(
+            event_bus=bundle.bus,
+            registry=bundle.registry,
+            research_root=_REPO / "data" / "research",
+            run_id=interaction_run_id,
+        )
+
+    try:
+        # Initial warmup: everything before start_date's session open, fed once.
+        initial_warmup_end = bundle.calendar.pre_market_open(start_date)
+        warmup_bars = [b for b in all_bars if b.timestamp < initial_warmup_end]
+        for bar in warmup_bars:
+            await bundle.bus.publish(bar)
+            await bundle.bus.flush()
+        if verbose:
+            print(f"  {_DIM}Warmup: {len(warmup_bars)} bars fed{_R}")
+
+        # Attached only now (after initial warmup, before any tracked day) and
+        # left running continuously for the whole range — LevelInteractionEngine
+        # already has its own session-rollover handling (same as live/
+        # research_replay.py), so it does not need to be rebuilt per day.
+        if interaction_engine is not None:
+            interaction_engine.attach()
+
+        session_count = 0
+        for session_date in candidate_dates:
+            session_utc_start = bundle.calendar.pre_market_open(session_date)
+            session_utc_end = bundle.calendar.pre_market_open(session_date + timedelta(days=1))
+            session_bars = [b for b in all_bars if session_utc_start <= b.timestamp < session_utc_end]
+
+            if not session_bars:
+                continue  # not a trading day / no data
+
+            tracker = SignalTracker(
+                symbol=symbol,
+                session_date=session_date,
+                min_grade=min_grade,
+                max_hold_bars=max_hold_bars,
+                point_value=point_value,
+            )
+            await _feed_session_day(bundle, session_date, session_bars, tracker, verbose)
+
+            session_count += 1
+            day_signals = tracker.signals
+            all_signals.extend(day_signals)
+
+            day_wins   = sum(1 for s in day_signals if s.outcome == "win")
+            day_losses = sum(1 for s in day_signals if s.outcome == "loss")
+            day_pnl    = sum(s.pnl_pts for s in day_signals if s.outcome != "incomplete")
+            pnl_col    = _GREEN if day_pnl >= 0 else _RED
+
+            print(
+                f"{str(session_date):<12} {len(session_bars):>5}  "
+                f"{len(day_signals):>8}  "
+                f"{day_wins:>4} {day_losses:>4}  "
+                f"{pnl_col}{day_pnl:>+9.1f}pts{_R}"
+            )
+
+            if verbose and day_signals:
+                for s in day_signals:
+                    _print_signal(s)
+
+        # Flush once, at the true end of the run — LevelInteractionEngine.flush()
+        # also force-closes any still-open episode (end_reason="replay_completed"),
+        # so calling it per-day would incorrectly truncate episodes that are
+        # still active when one day's bars end.
+        if interaction_engine is not None:
+            interaction_engine.flush()
+            total_episodes = interaction_engine.episodes_written
+            print("-" * 56)
+            print(f"  {session_count} trading sessions")
+            print(f"  {total_episodes} level-interaction episodes written "
+                  f"(data/research/interaction/, run_id={interaction_run_id})")
+            by_date = _episodes_by_session_date(interaction_run_id)
+            for d in sorted(by_date):
+                print(f"    {d}: {by_date[d]}")
+        else:
+            print("-" * 56)
+            print(f"  {session_count} trading sessions")
+    finally:
+        await stop_replay_pipeline(bundle)
 
     if not all_signals:
         print(f"\n{_YELLOW}No signals found. Check date range, min_grade, and parquet data.{_R}")
