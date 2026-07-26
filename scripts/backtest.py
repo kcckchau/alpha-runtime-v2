@@ -65,9 +65,9 @@ from alpha.engines.flow.pipeline import BarPipeline
 from alpha.engines.market_state.engine import MarketStateEngine
 from alpha.engines.scoring.engine import ScoringEngine
 from alpha.engines.setup.engine import SetupEngine
-from alpha.engines.storage.engine import StorageEngine
-from alpha.engines.storage.parquet import ParquetStore
 from alpha.engines.thesis.engine import ThesisEngine
+from alpha.research.interaction.engine import LevelInteractionEngine
+from replay_common import load_m1_bars
 from alpha.models.enums import (
     AssetClass, BarTimeframe, EventType, OrderSide, RuntimeMode, SetupGrade, SetupType,
 )
@@ -351,30 +351,6 @@ class SignalTracker:
 
 # ── Bar loading ───────────────────────────────────────────────────────────────
 
-def _load_parquet_bars(
-    symbol: str,
-    start: date,
-    end: date,
-    settings: AlphaSettings,
-) -> list[BarEvent]:
-    parquet = ParquetStore(settings.storage)
-    bars: list[BarEvent] = []
-    d = start
-    while d <= end:
-        try:
-            table = parquet.read_range(f"bars/{BarTimeframe.M1}", symbol, d, d)
-            for row in table.to_pylist():
-                bar = StorageEngine._row_to_bar_event(row, BarTimeframe.M1)
-                if bar.symbol != symbol:
-                    bar = bar.model_copy(update={"symbol": symbol})
-                bars.append(bar)
-        except Exception:
-            pass
-        d += timedelta(days=1)
-    bars.sort(key=lambda b: b.timestamp)
-    return bars
-
-
 # ── Per-day replay ────────────────────────────────────────────────────────────
 
 async def _replay_day(
@@ -385,38 +361,37 @@ async def _replay_day(
     settings: AlphaSettings,
     tracker: SignalTracker,
     verbose: bool,
-) -> int:
+    record_interactions: bool = False,
+    research_root: Path | None = None,
+    interaction_run_id: str | None = None,
+) -> tuple[int, int]:
     """
     Replay one session through the full pipeline.
-    Returns the number of session bars processed.
+    Returns (session bars processed, level-interaction episodes written).
     """
     # Load bars: warmup window + session
     warmup_start = session_date - timedelta(days=warmup_days + 2)
-    all_bars = _load_parquet_bars(symbol, warmup_start, session_date, settings)
+    all_bars = load_m1_bars(symbol, warmup_start, session_date, settings)
     if not all_bars:
-        return 0
+        return 0, 0
 
     # Split warmup vs session
-    # CME futures session: prior day 18:00 ET (22:00 UTC) → same day 18:00 ET (22:00 UTC)
-    session_utc_start = datetime(
-        session_date.year, session_date.month, session_date.day,
-        22, 0, 0, tzinfo=_UTC,
-    ) - timedelta(days=1)
-    session_utc_end = datetime(
-        session_date.year, session_date.month, session_date.day,
-        22, 0, 0, tzinfo=_UTC,
-    )
+    # CME futures session: 18:00 ET prior day → 18:00 ET session_date. Computed via
+    # CMEEqIndexCalendar.pre_market_open() (ZoneInfo-based) rather than a hardcoded
+    # UTC offset — a fixed 22:00 UTC is EDT-only and drifts an hour off during EST.
+    calendar = calendar_for_symbol(sym_obj)
+    session_utc_start = calendar.pre_market_open(session_date)
+    session_utc_end = calendar.pre_market_open(session_date + timedelta(days=1))
 
     warmup_bars  = [b for b in all_bars if b.timestamp < session_utc_start]
     session_bars = [b for b in all_bars if session_utc_start <= b.timestamp < session_utc_end]
 
     if not session_bars:
-        return 0
+        return 0, 0
 
     # ── Build engines ──────────────────────────────────────────────────────────
     registry = SymbolRegistry()
     registry.register(sym_obj)
-    calendar = calendar_for_symbol(sym_obj)
     bus = EventBus(queue_size=5000)
     await bus.start()
     clock = WallClock()
@@ -481,6 +456,19 @@ async def _replay_day(
     if verbose:
         print(f"  {_DIM}Warmup: {len(warmup_bars)} bars fed{_R}")
 
+    # Level interactions: shadow research subscriber, never influences trades.
+    # Attached only now (target date only) — matching research_replay.py's pattern —
+    # so warmup days aren't re-recorded as episodes on every subsequent day's run.
+    interaction_engine: LevelInteractionEngine | None = None
+    if record_interactions:
+        interaction_engine = LevelInteractionEngine(
+            event_bus=bus,
+            registry=registry,
+            research_root=research_root or (_REPO / "data" / "research"),
+            run_id=interaction_run_id,
+        )
+        interaction_engine.attach()
+
     # ── Feed session bars ──────────────────────────────────────────────────────
     for bar in session_bars:
         # Exit check runs before pipeline (pre_bar is synchronous)
@@ -501,6 +489,11 @@ async def _replay_day(
     if session_bars:
         tracker.close_remaining(session_bars[-1])
 
+    episodes_written = 0
+    if interaction_engine is not None:
+        interaction_engine.flush()
+        episodes_written = interaction_engine.episodes_written
+
     # ── Stop engines ───────────────────────────────────────────────────────────
     await scoring_engine.stop()
     await thesis_engine.stop()
@@ -510,7 +503,7 @@ async def _replay_day(
     await feature_engine.stop()
     await bus.stop()
 
-    return len(session_bars)
+    return len(session_bars), episodes_written
 
 
 # ── Aggregate statistics ──────────────────────────────────────────────────────
@@ -695,6 +688,7 @@ async def run(
     max_hold_bars: int,
     save: bool,
     verbose: bool,
+    record_interactions: bool = False,
 ) -> None:
     settings = AlphaSettings(
         runtime=RuntimeSettings(
@@ -735,9 +729,12 @@ async def run(
           f"warmup={warmup_days}d  "
           f"timeout={max_hold_bars}bars\n")
 
-    print(f"{'Date':<12} {'Bars':>5}  {'Signals':>8}  {'Win':>4} {'Loss':>4}  {'P&L':>10}")
-    print("-" * 56)
+    print(f"{'Date':<12} {'Bars':>5}  {'Signals':>8}  {'Win':>4} {'Loss':>4}  {'P&L':>10}"
+          + ("  Episodes" if record_interactions else ""))
+    print("-" * (56 + (10 if record_interactions else 0)))
 
+    interaction_run_id = f"btest-{start_date}_{end_date}"
+    total_episodes = 0
     session_count = 0
     for session_date in candidate_dates:
         tracker = SignalTracker(
@@ -748,7 +745,7 @@ async def run(
             point_value=point_value,
         )
 
-        bars_processed = await _replay_day(
+        bars_processed, episodes_written = await _replay_day(
             symbol=symbol,
             sym_obj=sym_obj,
             session_date=session_date,
@@ -756,7 +753,10 @@ async def run(
             settings=settings,
             tracker=tracker,
             verbose=verbose,
+            record_interactions=record_interactions,
+            interaction_run_id=interaction_run_id,
         )
+        total_episodes += episodes_written
 
         if bars_processed == 0:
             continue  # not a trading day / no data
@@ -775,6 +775,7 @@ async def run(
             f"{len(day_signals):>8}  "
             f"{day_wins:>4} {day_losses:>4}  "
             f"{pnl_col}{day_pnl:>+9.1f}pts{_R}"
+            + (f"  {episodes_written:>8}" if record_interactions else "")
         )
 
         if verbose and day_signals:
@@ -783,6 +784,9 @@ async def run(
 
     print("-" * 56)
     print(f"  {session_count} trading sessions")
+    if record_interactions:
+        print(f"  {total_episodes} level-interaction episodes written "
+              f"(data/research/interaction/, run_id={interaction_run_id})")
 
     if not all_signals:
         print(f"\n{_YELLOW}No signals found. Check date range, min_grade, and parquet data.{_R}")
@@ -821,6 +825,9 @@ def main() -> None:
                    help="Save signals.jsonl + summary.json to data/backtest_results/")
     p.add_argument("--verbose",   action="store_true",
                    help="Print each signal and intraday position details")
+    p.add_argument("--record-interactions", action="store_true",
+                   help="Also run LevelInteractionEngine (shadow, VWAP/OR episode geometry) "
+                        "and write to data/research/interaction/")
     args = p.parse_args()
 
     grade_map = {
@@ -841,6 +848,7 @@ def main() -> None:
         max_hold_bars=args.timeout,
         save=args.save,
         verbose=args.verbose,
+        record_interactions=args.record_interactions,
     ))
 
 
