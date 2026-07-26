@@ -368,6 +368,23 @@ async def replay(
         print(f"{_RED}No bars returned for {symbol} {warmup_start}→{session_date}.{_RESET}")
         return
 
+    # Pre-flight completeness check (Parquet only — skip if the target session
+    # hasn't closed yet, since incomplete-so-far data is expected, not a gap).
+    # A single-day replay with missing days in its warmup/session window is
+    # close to meaningless (degraded PDH/PDL, discontinuous EMAs, or the
+    # target day itself just isn't there) — better to say so up front with the
+    # exact fix than run anyway and produce a quietly-wrong replay.
+    if source == "parquet" and session_date < date.today():
+        manifest = dataset_manifest(all_bars, calendar, warmup_start, session_date, symbol, source=source)
+        if manifest["missing_days"]:
+            gap_start, gap_end = manifest["missing_days"][0], manifest["missing_days"][-1]
+            print(f"\n{_RED}Missing Parquet data for {symbol}: {', '.join(manifest['missing_days'])}{_RESET}")
+            print(f"{_YELLOW}Fill the gap first:{_RESET}")
+            print(f"  python scripts/download_raw.py --symbol {symbol} --start {gap_start} --end {gap_end}")
+            print(f"  python scripts/backfill.py --symbol {symbol} --start {gap_start} --end {gap_end}")
+            print(f"{_DIM}(backfill.py is idempotent — safe to run even where data already exists){_RESET}")
+            sys.exit(1)
+
     # Split into warmup (before session date) and session bars
     # For CME futures, the session date's bars start at 18:00 ET the prior calendar day.
     # We define "session" as bars whose ET date equals session_date OR the overnight

@@ -662,6 +662,22 @@ async def run(
 
     bundle = await build_replay_pipeline(settings, symbol, sym_obj, include_scoring=True)
 
+    # Early completeness warning (not a hard exit, unlike replay_day.py) — a
+    # research backtest over a long range may deliberately tolerate some known
+    # gaps, so this surfaces the issue up front (not just buried in the saved
+    # summary.json's "dataset" field) without blocking a run someone actually
+    # wants to do anyway. Excludes today/still-open sessions, which are
+    # incomplete by definition, not a gap.
+    preflight_end = min(end_date, date.today() - timedelta(days=1))
+    if warmup_start <= preflight_end:
+        preflight_manifest = dataset_manifest(all_bars, bundle.calendar, warmup_start, preflight_end, symbol)
+        if preflight_manifest["missing_days"]:
+            missing = preflight_manifest["missing_days"]
+            print(f"\n{_YELLOW}Warning: {len(missing)} missing trading day(s) in requested range: "
+                  f"{', '.join(missing[:5])}{' …' if len(missing) > 5 else ''}{_R}")
+            print(f"{_DIM}  python scripts/download_raw.py --symbol {symbol} --start {missing[0]} --end {missing[-1]}")
+            print(f"  python scripts/backfill.py --symbol {symbol} --start {missing[0]} --end {missing[-1]}{_R}\n")
+
     interaction_run_id = f"btest-{start_date}_{end_date}"
     interaction_engine: LevelInteractionEngine | None = None
     if record_interactions:
