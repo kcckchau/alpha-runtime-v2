@@ -638,7 +638,7 @@ def run_checks(symbol: str, d: date, schemas: list[str], verbose: bool) -> int:
     """Returns number of hard failures."""
     settings = get_settings()
     raw_root = settings.databento.raw_archive_root
-    parquet_root = settings.databento.parquet_root if hasattr(settings.databento, "parquet_root") else Path("data/parquet")
+    parquet_root = settings.storage.parquet_root
     db_symbol = _SCHEMA_TO_DB_SYMBOL.get(symbol, symbol.replace("-", ".c.") if "-" in symbol else symbol)
 
     failures = 0

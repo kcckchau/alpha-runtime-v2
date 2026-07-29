@@ -53,26 +53,24 @@ from uuid import uuid4
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "src"))
 
-from alpha.calendar.resolver import calendar_for_symbol
-from alpha.config.settings import AlphaSettings, RuntimeSettings, StorageSettings
-from alpha.core.clock import WallClock
-from alpha.core.event_bus import EventBus
-from alpha.core.registry import SymbolRegistry
-from alpha.engines.context.engine import ContextEngine
-from alpha.engines.feature.engine import FeatureEngine
-from alpha.engines.flow.aggregator import BarFlowAggregator
-from alpha.engines.flow.pipeline import BarPipeline
-from alpha.engines.market_state.engine import MarketStateEngine
-from alpha.engines.scoring.engine import ScoringEngine
-from alpha.engines.setup.engine import SetupEngine
-from alpha.engines.storage.engine import StorageEngine
-from alpha.engines.storage.parquet import ParquetStore
-from alpha.engines.thesis.engine import ThesisEngine
+from alpha.config.settings import AlphaSettings
+from replay_common import (
+    EngineBundle,
+    build_config_fingerprint,
+    build_replay_context,
+    build_replay_settings_and_symbol,
+    build_resolved_config,
+    config_fingerprint_lines,
+    config_hash,
+    dataset_manifest,
+    default_m1_warmup_days,
+    enforce_persist_guard,
+    load_m1_bars,
+)
 from alpha.models.enums import (
-    AssetClass, BarTimeframe, EventType, OrderSide, RuntimeMode, SetupGrade, SetupType,
+    EventType, OrderSide, SetupGrade, SetupType,
 )
 from alpha.models.events import BarEvent, PipelineOutputEvent
-from alpha.models.symbol import Symbol
 
 _UTC = timezone.utc
 _ET  = timezone(timedelta(hours=-4))   # EDT display
@@ -351,166 +349,62 @@ class SignalTracker:
 
 # ── Bar loading ───────────────────────────────────────────────────────────────
 
-def _load_parquet_bars(
-    symbol: str,
-    start: date,
-    end: date,
-    settings: AlphaSettings,
-) -> list[BarEvent]:
-    parquet = ParquetStore(settings.storage)
-    bars: list[BarEvent] = []
-    d = start
-    while d <= end:
-        try:
-            table = parquet.read_range(f"bars/{BarTimeframe.M1}", symbol, d, d)
-            for row in table.to_pylist():
-                bar = StorageEngine._row_to_bar_event(row, BarTimeframe.M1)
-                if bar.symbol != symbol:
-                    bar = bar.model_copy(update={"symbol": symbol})
-                bars.append(bar)
-        except Exception:
-            pass
-        d += timedelta(days=1)
-    bars.sort(key=lambda b: b.timestamp)
-    return bars
-
-
 # ── Per-day replay ────────────────────────────────────────────────────────────
 
-async def _replay_day(
-    symbol: str,
-    sym_obj: Symbol,
+async def _feed_session_day(
+    bundle: EngineBundle,
     session_date: date,
-    warmup_days: int,
-    settings: AlphaSettings,
+    session_bars: list[BarEvent],
     tracker: SignalTracker,
     verbose: bool,
-) -> int:
+) -> None:
     """
-    Replay one session through the full pipeline.
-    Returns the number of session bars processed.
+    Feed one day's session bars through the already-running engine bundle and
+    drive tracker's entry/exit simulation. Engines are NOT rebuilt here —
+    session-rollover (SetupEngine._roll_session_if_needed etc, the same
+    mechanism live trading relies on) is what carries state across the day
+    boundary, exactly as it does for a real multi-day live/replay process.
     """
-    # Load bars: warmup window + session
-    warmup_start = session_date - timedelta(days=warmup_days + 2)
-    all_bars = _load_parquet_bars(symbol, warmup_start, session_date, settings)
-    if not all_bars:
-        return 0
+    sub = bundle.bus.subscribe(EventType.PIPELINE_OUTPUT, tracker.on_pipeline_output)
+    try:
+        for bar in session_bars:
+            # Exit check runs before pipeline (pre_bar is synchronous)
+            tracker.pre_bar(bar)
+            await bundle.bus.publish(bar)
+            await bundle.bus.flush()  # pipeline runs → PIPELINE_OUTPUT → tracker.on_pipeline_output
 
-    # Split warmup vs session
-    # CME futures session: prior day 18:00 ET (22:00 UTC) → same day 18:00 ET (22:00 UTC)
-    session_utc_start = datetime(
-        session_date.year, session_date.month, session_date.day,
-        22, 0, 0, tzinfo=_UTC,
-    ) - timedelta(days=1)
-    session_utc_end = datetime(
-        session_date.year, session_date.month, session_date.day,
-        22, 0, 0, tzinfo=_UTC,
-    )
-
-    warmup_bars  = [b for b in all_bars if b.timestamp < session_utc_start]
-    session_bars = [b for b in all_bars if session_utc_start <= b.timestamp < session_utc_end]
-
-    if not session_bars:
-        return 0
-
-    # ── Build engines ──────────────────────────────────────────────────────────
-    registry = SymbolRegistry()
-    registry.register(sym_obj)
-    calendar = calendar_for_symbol(sym_obj)
-    bus = EventBus(queue_size=5000)
-    await bus.start()
-    clock = WallClock()
-
-    feature_engine      = FeatureEngine(settings, bus, registry, calendar, clock)
-    context_engine      = ContextEngine(settings, bus, registry, calendar, clock)
-    market_state_engine = MarketStateEngine(settings, bus, registry)
-    setup_engine        = SetupEngine(settings, bus, registry)
-    thesis_engine       = ThesisEngine(settings, bus, registry)
-    scoring_engine      = ScoringEngine(settings, bus)
-
-    market_state_engine.set_feature_engine(feature_engine)
-    context_engine.set_feature_engine(feature_engine)
-    market_state_engine.set_context_engine(context_engine)
-    setup_engine.set_feature_engine(feature_engine)
-    setup_engine.set_market_state_engine(market_state_engine)
-    setup_engine.set_context_engine(context_engine)
-    thesis_engine.set_feature_engine(feature_engine)
-    thesis_engine.set_context_engine(context_engine)
-    scoring_engine.set_setup_engine(setup_engine)
-    scoring_engine.set_feature_engine(feature_engine)
-
-    # Wire BarFlowAggregator + BarPipeline (same as live)
-    agg = BarFlowAggregator(
-        symbol=symbol,
-        event_bus=bus,
-        large_trade_threshold=getattr(settings.runtime, "large_trade_threshold", 10),
-    )
-    agg.attach()
-
-    pipeline = BarPipeline(bus)
-    pipeline.set_feature_engine(feature_engine)
-    pipeline.set_market_state_engine(market_state_engine)
-    pipeline.set_thesis_engine(thesis_engine)
-    pipeline.set_setup_engine(setup_engine)
-    pipeline.set_scoring_engine(scoring_engine)
-    pipeline.attach()
-
-    # Subscribe tracker to PIPELINE_OUTPUT
-    bus.subscribe(EventType.PIPELINE_OUTPUT, tracker.on_pipeline_output)
-
-    # Start engines
-    await feature_engine.initialize()
-    await context_engine.initialize()
-    await market_state_engine.initialize()
-    await setup_engine.initialize()
-    await thesis_engine.initialize()
-    await scoring_engine.initialize()
-
-    await feature_engine.start()
-    await context_engine.start()
-    await market_state_engine.start()
-    await setup_engine.start()
-    await thesis_engine.start()
-    await scoring_engine.start()
-
-    # ── Feed warmup bars ───────────────────────────────────────────────────────
-    for bar in warmup_bars:
-        await bus.publish(bar)
-        await bus.flush()
-
-    if verbose:
-        print(f"  {_DIM}Warmup: {len(warmup_bars)} bars fed{_R}")
-
-    # ── Feed session bars ──────────────────────────────────────────────────────
-    for bar in session_bars:
-        # Exit check runs before pipeline (pre_bar is synchronous)
-        tracker.pre_bar(bar)
-        await bus.publish(bar)
-        await bus.flush()  # pipeline runs → PIPELINE_OUTPUT → tracker.on_pipeline_output
-
-        if verbose and tracker._open:
-            pos = tracker._open
-            print(f"  {_ts(bar.timestamp)}  {_CYAN}IN POSITION{_R}  "
-                  f"{pos.setup_type} {pos.grade}  "
-                  f"entry={float(pos.entry_price):.2f}  "
-                  f"stop={float(pos.stop):.2f}  "
-                  f"target={float(pos.target):.2f}  "
-                  f"bars_held={pos.bars_held}")
+            if verbose and tracker._open:
+                pos = tracker._open
+                print(f"  {_ts(bar.timestamp)}  {_CYAN}IN POSITION{_R}  "
+                      f"{pos.setup_type} {pos.grade}  "
+                      f"entry={float(pos.entry_price):.2f}  "
+                      f"stop={float(pos.stop):.2f}  "
+                      f"target={float(pos.target):.2f}  "
+                      f"bars_held={pos.bars_held}")
+    finally:
+        bundle.bus.unsubscribe(sub)
 
     # Close any position still open at session end
     if session_bars:
         tracker.close_remaining(session_bars[-1])
 
-    # ── Stop engines ───────────────────────────────────────────────────────────
-    await scoring_engine.stop()
-    await thesis_engine.stop()
-    await setup_engine.stop()
-    await market_state_engine.stop()
-    await context_engine.stop()
-    await feature_engine.stop()
-    await bus.stop()
 
-    return len(session_bars)
+def _episodes_by_session_date(run_id: str) -> dict[str, int]:
+    """Post-hoc breakdown of episodes this run wrote, grouped by session_date.
+
+    Reads back the just-flushed Parquet files instead of counting inline per
+    day — LevelInteractionEngine.flush() also force-closes any still-open
+    episode (end_reason="replay_completed"), so it must only be called once,
+    at the very end of a continuous multi-day run, not per day.
+    """
+    import pyarrow.parquet as pq
+
+    root = _REPO / "data" / "research" / "interaction" / "episodes"
+    counts: dict[str, int] = {}
+    for path in root.glob(f"*/session_date=*/part-{run_id}-*.parquet"):
+        session_date = path.parent.name.removeprefix("session_date=")
+        counts[session_date] = counts.get(session_date, 0) + pq.ParquetFile(path).metadata.num_rows
+    return counts
 
 
 # ── Aggregate statistics ──────────────────────────────────────────────────────
@@ -662,6 +556,9 @@ def _save(
     start: str,
     end: str,
     meta: dict,
+    settings: AlphaSettings,
+    cli_args: dict,
+    manifest: dict,
 ) -> Path:
     out_dir = _REPO / "data" / "backtest_results" / symbol / f"{start}_{end}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -672,8 +569,20 @@ def _save(
         for s in signals:
             f.write(json.dumps(s.__dict__) + "\n")
 
-    # summary.json
-    summary = {"meta": meta, "stats": stats}
+    # summary.json — meta/fingerprint/config/dataset three-layer(+1) provenance,
+    # so a summary.json opened later is self-contained: what ran, what code
+    # produced it, what parameters/settings were resolved, and whether the
+    # requested date range actually had complete data (see dataset_manifest()'s
+    # docstring — load_m1_bars silently continues past a missing/corrupt day).
+    resolved_config = build_resolved_config(settings, cli_args)
+    summary = {
+        "meta": meta,
+        "fingerprint": build_config_fingerprint(),
+        "config": resolved_config,
+        "config_hash": config_hash(resolved_config),
+        "dataset": manifest,
+        "stats": stats,
+    }
     summary_path = out_dir / "summary.json"
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
@@ -695,29 +604,11 @@ async def run(
     max_hold_bars: int,
     save: bool,
     verbose: bool,
+    record_interactions: bool = False,
+    persist: bool = False,
+    persist_force: bool = False,
 ) -> None:
-    settings = AlphaSettings(
-        runtime=RuntimeSettings(
-            mode=RuntimeMode.REPLAY,
-            symbols=[symbol],
-            orb_minutes=5,
-        ),
-        storage=StorageSettings(
-            parquet_root=_REPO / "data" / "parquet",
-        ),
-    )
-
-    asset_class = AssetClass.FUTURE if "-" in symbol else AssetClass.EQUITY
-    root = symbol.split("-")[0] if "-" in symbol else symbol
-    sym_obj = Symbol(
-        ticker=symbol,
-        exchange="CME" if asset_class == AssetClass.FUTURE else "NYSE",
-        asset_class=asset_class,
-        root_symbol=root,
-        lot_size=1,
-        tick_size=Decimal("0.25") if "MNQ" in symbol else Decimal("0.01"),
-        point_value=Decimal("2.0") if "MNQ" in symbol else Decimal("1.0"),
-    )
+    settings, sym_obj = build_replay_settings_and_symbol(symbol)
     point_value = sym_obj.point_value or Decimal("1.0")
 
     # Enumerate candidate session dates
@@ -733,64 +624,126 @@ async def run(
           f"{start_date} → {end_date}  "
           f"min_grade={min_grade}  "
           f"warmup={warmup_days}d  "
-          f"timeout={max_hold_bars}bars\n")
+          f"timeout={max_hold_bars}bars")
+    for line in config_fingerprint_lines():
+        print(f"{_DIM}{line}{_R}")
+    print()
 
     print(f"{'Date':<12} {'Bars':>5}  {'Signals':>8}  {'Win':>4} {'Loss':>4}  {'P&L':>10}")
     print("-" * 56)
 
-    session_count = 0
-    for session_date in candidate_dates:
-        tracker = SignalTracker(
-            symbol=symbol,
-            session_date=session_date,
-            min_grade=min_grade,
-            max_hold_bars=max_hold_bars,
-            point_value=point_value,
-        )
+    # ── Load the whole range's bars once, build engines once ────────────────────
+    warmup_start = start_date - timedelta(days=warmup_days + 2)
+    all_bars = load_m1_bars(symbol, warmup_start, end_date, settings)
 
-        bars_processed = await _replay_day(
-            symbol=symbol,
-            sym_obj=sym_obj,
-            session_date=session_date,
-            warmup_days=warmup_days,
-            settings=settings,
-            tracker=tracker,
-            verbose=verbose,
-        )
-
-        if bars_processed == 0:
-            continue  # not a trading day / no data
-
-        session_count += 1
-        day_signals = tracker.signals
-        all_signals.extend(day_signals)
-
-        day_wins   = sum(1 for s in day_signals if s.outcome == "win")
-        day_losses = sum(1 for s in day_signals if s.outcome == "loss")
-        day_pnl    = sum(s.pnl_pts for s in day_signals if s.outcome != "incomplete")
-        pnl_col    = _GREEN if day_pnl >= 0 else _RED
-
-        print(
-            f"{str(session_date):<12} {bars_processed:>5}  "
-            f"{len(day_signals):>8}  "
-            f"{day_wins:>4} {day_losses:>4}  "
-            f"{pnl_col}{day_pnl:>+9.1f}pts{_R}"
-        )
-
-        if verbose and day_signals:
-            for s in day_signals:
-                _print_signal(s)
-
-    print("-" * 56)
-    print(f"  {session_count} trading sessions")
-
-    if not all_signals:
-        print(f"\n{_YELLOW}No signals found. Check date range, min_grade, and parquet data.{_R}")
+    if not all_bars:
+        print(f"\n{_YELLOW}No bars found for {symbol} {warmup_start}→{end_date}.{_R}")
         return
 
-    stats = _compute_stats(all_signals)
-    _print_summary(stats, symbol, str(start_date), str(end_date))
+    persist_dates = [warmup_start + timedelta(days=i) for i in range((end_date - warmup_start).days + 1)]
+    enforce_persist_guard(symbol, persist_dates, settings, persist=persist, persist_force=persist_force)
 
+    interaction_run_id = f"btest-{start_date}_{end_date}"
+    ctx = await build_replay_context(
+        symbol, sym_obj, settings, include_scoring=True, persist=persist,
+        record_interactions=record_interactions, interaction_run_id=interaction_run_id,
+    )
+    bundle = ctx.bundle
+
+    # Early completeness warning (not a hard exit, unlike replay_day.py) — a
+    # research backtest over a long range may deliberately tolerate some known
+    # gaps, so this surfaces the issue up front (not just buried in the saved
+    # summary.json's "dataset" field) without blocking a run someone actually
+    # wants to do anyway. Excludes today/still-open sessions, which are
+    # incomplete by definition, not a gap.
+    preflight_end = min(end_date, date.today() - timedelta(days=1))
+    if warmup_start <= preflight_end:
+        preflight_manifest = dataset_manifest(all_bars, bundle.calendar, warmup_start, preflight_end, symbol)
+        if preflight_manifest["missing_days"]:
+            missing = preflight_manifest["missing_days"]
+            print(f"\n{_YELLOW}Warning: {len(missing)} missing trading day(s) in requested range: "
+                  f"{', '.join(missing[:5])}{' …' if len(missing) > 5 else ''}{_R}")
+            print(f"{_DIM}  python scripts/download_raw.py --symbol {symbol} --start {missing[0]} --end {missing[-1]}")
+            print(f"  python scripts/backfill.py --symbol {symbol} --start {missing[0]} --end {missing[-1]}{_R}\n")
+
+    try:
+        # Initial warmup: everything before start_date's session open, fed once.
+        initial_warmup_end = bundle.calendar.pre_market_open(start_date)
+        warmup_bars = [b for b in all_bars if b.timestamp < initial_warmup_end]
+        for bar in warmup_bars:
+            await bundle.bus.publish(bar)
+            await bundle.bus.flush()
+        if verbose:
+            print(f"  {_DIM}Warmup: {len(warmup_bars)} bars fed{_R}")
+
+        # Attached only now (after initial warmup, before any tracked day) and
+        # left running continuously for the whole range — LevelInteractionEngine
+        # already has its own session-rollover handling (same as live/
+        # research_replay.py), so it does not need to be rebuilt per day.
+        ctx.attach_interactions()
+
+        session_count = 0
+        for session_date in candidate_dates:
+            session_utc_start = bundle.calendar.pre_market_open(session_date)
+            session_utc_end = bundle.calendar.pre_market_open(session_date + timedelta(days=1))
+            session_bars = [b for b in all_bars if session_utc_start <= b.timestamp < session_utc_end]
+
+            if not session_bars:
+                continue  # not a trading day / no data
+
+            tracker = SignalTracker(
+                symbol=symbol,
+                session_date=session_date,
+                min_grade=min_grade,
+                max_hold_bars=max_hold_bars,
+                point_value=point_value,
+            )
+            await _feed_session_day(bundle, session_date, session_bars, tracker, verbose)
+
+            session_count += 1
+            day_signals = tracker.signals
+            all_signals.extend(day_signals)
+
+            day_wins   = sum(1 for s in day_signals if s.outcome == "win")
+            day_losses = sum(1 for s in day_signals if s.outcome == "loss")
+            day_pnl    = sum(s.pnl_pts for s in day_signals if s.outcome != "incomplete")
+            pnl_col    = _GREEN if day_pnl >= 0 else _RED
+
+            print(
+                f"{str(session_date):<12} {len(session_bars):>5}  "
+                f"{len(day_signals):>8}  "
+                f"{day_wins:>4} {day_losses:>4}  "
+                f"{pnl_col}{day_pnl:>+9.1f}pts{_R}"
+            )
+
+            if verbose and day_signals:
+                for s in day_signals:
+                    _print_signal(s)
+
+        # Flush once, at the true end of the run — LevelInteractionEngine.flush()
+        # also force-closes any still-open episode (end_reason="replay_completed"),
+        # so calling it per-day would incorrectly truncate episodes that are
+        # still active when one day's bars end — ctx.finish() (below, in
+        # finally) only calls it once, at the true end of the run.
+        print("-" * 56)
+        print(f"  {session_count} trading sessions")
+    finally:
+        finish_result = await ctx.finish()
+
+    if ctx.interaction_engine is not None:
+        total_episodes = finish_result["episodes_written"]
+        print(f"  {total_episodes} level-interaction episodes written "
+              f"(data/research/interaction/, run_id={interaction_run_id})")
+        by_date = _episodes_by_session_date(interaction_run_id)
+        for d in sorted(by_date):
+            print(f"    {d}: {by_date[d]}")
+
+    stats = _compute_stats(all_signals)
+
+    # save runs regardless of whether any signals fired — a zero-signal run is
+    # exactly when dataset_manifest's missing_days matters most (was there
+    # really no signal, or was data silently absent?), so --save must not
+    # skip writing provenance just because there was nothing to summarize.
     if save:
         meta = {
             "symbol": symbol,
@@ -802,7 +755,23 @@ async def run(
             "sessions": session_count,
             "generated_at": datetime.now(_UTC).isoformat(),
         }
-        _save(all_signals, stats, symbol, str(start_date), str(end_date), meta)
+        cli_args = {
+            "symbol": symbol,
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+            "min_grade": str(min_grade),
+            "warmup_days": warmup_days,
+            "max_hold_bars": max_hold_bars,
+            "record_interactions": record_interactions,
+        }
+        manifest = dataset_manifest(all_bars, bundle.calendar, warmup_start, end_date, symbol)
+        _save(all_signals, stats, symbol, str(start_date), str(end_date), meta, settings, cli_args, manifest)
+
+    if not all_signals:
+        print(f"\n{_YELLOW}No signals found. Check date range, min_grade, and parquet data.{_R}")
+        return
+
+    _print_summary(stats, symbol, str(start_date), str(end_date))
 
 
 def main() -> None:
@@ -813,14 +782,26 @@ def main() -> None:
     p.add_argument("--min-grade", default="A",
                    choices=["SSS", "A+", "A", "B", "C"],
                    help="Minimum setup grade to track (default: A)")
-    p.add_argument("--warmup",    type=int, default=5,
-                   help="Warmup days per session (default: 5)")
+    p.add_argument("--warmup",    type=int, default=None,
+                   help="Warmup days per session (default: derived from "
+                        "settings.historical.minute1_warmup_bars, same formula backfill.py uses)")
     p.add_argument("--timeout",   type=int, default=60,
                    help="Max bars to hold before timeout exit (default: 60 = 1 hour)")
     p.add_argument("--save",      action="store_true",
                    help="Save signals.jsonl + summary.json to data/backtest_results/")
     p.add_argument("--verbose",   action="store_true",
                    help="Print each signal and intraday position details")
+    p.add_argument("--record-interactions", action="store_true",
+                   help="Also run LevelInteractionEngine (shadow, VWAP/OR episode geometry) "
+                        "and write to data/research/interaction/")
+    p.add_argument("--persist", action="store_true",
+                   help="Also write reconstructed setups/market_states to "
+                        "data/parquet/setups|market_states/ (same tables live uses), "
+                        "tagged is_replay=True so they're distinguishable from live-captured rows")
+    p.add_argument("--persist-force", action="store_true",
+                   help="With --persist: clear any prior reconstruction (is_replay=True rows) "
+                        "for the affected dates before rerunning, instead of blocking. "
+                        "Never touches live-captured (is_replay=False) rows.")
     args = p.parse_args()
 
     grade_map = {
@@ -832,15 +813,22 @@ def main() -> None:
     }
     min_grade = grade_map[args.min_grade]
 
+    warmup_days = args.warmup
+    if warmup_days is None:
+        warmup_days = default_m1_warmup_days(AlphaSettings())
+
     asyncio.run(run(
         symbol=args.symbol,
         start_date=date.fromisoformat(args.start),
         end_date=date.fromisoformat(args.end),
         min_grade=min_grade,
-        warmup_days=args.warmup,
+        warmup_days=warmup_days,
         max_hold_bars=args.timeout,
         save=args.save,
         verbose=args.verbose,
+        record_interactions=args.record_interactions,
+        persist=args.persist,
+        persist_force=args.persist_force,
     ))
 
 

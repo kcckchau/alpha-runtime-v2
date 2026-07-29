@@ -552,6 +552,11 @@ class StorageEngine(BaseEngine):
                 "setup_type": str(event.setup_type),
                 "setup_state": str(event.setup_state),
                 "prev_state": str(event.prev_state) if event.prev_state is not None else None,
+                "entry_trigger": self._decimal_text(event.entry_trigger),
+                "stop_reference": self._decimal_text(event.stop_reference),
+                "target_reference": self._decimal_text(event.target_reference),
+                "grade": event.grade,
+                "score": event.score,
             }
         if isinstance(event, OrderUpdateEvent):
             return {

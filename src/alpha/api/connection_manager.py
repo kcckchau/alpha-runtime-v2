@@ -10,6 +10,7 @@ The source (Databento, IBKR, etc.) is irrelevant here.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import defaultdict
 from decimal import Decimal
@@ -20,6 +21,10 @@ from alpha.models.enums import BarTimeframe, EventType
 from alpha.models.events import AnyEvent, BarEvent, PipelineOutputEvent, PositionSignalEvent, QuoteEvent, SetupEvent, ThesisEvent
 
 logger = logging.getLogger(__name__)
+
+# A single slow/dead client must never stall delivery to the rest — bound each
+# client's send and drop it if it doesn't complete in time.
+_SEND_TIMEOUT_S = 2.0
 
 
 def _symbol_broadcast_keys(symbol: str) -> set[str]:
@@ -271,9 +276,13 @@ class ConnectionManager:
         dead: set[WebSocket] = set()
         for ws in list(clients):
             try:
-                await ws.send_json(payload)
+                await asyncio.wait_for(ws.send_json(payload), timeout=_SEND_TIMEOUT_S)
             except Exception:
                 dead.add(ws)
         for ws in dead:
             for key in _symbol_broadcast_keys(symbol):
                 self._connections.get(key, set()).discard(ws)
+            try:
+                await ws.close()
+            except Exception:
+                pass

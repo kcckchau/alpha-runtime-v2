@@ -169,12 +169,21 @@ class BarPipeline:
 
         # ── Publish PipelineOutput ────────────────────────────────────────────
         now_utc = datetime.now(timezone.utc)
-        e2e_ms = (now_utc - bundle.metadata.received_at).total_seconds() * 1000
-        if e2e_ms > 2000:
-            logger.warning(
-                "BarPipeline %s: bar-to-signal latency=%.0fms (bar_ts=%s received_at=%s)",
-                sym, e2e_ms, bundle.timestamp, bundle.metadata.received_at,
-            )
+        # Live-only health check: received_at is when this bar was originally
+        # ingested. For live bars that's ~now, so now_utc - received_at is a
+        # real feed-latency signal. For replayed/backfilled bars it's whenever
+        # that historical data was first backfilled — could be days after its
+        # own market timestamp — so the same subtraction during a backtest
+        # produces a multi-day "latency" that's just log noise, not a real
+        # delay. Every bar fed by backtest.py/replay_day.py has is_replay=True
+        # (load_m1_bars forces it), so this skips cleanly for both.
+        if not bundle.metadata.is_replay:
+            e2e_ms = (now_utc - bundle.metadata.received_at).total_seconds() * 1000
+            if e2e_ms > 2000:
+                logger.warning(
+                    "BarPipeline %s: bar-to-signal latency=%.0fms (bar_ts=%s received_at=%s)",
+                    sym, e2e_ms, bundle.timestamp, bundle.metadata.received_at,
+                )
 
         scored_setups = [s for s in setups if s.grade is not None]
         output = PipelineOutputEvent(

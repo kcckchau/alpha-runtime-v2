@@ -37,22 +37,25 @@ from typing import AsyncIterator
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "src"))
 
-from alpha.calendar.resolver import calendar_for_symbol
-from alpha.config.settings import AlphaSettings, RuntimeSettings, StorageSettings
-from alpha.core.clock import WallClock
-from alpha.core.event_bus import EventBus
+from alpha.calendar.base import SessionCalendar
+from replay_common import (
+    build_config_fingerprint,
+    build_replay_context,
+    build_replay_settings_and_symbol,
+    build_resolved_config,
+    config_fingerprint_lines,
+    config_hash,
+    dataset_manifest,
+    default_m1_warmup_days,
+    enforce_persist_guard,
+    load_m1_bars,
+)
+from alpha.config.settings import AlphaSettings
 from alpha.core.registry import SymbolRegistry
-from alpha.engines.context.engine import ContextEngine
-from alpha.engines.feature.engine import FeatureEngine
 from alpha.engines.historical.sources.databento import DatabentoHistoricalDataSource as DatabentoHistoricalSource
-from alpha.engines.market_state.engine import MarketStateEngine
-from alpha.engines.setup.engine import SetupEngine
-from alpha.engines.storage.engine import StorageEngine
-from alpha.engines.storage.parquet import ParquetStore
-from alpha.engines.thesis.engine import ThesisEngine
-from alpha.models.enums import AssetClass, BarTimeframe, RuntimeMode
+from alpha.models.enums import BarTimeframe
 from alpha.models.events import BarEvent, QuoteEvent, TradeEvent
-from alpha.models.symbol import Symbol
+from alpha.research.interaction.engine import LevelInteractionEngine
 from replay_cache import ReplayCache, ReplayResultSaver
 
 _UTC = timezone.utc
@@ -90,35 +93,13 @@ def _fmt_pct(v: float | None) -> str:
     return f"{v*100:.1f}%"
 
 
-# ── Bar loading ───────────────────────────────────────────────────────────────
-
-def _load_from_parquet(
-    symbol: str,
-    warmup_start: date,
-    session_date: date,
-    settings: AlphaSettings,
-) -> list[BarEvent]:
-    parquet = ParquetStore(settings.storage)
-    bars: list[BarEvent] = []
-    d = warmup_start
-    while d <= session_date:
-        table = parquet.read_range(f"bars/{BarTimeframe.M1}", symbol, d, d)
-        for row in table.to_pylist():
-            bar = StorageEngine._row_to_bar_event(row, BarTimeframe.M1)
-            if bar.symbol != symbol:
-                bar = bar.model_copy(update={"symbol": symbol})
-            bars.append(bar)
-        d += timedelta(days=1)
-    bars.sort(key=lambda b: b.timestamp)
-    return bars
-
-
 async def _load_from_databento(
     symbol: str,
     warmup_start: date,
     session_date: date,
     settings: AlphaSettings,
     registry: SymbolRegistry,
+    calendar: SessionCalendar,
     cache: ReplayCache | None = None,
     warmup_days: int = 5,
     no_cache: bool = False,
@@ -130,14 +111,10 @@ async def _load_from_databento(
     """
     source: DatabentoHistoricalSource | None = None
 
-    start_utc = datetime(
-        warmup_start.year, warmup_start.month, warmup_start.day,
-        22, 0, 0, tzinfo=_UTC,
-    ) - timedelta(days=1)
-    end_utc = datetime(
-        session_date.year, session_date.month, session_date.day,
-        21, 0, 0, tzinfo=_UTC,
-    )
+    # ZoneInfo-based (DST-safe) rather than a hardcoded UTC offset — see the
+    # same fix in the warmup/session split below.
+    start_utc = calendar.pre_market_open(warmup_start)
+    end_utc = calendar.after_hours_close(session_date)
 
     # ── M1 bars ───────────────────────────────────────────────────────────────
     if cache is not None and not no_cache and cache.bars_cached(symbol, session_date, warmup_days):
@@ -177,10 +154,9 @@ async def _load_from_databento(
     # SMA200 on H1 requires 200 bars ≈ 8.5 trading days. We always fetch at
     # least 12 calendar days back so the SMA200 is warm by RTH open.
     h1_warmup_days = max(warmup_days, 12)
-    h1_start_utc = datetime(
-        warmup_start.year, warmup_start.month, warmup_start.day,
-        22, 0, 0, tzinfo=_UTC,
-    ) - timedelta(days=max(0, h1_warmup_days - warmup_days) + 1)
+    h1_start_utc = calendar.pre_market_open(warmup_start) - timedelta(
+        days=max(0, h1_warmup_days - warmup_days)
+    )
 
     if cache is not None and not no_cache and cache.h1_bars_cached(symbol, session_date, warmup_days):
         print("  H1 bars: loading from cache…", end="", flush=True)
@@ -318,67 +294,36 @@ async def replay(
     full_signals: bool = False,
     no_cache: bool = False,
     save_results: bool = False,
+    record_interactions: bool = False,
+    persist: bool = False,
+    persist_force: bool = False,
 ) -> None:
 
-    settings = AlphaSettings(
-        runtime=RuntimeSettings(
-            mode=RuntimeMode.REPLAY,
-            symbols=[symbol],
-            orb_minutes=5,
-        ),
-        storage=StorageSettings(
-            parquet_root=_REPO / "data" / "parquet",
-        ),
+    settings, sym_obj = build_replay_settings_and_symbol(symbol)
+
+    # Shared with backtest.py — wires FeatureEngine/ContextEngine/MarketStateEngine/
+    # SetupEngine/ThesisEngine onto BarFlowAggregator + BarPipeline (same
+    # sequential-stage pattern as live), replacing the old direct-subscription
+    # pattern this script used before (each engine self-subscribing to raw BAR
+    # events, relying on .start() call order for dependency ordering).
+    # No ScoringEngine — replay_day.py intentionally shows SetupEngine's raw
+    # score, not a final letter grade.
+    # Named rctx, not ctx — this script already uses `ctx` for
+    # ContextEngine.get_context()'s per-bar snapshot inside the feed loop,
+    # which would otherwise silently shadow this object before teardown.
+    rctx = await build_replay_context(
+        symbol, sym_obj, settings, include_scoring=False, persist=persist,
+        record_interactions=record_interactions, interaction_run_id=f"replay-{session_date}",
     )
-
-    # Symbol object — root_symbol drives Databento continuous contract lookup
-    asset_class = AssetClass.FUTURE if "-" in symbol else AssetClass.EQUITY
-    root = symbol.split("-")[0] if "-" in symbol else symbol
-    sym_obj = Symbol(
-        ticker=symbol,
-        exchange="CME" if asset_class == AssetClass.FUTURE else "NYSE",
-        asset_class=asset_class,
-        root_symbol=root,
-        lot_size=1,
-        tick_size=Decimal("0.25") if "MNQ" in symbol else Decimal("0.01"),
-        point_value=Decimal("2.0") if "MNQ" in symbol else Decimal("1.0"),
-    )
-    registry = SymbolRegistry()
-    registry.register(sym_obj)
-
-    calendar = calendar_for_symbol(sym_obj)
-    bus = EventBus(queue_size=5000)
-    await bus.start()
-
-    clock = WallClock()
-    feature_engine      = FeatureEngine(settings, bus, registry, calendar, clock)
-    context_engine      = ContextEngine(settings, bus, registry, calendar, clock)
-    market_state_engine = MarketStateEngine(settings, bus, registry)
-    setup_engine        = SetupEngine(settings, bus, registry)
-    thesis_engine       = ThesisEngine(settings, bus, registry)
-
-    market_state_engine.set_feature_engine(feature_engine)
-    setup_engine.set_feature_engine(feature_engine)
-    setup_engine.set_market_state_engine(market_state_engine)
-    thesis_engine.set_feature_engine(feature_engine)
-    context_engine.set_feature_engine(feature_engine)
-    market_state_engine.set_context_engine(context_engine)
-    setup_engine.set_context_engine(context_engine)
-    thesis_engine.set_context_engine(context_engine)
-
-    await feature_engine.initialize()
-    await context_engine.initialize()
-    await market_state_engine.initialize()
-    await setup_engine.initialize()
-    await thesis_engine.initialize()
-
-    # ContextEngine must start AFTER FeatureEngine so its BAR subscription
-    # fires second — guaranteeing FeatureEngine.get_snapshot() is current.
-    await feature_engine.start()
-    await context_engine.start()
-    await market_state_engine.start()
-    await setup_engine.start()
-    await thesis_engine.start()
+    bundle               = rctx.bundle
+    registry             = bundle.registry
+    calendar             = bundle.calendar
+    bus                  = bundle.bus
+    feature_engine       = bundle.feature
+    context_engine       = bundle.context
+    market_state_engine  = bundle.market_state
+    setup_engine         = bundle.setup
+    thesis_engine        = bundle.thesis
 
     # ── Cache setup ───────────────────────────────────────────────────────────
     cache: ReplayCache | None = None
@@ -390,16 +335,19 @@ async def replay(
     signals_label = " +full-signals" if full_signals else ""
     cache_label = " no-cache" if no_cache else ""
     print(f"\n{_BOLD}Replay: {symbol} session {session_date}  "
-          f"(source={source}{signals_label}{cache_label}, warmup from {warmup_start}){_RESET}\n")
+          f"(source={source}{signals_label}{cache_label}, warmup from {warmup_start}){_RESET}")
+    for line in config_fingerprint_lines():
+        print(f"{_DIM}{line}{_RESET}")
+    print()
 
     if source == "databento":
         print("  Loading bars…")
         all_bars, all_m5_bars, all_h1_bars, all_d1_bars = await _load_from_databento(
-            symbol, warmup_start, session_date, settings, registry,
+            symbol, warmup_start, session_date, settings, registry, calendar,
             cache=cache, warmup_days=warmup_days, no_cache=no_cache,
         )
     else:
-        all_bars = _load_from_parquet(symbol, warmup_start, session_date, settings)
+        all_bars = load_m1_bars(symbol, warmup_start, session_date, settings, skip_read_errors=False)
         all_m5_bars = []
         all_h1_bars = []
         all_d1_bars = []
@@ -408,21 +356,37 @@ async def replay(
         print(f"{_RED}No bars returned for {symbol} {warmup_start}→{session_date}.{_RESET}")
         return
 
+    # Pre-flight completeness check (Parquet only — skip if the target session
+    # hasn't closed yet, since incomplete-so-far data is expected, not a gap).
+    # A single-day replay with missing days in its warmup/session window is
+    # close to meaningless (degraded PDH/PDL, discontinuous EMAs, or the
+    # target day itself just isn't there) — better to say so up front with the
+    # exact fix than run anyway and produce a quietly-wrong replay.
+    if source == "parquet" and session_date < date.today():
+        manifest = dataset_manifest(all_bars, calendar, warmup_start, session_date, symbol, source=source)
+        if manifest["missing_days"]:
+            gap_start, gap_end = manifest["missing_days"][0], manifest["missing_days"][-1]
+            print(f"\n{_RED}Missing Parquet data for {symbol}: {', '.join(manifest['missing_days'])}{_RESET}")
+            print(f"{_YELLOW}Fill the gap first:{_RESET}")
+            print(f"  python scripts/download_raw.py --symbol {symbol} --start {gap_start} --end {gap_end}")
+            print(f"  python scripts/backfill.py --symbol {symbol} --start {gap_start} --end {gap_end}")
+            print(f"{_DIM}(backfill.py is idempotent — safe to run even where data already exists){_RESET}")
+            sys.exit(1)
+
+    persist_dates = [warmup_start + timedelta(days=i) for i in range((session_date - warmup_start).days + 1)]
+    enforce_persist_guard(symbol, persist_dates, settings, persist=persist, persist_force=persist_force)
+
     # Split into warmup (before session date) and session bars
     # For CME futures, the session date's bars start at 18:00 ET the prior calendar day.
     # We define "session" as bars whose ET date equals session_date OR the overnight
     # window that belongs to this CME session (18:00–23:59 ET on the prior calendar day).
-    session_date_utc_start = datetime(
-        session_date.year, session_date.month, session_date.day,
-        22, 0, 0, tzinfo=_UTC,
-    ) - timedelta(days=1)   # 18:00 ET prior day = session open
+    # Computed via CMEEqIndexCalendar.pre_market_open() (ZoneInfo-based) rather than a
+    # hardcoded UTC offset — a fixed 22:00 UTC is EDT-only and drifts an hour off in EST.
+    session_date_utc_start = calendar.pre_market_open(session_date)   # 18:00 ET prior day = session open
 
-    # Cap at 18:00 ET on session_date (= 22:00 UTC) — the next CME session starts
-    # there and would trigger ContextEngine.rollover(), resetting rth_open/ONH/ONL.
-    session_date_utc_end = datetime(
-        session_date.year, session_date.month, session_date.day,
-        22, 0, 0, tzinfo=_UTC,
-    )   # 18:00 ET session_date = exclusive upper bound
+    # Cap at 18:00 ET on session_date — the next CME session starts there and would
+    # trigger ContextEngine.rollover(), resetting rth_open/ONH/ONL.
+    session_date_utc_end = calendar.pre_market_open(session_date + timedelta(days=1))   # 18:00 ET session_date = exclusive upper bound
 
     warmup_bars  = [b for b in all_bars    if b.timestamp < session_date_utc_start]
     session_bars = [b for b in all_bars    if session_date_utc_start <= b.timestamp < session_date_utc_end]
@@ -441,10 +405,7 @@ async def replay(
         return
 
     # ── Optionally load order-flow data ───────────────────────────────────────
-    session_end_utc = datetime(
-        session_date.year, session_date.month, session_date.day,
-        21, 0, 0, tzinfo=_UTC,
-    )
+    session_end_utc = calendar.after_hours_close(session_date)
     session_trades: list[TradeEvent] = []
     session_quotes: list[QuoteEvent] = []
     if full_signals:
@@ -472,6 +433,11 @@ async def replay(
         await bus.publish(bar)
         await bus.flush()
     print(f" done.{_RESET}\n")
+
+    # Level interactions: shadow research subscriber, never influences trades.
+    # Attached only now (target date only, after warmup) — matching backtest.py /
+    # research_replay.py — so warmup days aren't recorded as episodes.
+    rctx.attach_interactions()
 
     # ── Build merged session event stream (bars + optional trades/quotes) ─────
     # Priority for same-timestamp ties: trades(0) → quotes(1) → bars(2)
@@ -559,7 +525,7 @@ async def replay(
         if verbose and snap:
             print(f"         EMA9={_fmt_dec(snap.ema_9)}  EMA20={_fmt_dec(snap.ema_20)}  "
                   f"ATR14={_fmt_dec(snap.atr_14)}  AboveVWAP={'Y' if snap.is_above_vwap else 'N'}  "
-                  f"ORBhigh={_fmt_dec(snap.orb_high)}  ORBlow={_fmt_dec(snap.orb_low)}")
+                  f"ORBhigh={_fmt_dec(snap.or_high)}  ORBlow={_fmt_dec(snap.or_low)}")
         if verbose and ctx:
             wz = f"{ctx.nearest_war_zone}@{_fmt_dec(ctx.nearest_war_zone_price)} ({_fmt_dec(ctx.nearest_war_zone_dist, 1)}pts)" if ctx.nearest_war_zone else "—"
             gap_str = f"{ctx.gap_points:+.2f}pts ({ctx.gap_pct:+.2f}%)" if ctx.gap_points is not None else "—"
@@ -621,16 +587,21 @@ async def replay(
         if ctx_final.nearest_war_zone:
             print(f"  Nearest WZ: {ctx_final.nearest_war_zone} @ {_fmt_dec(ctx_final.nearest_war_zone_price)}")
 
+    if rctx.interaction_engine is not None:
+        episodes_written = rctx.flush_interactions()
+        print(f"\n{_DIM}Level interactions: {episodes_written} episodes "
+              f"written to data/research/interaction/ (run_id=replay-{session_date}){_RESET}")
+
     snap = feature_engine.get_snapshot(symbol)
     if snap:
         print(f"\nFinal indicators:")
         print(f"  VWAP     : {_fmt_dec(snap.vwap)}")
         print(f"  EMA9     : {_fmt_dec(snap.ema_9)}")
-        print(f"  EMA20    : {_fmt_dec(snap.ema_20)}")
+        print(f"  EMA21    : {_fmt_dec(snap.ema_21)}")
         print(f"  EMA50    : {_fmt_dec(snap.ema_50)}")
         print(f"  ATR14    : {_fmt_dec(snap.atr_14)}")
-        print(f"  ORB H    : {_fmt_dec(snap.orb_high)}")
-        print(f"  ORB L    : {_fmt_dec(snap.orb_low)}")
+        print(f"  ORB H    : {_fmt_dec(snap.or_high)}")
+        print(f"  ORB L    : {_fmt_dec(snap.or_low)}")
         print(f"  EMA10 1d : {_fmt_dec(snap.ema10_1d)}")
         print(f"  EMA20 1d : {_fmt_dec(snap.ema20_1d)}")
 
@@ -638,6 +609,15 @@ async def replay(
         thesis_final = thesis_engine.get_thesis(symbol)
         snap_final   = feature_engine.get_snapshot(symbol)
         active_setups_final = setup_engine.active_setups(symbol)
+        resolved_config = build_resolved_config(settings, {
+            "symbol": symbol,
+            "session_date": str(session_date),
+            "warmup_days": warmup_days,
+            "source": source,
+            "full_signals": full_signals,
+            "no_cache": no_cache,
+            "record_interactions": record_interactions,
+        })
         json_path, csv_path = saver.save(
             meta={
                 "symbol": symbol,
@@ -645,6 +625,10 @@ async def replay(
                 "source": source,
                 "warmup_days": warmup_days,
             },
+            fingerprint=build_config_fingerprint(),
+            config=resolved_config,
+            config_hash_value=config_hash(resolved_config),
+            dataset=dataset_manifest(all_bars, calendar, warmup_start, session_date, symbol, source=source),
             full_signals=full_signals,
             thesis_final=thesis_final.dominant if thesis_final else None,
             snap_final=snap_final,
@@ -654,12 +638,7 @@ async def replay(
         print(f"  JSON → {json_path}")
         print(f"  CSV  → {csv_path}")
 
-    await thesis_engine.stop()
-    await setup_engine.stop()
-    await market_state_engine.stop()
-    await context_engine.stop()
-    await feature_engine.stop()
-    await bus.stop()
+    await rctx.stop()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -682,7 +661,9 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Replay a single CME session through the engine pipeline")
     p.add_argument("--symbol",  default="MNQ-09",    help="Ticker (default: MNQ-09)")
     p.add_argument("--date",    default=None,         help="Session date YYYY-MM-DD")
-    p.add_argument("--warmup",  type=int, default=5,  help="Warmup days (default: 5)")
+    p.add_argument("--warmup",  type=int, default=None,
+                   help="Warmup days (default: derived from "
+                        "settings.historical.minute1_warmup_bars, same formula backfill.py uses)")
     p.add_argument("--source",  default="parquet",    choices=["parquet", "databento"],
                    help="Data source (default: parquet)")
     p.add_argument("--full-signals", action="store_true",
@@ -693,6 +674,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--save-results", action="store_true",
                    help="Save structured JSON + CSV results to data/replay_results/ after replay")
     p.add_argument("--verbose", action="store_true",  help="Print indicator snapshot each bar")
+    p.add_argument("--record-interactions", action="store_true",
+                   help="Also run LevelInteractionEngine (shadow, VWAP/OR episode geometry) "
+                        "and write to data/research/interaction/")
+    p.add_argument("--persist", action="store_true",
+                   help="Also write reconstructed setups/market_states to "
+                        "data/parquet/setups|market_states/ (same tables live uses), "
+                        "tagged is_replay=True so they're distinguishable from live-captured rows")
+    p.add_argument("--persist-force", action="store_true",
+                   help="With --persist: clear any prior reconstruction (is_replay=True rows) "
+                        "for the affected dates before rerunning, instead of blocking. "
+                        "Never touches live-captured (is_replay=False) rows.")
     return p.parse_args()
 
 
@@ -711,12 +703,19 @@ def main() -> None:
             sys.exit(1)
         print(f"Auto-detected most recent cached date: {session_date}")
 
+    warmup_days = args.warmup
+    if warmup_days is None:
+        warmup_days = default_m1_warmup_days(AlphaSettings())
+
     asyncio.run(replay(
-        args.symbol, session_date, args.warmup, args.verbose,
+        args.symbol, session_date, warmup_days, args.verbose,
         args.source,
         full_signals=args.full_signals,
         no_cache=args.no_cache,
         save_results=args.save_results,
+        record_interactions=args.record_interactions,
+        persist=args.persist,
+        persist_force=args.persist_force,
     ))
 
 

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from alpha.calendar.nyse import NYSECalendar
 from alpha.config.loader import get_settings
-from alpha.config.settings import AlphaSettings
+from alpha.config.settings import AlphaSettings, HistoricalSettings
 from alpha.core.engine import BaseEngine
 from alpha.core.event_bus import EventBus
 from alpha.core.registry import SymbolRegistry
@@ -28,6 +28,27 @@ if TYPE_CHECKING:
     from alpha.engines.storage.engine import StorageEngine
 
 logger = logging.getLogger(__name__)
+
+
+def default_warmup_days(hist: HistoricalSettings) -> dict[BarTimeframe, int]:
+    """
+    Single source of truth for warmup-driven fetch/feed window sizing, per
+    timeframe — how many calendar days of history are needed to warm up each
+    timeframe's deepest indicator (EMA9/21 + VWAP for 1m/5m, EMA9/21/50 +
+    SMA100/200 for 1h, EMA9/21 + SMA50/100/200 for 1d).
+
+    Used by _on_start() below (the real fetch), scripts/backfill.py's
+    --dry-run (preview), and scripts/replay_common.py's
+    default_m1_warmup_days (backtest.py/replay_day.py's engine-priming
+    window) — previously three independent copies of this exact formula
+    with nothing enforcing they stay in sync.
+    """
+    return {
+        BarTimeframe.M1: max(3, hist.minute1_warmup_bars // 390 + 1),
+        BarTimeframe.M5: max(7, hist.minute5_warmup_bars // 78 + 2),
+        BarTimeframe.H1: int(hist.hourly_warmup_bars * 0.22) + 30,
+        BarTimeframe.D1: int(hist.daily_warmup_bars * 1.5),
+    }
 
 
 class BackfillEngine(BaseEngine):
@@ -121,10 +142,8 @@ class BackfillEngine(BaseEngine):
 
             # Warmup-driven start dates (calendar-day adjusted: ≈1.4× trading days for weekends)
             default_starts: dict[BarTimeframe, datetime] = {
-                BarTimeframe.M1: end - timedelta(days=max(3, hist.minute1_warmup_bars // 390 + 1)),
-                BarTimeframe.M5: end - timedelta(days=max(7, hist.minute5_warmup_bars // 78 + 2)),
-                BarTimeframe.H1: end - timedelta(days=int(hist.hourly_warmup_bars * 0.22) + 30),
-                BarTimeframe.D1: end - timedelta(days=int(hist.daily_warmup_bars * 1.5)),
+                tf: end - timedelta(days=days)
+                for tf, days in default_warmup_days(hist).items()
             }
 
             # An explicit --start extends the window further back on all timeframes
