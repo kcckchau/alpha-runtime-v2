@@ -64,6 +64,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Cap how far back the live feed's intraday replay can reach, regardless of
+# how stale m1_end is. Catch-up duration and historical-API publish lag both
+# make "m1_end - 1 minute" an unreliable proxy for "now" — if catch-up takes
+# 20+ minutes (or the historical API's latest bar is itself 20+ minutes old),
+# subscribing with that stale a start floods the live gateway's intraday
+# replay with a backlog sized to real market volume, right at open. Any gap
+# this leaves is closed by the existing catch-up/backfill path, not by this
+# subscription.
+_MAX_LIVE_REPLAY_LOOKBACK = timedelta(minutes=2)
+
+
+def compute_replay_start(m1_end: datetime, now: datetime) -> datetime:
+    """1-bar overlap against m1_end, floored so replay never reaches further
+    back than _MAX_LIVE_REPLAY_LOOKBACK from `now`."""
+    return max(m1_end - timedelta(minutes=1), now - _MAX_LIVE_REPLAY_LOOKBACK)
+
 
 class BootstrapEngine(BaseEngine, SnapshotMixin):
     """
@@ -269,9 +285,10 @@ class BootstrapEngine(BaseEngine, SnapshotMixin):
             await self._storage.flush()
 
         # ── Start live feed from historical edge ──────────────────────────────
-        # Use m1_end - 1m as a 1-bar overlap buffer against boundary precision.
+        # 1-bar overlap against m1_end, capped so a slow catch-up can't turn
+        # into a multi-minute replay backlog request right at market open.
         if self._live is not None:
-            replay_start = m1_end - timedelta(minutes=1)
+            replay_start = compute_replay_start(m1_end, datetime.now(timezone.utc))
             self._live.set_replay_start(replay_start)
             await self._live.start()
             self._write_runtime_snapshot()
