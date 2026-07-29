@@ -88,7 +88,14 @@ class OrderEngine(BaseEngine):
 
     async def _on_start(self) -> None:
         for adapter in self._adapters.values():
-            await adapter.connect()
+            try:
+                await adapter.connect()
+            except Exception:
+                logger.exception(
+                    "OrderEngine: adapter %s failed to connect — starting degraded, "
+                    "execution stays unavailable until it reconnects",
+                    adapter.source_id,
+                )
 
     async def _on_stop(self) -> None:
         for adapter in self._adapters.values():
