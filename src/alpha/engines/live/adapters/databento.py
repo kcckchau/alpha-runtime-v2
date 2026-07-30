@@ -567,6 +567,15 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             return
         lvl = levels[0]
 
+        # bid_px/ask_px carry the same UNDEF_PRICE (INT64_MAX) sentinel as
+        # record.price when one side of the book is momentarily empty (e.g.
+        # thin liquidity, pre-open). Undetected, _to_decimal() turns that
+        # into a ~9.2 billion "price" that flows straight through to the web
+        # chart. Skip the update entirely rather than publish a bad side —
+        # the previous bid/ask stays displayed until a real quote arrives.
+        if lvl.bid_px == dbn.UNDEF_PRICE or lvl.ask_px == dbn.UNDEF_PRICE:
+            return
+
         # MBP1Msg.price is the last trade price that triggered this book update.
         # Filter out the UNDEF_PRICE sentinel (INT64_MAX) which appears on
         # quote-only updates (no trade triggered the change).
