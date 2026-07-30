@@ -297,8 +297,13 @@ function formatPrice(value: string | number | null | undefined): string {
   if (value === null || value === undefined) return "—";
   const price = Number(value);
   if (!Number.isFinite(price)) return "—";
+  // Fixed at 2 decimals regardless of magnitude — MNQ (and the other futures
+  // this dashboard shows) trade in fixed tick increments (0.25), so letting
+  // minimumFractionDigits vary by price band made the string length itself
+  // flicker between 1 and 2 decimals tick to tick (27843.5 vs 27843.25),
+  // visibly changing the rendered width on every quote update.
   return price.toLocaleString(undefined, {
-    minimumFractionDigits: price >= 1000 ? 1 : 2,
+    minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
 }
