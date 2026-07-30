@@ -33,6 +33,14 @@ LOG_INTERVAL_SECS = 30.0
 GAP_WARN_MS = 5_000          # >5s between records → possible feed stall
 RECV_LATENCY_WARN_MS = 500   # >500ms ts_recv → local → network/SDK lag
 
+# Both warnings below fire from the same background thread that reads records
+# off the wire. logging.StreamHandler flushes on every emit, so once latency
+# crosses the threshold, an unthrottled warning-per-record turns the log call
+# itself into extra per-record work on the exact thread that's already behind
+# — a self-reinforcing loop, not just noise. Throttle to one line per window,
+# folding the suppressed count into the next line that does print.
+WARN_THROTTLE_S = 2.0
+
 
 class IngressObserver:
     """
@@ -57,6 +65,12 @@ class IngressObserver:
         self._total_recv_latency_ms: float = 0.0
         self._recv_latency_count: int = 0
 
+        # Warning throttle state (shared window per warning type)
+        self._last_gap_warn_ns: int | None = None
+        self._suppressed_gap_warnings: int = 0
+        self._last_recv_latency_warn_ns: int | None = None
+        self._suppressed_recv_latency_warnings: int = 0
+
         # Per-(instrument_id, rtype) last ts_event for out-of-order detection.
         # Keyed by rtype so bars (ts_event = bar open) don't pollute trade/quote ordering.
         self._last_ts_event_ns: dict[tuple[int, int], int] = {}
@@ -78,10 +92,20 @@ class IngressObserver:
             if gap_ms > self._max_gap_ms:
                 self._max_gap_ms = gap_ms
             if gap_ms > GAP_WARN_MS:
-                logger.warning(
-                    "IngressObserver: feed gap %.0fms (no records for %.1fs)",
-                    gap_ms, gap_ms / 1000,
-                )
+                if (
+                    self._last_gap_warn_ns is None
+                    or (arrival_ns - self._last_gap_warn_ns) / 1_000_000_000 >= WARN_THROTTLE_S
+                ):
+                    suppressed = self._suppressed_gap_warnings
+                    self._suppressed_gap_warnings = 0
+                    self._last_gap_warn_ns = arrival_ns
+                    logger.warning(
+                        "IngressObserver: feed gap %.0fms (no records for %.1fs)%s",
+                        gap_ms, gap_ms / 1000,
+                        f" [{suppressed} more suppressed]" if suppressed else "",
+                    )
+                else:
+                    self._suppressed_gap_warnings += 1
         self._last_arrival_ns = arrival_ns
 
         # ── ts_recv latency (Databento gateway → our machine) ────────────────
@@ -94,10 +118,20 @@ class IngressObserver:
                 if recv_latency_ms > self._max_recv_latency_ms:
                     self._max_recv_latency_ms = recv_latency_ms
                 if recv_latency_ms > RECV_LATENCY_WARN_MS:
-                    logger.warning(
-                        "IngressObserver: high ts_recv latency %.0fms (instrument_id=%s)",
-                        recv_latency_ms, getattr(record, "instrument_id", "?"),
-                    )
+                    if (
+                        self._last_recv_latency_warn_ns is None
+                        or (arrival_ns - self._last_recv_latency_warn_ns) / 1_000_000_000 >= WARN_THROTTLE_S
+                    ):
+                        suppressed = self._suppressed_recv_latency_warnings
+                        self._suppressed_recv_latency_warnings = 0
+                        self._last_recv_latency_warn_ns = arrival_ns
+                        logger.warning(
+                            "IngressObserver: high ts_recv latency %.0fms (instrument_id=%s)%s",
+                            recv_latency_ms, getattr(record, "instrument_id", "?"),
+                            f" [{suppressed} more suppressed]" if suppressed else "",
+                        )
+                    else:
+                        self._suppressed_recv_latency_warnings += 1
 
         # ── Feed latency (CME → Databento gateway: ts_recv - ts_event) ───────
         ts_event = getattr(record, "ts_event", None)
