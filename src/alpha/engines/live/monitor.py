@@ -139,6 +139,22 @@ class IngestionMonitor:
             len(self._states),
         )
 
+    def on_ingress_overload(self) -> None:
+        """
+        Call when the bounded ingress queue is full and records are being dropped.
+
+        Degrades all tracked symbols — dropped records mean the live state
+        (quote imbalance, trade flow) is incomplete for the current bar.
+        Safe to call from a background thread (only mutates state under GIL).
+        Recovers via normal clean-bar path once the queue drains.
+        """
+        for symbol, state in self._states.items():
+            self._degrade(symbol, state, "Ingress queue full — records dropped")
+        logger.error(
+            "IngestionMonitor: ingress queue overload — degraded %d symbol(s)",
+            len(self._states),
+        )
+
     def on_record_received(self, symbol: str, now: datetime | None = None) -> None:
         """
         Call on every trade or quote record for silence detection.

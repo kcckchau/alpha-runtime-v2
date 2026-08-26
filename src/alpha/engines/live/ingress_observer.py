@@ -11,10 +11,12 @@ or LOG_INTERVAL_SECS seconds, whichever comes first):
 
     IngressObserver | 500 records in 10.2s (49.0/s) | inter-record gap
     avg=20ms max=840ms | out_of_order=2 | ts_recv_latency avg=18ms max=91ms
+    | queue_wait avg=2ms max=18ms | dropped=0
 
 Warnings are emitted immediately when:
     - inter-record gap > GAP_WARN_MS (feed stall)
     - ts_recv latency > RECV_LATENCY_WARN_MS (network/SDK lag)
+    - queue wait > QUEUE_WAIT_WARN_MS (ingress backlog building)
     - out-of-order ts_event detected per instrument
 """
 
@@ -32,6 +34,11 @@ LOG_INTERVAL_SECS = 30.0
 # Warning thresholds
 GAP_WARN_MS = 5_000          # >5s between records → possible feed stall
 RECV_LATENCY_WARN_MS = 500   # >500ms ts_recv → local → network/SDK lag
+
+# Queue wait thresholds (time a record sits in the bounded ingress queue)
+QUEUE_WAIT_WARN_MS     = 100    # 100ms → WARN — backlog starting to build
+QUEUE_WAIT_DEGRADE_MS  = 500    # 500ms → DEGRADED — consumer falling behind
+QUEUE_WAIT_CRITICAL_MS = 2_000  # 2s    → CRITICAL — severe backlog
 
 # Both warnings below fire from the same background thread that reads records
 # off the wire. logging.StreamHandler flushes on every emit, so once latency
@@ -70,6 +77,8 @@ class IngressObserver:
         self._suppressed_gap_warnings: int = 0
         self._last_recv_latency_warn_ns: int | None = None
         self._suppressed_recv_latency_warnings: int = 0
+        self._last_queue_wait_warn_ns: int | None = None
+        self._suppressed_queue_wait_warnings: int = 0
 
         # Per-(instrument_id, rtype) last ts_event for out-of-order detection.
         # Keyed by rtype so bars (ts_event = bar open) don't pollute trade/quote ordering.
@@ -79,6 +88,13 @@ class IngressObserver:
         self._max_feed_latency_ms: float = 0.0
         self._total_feed_latency_ms: float = 0.0
         self._feed_latency_count: int = 0
+
+        # Bounded ingress queue metrics (populated by _ingress_consumer in event loop)
+        self._total_queue_wait_ms: float = 0.0
+        self._max_queue_wait_ms: float = 0.0
+        self._queue_wait_count: int = 0
+        self._window_dropped: int = 0
+        self._total_dropped: int = 0
 
     def observe(self, record: object, arrival_ns: int) -> None:
         self._records_seen += 1
@@ -168,6 +184,47 @@ class IngressObserver:
             self._log_summary(elapsed_s)
             self._reset_window(arrival_ns)
 
+    def observe_queue_wait(self, queue_wait_ms: float) -> None:
+        """
+        Called by _ingress_consumer (event loop) for each record drained from
+        the bounded queue. queue_wait_ms is the age of the record in the queue.
+        """
+        self._queue_wait_count += 1
+        self._total_queue_wait_ms += queue_wait_ms
+        if queue_wait_ms > self._max_queue_wait_ms:
+            self._max_queue_wait_ms = queue_wait_ms
+
+        if queue_wait_ms >= QUEUE_WAIT_DEGRADE_MS:
+            now_ns = time.time_ns()
+            if (
+                self._last_queue_wait_warn_ns is None
+                or (now_ns - self._last_queue_wait_warn_ns) / 1_000_000_000 >= WARN_THROTTLE_S
+            ):
+                suppressed = self._suppressed_queue_wait_warnings
+                self._suppressed_queue_wait_warnings = 0
+                self._last_queue_wait_warn_ns = now_ns
+                level = logging.ERROR if queue_wait_ms >= QUEUE_WAIT_CRITICAL_MS else logging.WARNING
+                logger.log(
+                    level,
+                    "IngressObserver: ingress queue backlog %.0fms (consumer falling behind)%s",
+                    queue_wait_ms,
+                    f" [{suppressed} more suppressed]" if suppressed else "",
+                )
+            else:
+                self._suppressed_queue_wait_warnings += 1
+
+    def record_ingress_drop(self) -> None:
+        """
+        Called by _record_loop (background thread) when put_nowait raises queue.Full.
+        Thread-safe: only increments int counters (atomic under GIL) + logs.
+        """
+        self._window_dropped += 1
+        self._total_dropped += 1
+        logger.error(
+            "IngressObserver: ingress queue full — record dropped (total=%d)",
+            self._total_dropped,
+        )
+
     def _log_summary(self, elapsed_s: float) -> None:
         rate = self._window_records / elapsed_s if elapsed_s > 0 else 0.0
 
@@ -197,15 +254,28 @@ class IngressObserver:
             else ""
         )
 
+        queue_avg = (
+            self._total_queue_wait_ms / self._queue_wait_count
+            if self._queue_wait_count > 0
+            else None
+        )
+        queue_str = (
+            f" | queue_wait avg={queue_avg:.0f}ms max={self._max_queue_wait_ms:.0f}ms"
+            f" dropped={self._window_dropped}"
+            if queue_avg is not None
+            else f" | queue_wait n/a dropped={self._window_dropped}"
+        )
+
         logger.info(
             "IngressObserver | %d records in %.1fs (%.1f/s)"
             " | gap avg=%.0fms max=%.0fms"
-            " | out_of_order=%d (total)%s%s",
+            " | out_of_order=%d (total)%s%s%s",
             self._window_records, elapsed_s, rate,
             gap_avg, self._max_gap_ms,
             self._out_of_order,
             recv_str,
             feed_str,
+            queue_str,
         )
 
     def _reset_window(self, now_ns: int) -> None:
@@ -220,4 +290,8 @@ class IngressObserver:
         self._total_feed_latency_ms = 0.0
         self._max_feed_latency_ms = 0.0
         self._feed_latency_count = 0
-        # out_of_order is cumulative — not reset
+        self._total_queue_wait_ms = 0.0
+        self._max_queue_wait_ms = 0.0
+        self._queue_wait_count = 0
+        self._window_dropped = 0
+        # out_of_order and _total_dropped are cumulative — not reset
