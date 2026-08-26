@@ -175,6 +175,7 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
 
         self._observer = IngressObserver()
         self._skipped_records_handler: Callable[[], None] | None = None
+        self._slow_reader_handler: Callable[[], None] | None = None
         self._ingress_overload_handler: Callable[[], None] | None = None
 
         # Bounded ingress queue — thread-safe SPSC buffer between record loop
@@ -185,8 +186,18 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
         self._ingress_consumer_task: asyncio.Task | None = None
 
     def set_skipped_records_handler(self, fn: Callable[[], None]) -> None:
-        """Register a callback invoked when Databento reports SKIPPED_RECORDS."""
+        """
+        Register a callback invoked when Databento reports SKIPPED_RECORDS_AFTER_SLOW_READING.
+        This is DATA_LOSS — records were dropped. Wire to IngestionMonitor.on_skipped_records().
+        """
         self._skipped_records_handler = fn
+
+    def set_slow_reader_handler(self, fn: Callable[[], None]) -> None:
+        """
+        Register a callback invoked when Databento warns the client is a slow reader.
+        This is LAG only — no records dropped yet. Wire to IngestionMonitor.on_slow_reader_warning().
+        """
+        self._slow_reader_handler = fn
 
     def set_ingress_overload_handler(self, fn: Callable[[], None]) -> None:
         """
@@ -429,10 +440,11 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                         return
                     if not self._loop.is_running():
                         return
-                    arrival_ns = time.time_ns()
-                    self._observer.observe(record, arrival_ns)
+                    arrival_wall_ns = time.time_ns()
+                    arrival_mono_ns = time.monotonic_ns()
+                    self._observer.observe(record, arrival_wall_ns)
                     try:
-                        self._ingress_queue.put_nowait((record, arrival_ns))
+                        self._ingress_queue.put_nowait((record, arrival_wall_ns, arrival_mono_ns))
                     except _queue.Full:
                         self._ingress_dropped += 1
                         self._observer.record_ingress_drop()
@@ -537,10 +549,10 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             drained = 0
             for _ in range(_INGRESS_MAX_BATCH):
                 try:
-                    record, arrival_ns = self._ingress_queue.get_nowait()
+                    record, _arrival_wall_ns, arrival_mono_ns = self._ingress_queue.get_nowait()
                 except _queue.Empty:
                     break
-                queue_wait_ms = (time.time_ns() - arrival_ns) / 1_000_000
+                queue_wait_ms = (time.monotonic_ns() - arrival_mono_ns) / 1_000_000
                 self._observer.observe_queue_wait(queue_wait_ms)
                 try:
                     await self._dispatch(record)
@@ -574,10 +586,19 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             self._handle_symbol_mapping(record)
         elif rtype_int == _RTYPE_SYSTEM:
             msg = getattr(record, "msg", "") or ""
-            if "SKIPPED" in msg.upper():
-                logger.warning("Databento SKIPPED_RECORDS: %s", msg)
+            msg_upper = msg.upper()
+            if "SKIPPED" in msg_upper:
+                # SKIPPED_RECORDS_AFTER_SLOW_READING: gateway actually dropped
+                # records — this is DATA_LOSS, not lag. State may be corrupt.
+                logger.error("Databento SKIPPED_RECORDS (DATA_LOSS): %s", msg)
                 if self._skipped_records_handler is not None:
                     self._skipped_records_handler()
+            elif "SLOW" in msg_upper:
+                # Slow-reader warning: client is falling behind but records are
+                # NOT yet dropped. LAG only — state still intact, can recover.
+                logger.warning("Databento slow reader warning: %s", msg)
+                if self._slow_reader_handler is not None:
+                    self._slow_reader_handler()
             else:
                 logger.debug("Databento system: %s", msg)
         elif rtype_int == _RTYPE_ERROR:

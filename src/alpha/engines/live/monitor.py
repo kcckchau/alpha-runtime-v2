@@ -123,19 +123,42 @@ class IngestionMonitor:
         else:
             self._record_clean_bar(symbol, state)
 
+    def on_slow_reader_warning(self) -> None:
+        """
+        Call when Databento warns the client is falling behind (slow reader).
+
+        This is a LAG condition — records are NOT yet dropped, the gateway is
+        warning that the client is consuming too slowly. State is still intact.
+        DEGRADED is correct: signals are blocked as a precaution, but the
+        system can auto-recover once it catches up and the next clean bar arrives.
+        """
+        reason = "Databento slow reader warning — lagging behind feed, not yet dropping records"
+        for symbol, state in self._states.items():
+            self._degrade(symbol, state, reason)
+        logger.warning(
+            "IngestionMonitor: slow reader warning — degraded %d symbol(s) (recoverable)",
+            len(self._states),
+        )
+
     def on_skipped_records(self) -> None:
         """
         Call when Databento reports SKIPPED_RECORDS_AFTER_SLOW_READING.
 
-        Degrades all tracked symbols — we don't know which instruments were
-        affected, so the safe default is to treat all as suspect until the
-        next clean bar arrives.
+        This is a DATA_LOSS condition — the gateway actually dropped records
+        because the client was too slow to consume them. The in-memory state
+        (VWAP, cumulative volume, trade flow, quote imbalance) is potentially
+        corrupt for the affected instruments.
+
+        Sets FAILED (sticky), not DEGRADED (auto-recoverable). The next clean
+        bar cannot reconstruct what was lost — explicit resync/restart required.
         """
-        now = datetime.now(timezone.utc)
+        reason = "Databento SKIPPED_RECORDS — records dropped by gateway, state integrity unknown"
         for symbol, state in self._states.items():
-            self._degrade(symbol, state, "Databento skipped records (slow reader)")
-        logger.warning(
-            "IngestionMonitor: Databento reported SKIPPED_RECORDS — degraded %d symbol(s)",
+            if state.quality != DataQualityState.FAILED:
+                self._set_state(symbol, state, DataQualityState.FAILED, reason)
+        logger.error(
+            "IngestionMonitor: SKIPPED_RECORDS DATA_LOSS — FAILED %d symbol(s)."
+            " Resync required before signals resume.",
             len(self._states),
         )
 
