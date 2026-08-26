@@ -27,7 +27,6 @@ Design notes:
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -77,9 +76,14 @@ class _Window:
         "s1_deltas",       # list of (ts, delta, volume) per 1s bar
         "bar_low",         # running bar low (updated from S1 bars or M1 bar)
         "bar_low_ts",      # timestamp of the 1s bar that set the bar low
-        # quote imbalance
-        "quote_updates",   # list of (ts, bid_size, ask_size)
+        # quote imbalance — incremental TWAP (O(1) per update, O(1) at seal)
         "quote_count",
+        "_twap_last_ts",       # datetime | None — timestamp of previous quote
+        "_twap_last_bid_sz",   # int — bid_size of previous quote
+        "_twap_last_ask_sz",   # int — ask_size of previous quote
+        "_twap_weighted_bid",  # float — running time-weighted bid accumulator
+        "_twap_weighted_ask",  # float — running time-weighted ask accumulator
+        "_twap_total_time",    # float — total seconds elapsed between quotes
     )
 
     def __init__(self, open_ts: datetime, close_ts: datetime, large_trade_threshold: int):
@@ -95,8 +99,13 @@ class _Window:
         self.s1_deltas: list[tuple[datetime, int, int]] = []   # (ts, delta, volume)
         self.bar_low: Decimal | None = None
         self.bar_low_ts: datetime | None = None
-        self.quote_updates: list[tuple[datetime, int, int]] = []
         self.quote_count = 0
+        self._twap_last_ts: datetime | None = None
+        self._twap_last_bid_sz: int = 0
+        self._twap_last_ask_sz: int = 0
+        self._twap_weighted_bid: float = 0.0
+        self._twap_weighted_ask: float = 0.0
+        self._twap_total_time: float = 0.0
 
     def add_trade(self, event: TradeEvent) -> None:
         size = event.size
@@ -115,7 +124,15 @@ class _Window:
         self.trade_count += 1
 
     def add_quote(self, event: QuoteEvent) -> None:
-        self.quote_updates.append((event.timestamp, event.bid_size, event.ask_size))
+        if self._twap_last_ts is not None:
+            dt = (event.timestamp - self._twap_last_ts).total_seconds()
+            if dt > 0:
+                self._twap_weighted_bid += self._twap_last_bid_sz * dt
+                self._twap_weighted_ask += self._twap_last_ask_sz * dt
+                self._twap_total_time += dt
+        self._twap_last_ts = event.timestamp
+        self._twap_last_bid_sz = event.bid_size
+        self._twap_last_ask_sz = event.ask_size
         self.quote_count += 1
 
     def add_s1_bar(self, event: BarEvent) -> None:
@@ -328,29 +345,10 @@ class BarFlowAggregator:
     def _compute_quote_imbalance(
         self, w: _Window
     ) -> tuple[float | None, float | None, float | None]:
-        updates = w.quote_updates
-        if len(updates) < 2:
+        if w.quote_count < 2 or w._twap_total_time <= 0:
             return None, None, None
-
-        total_time = 0.0
-        weighted_bid = 0.0
-        weighted_ask = 0.0
-
-        for i in range(len(updates) - 1):
-            ts_a, bid_a, ask_a = updates[i]
-            ts_b, _, _ = updates[i + 1]
-            dt = (ts_b - ts_a).total_seconds()
-            if dt <= 0:
-                continue
-            weighted_bid += bid_a * dt
-            weighted_ask += ask_a * dt
-            total_time += dt
-
-        if total_time <= 0:
-            return None, None, None
-
-        twap_bid = weighted_bid / total_time
-        twap_ask = weighted_ask / total_time
+        twap_bid = w._twap_weighted_bid / w._twap_total_time
+        twap_ask = w._twap_weighted_ask / w._twap_total_time
         total = twap_bid + twap_ask
         imbalance = (twap_bid / total) if total > 0 else None
         return twap_bid, twap_ask, imbalance
