@@ -143,15 +143,25 @@ class IngestionMonitor:
         """
         Call when the bounded ingress queue is full and records are being dropped.
 
-        Degrades all tracked symbols — dropped records mean the live state
-        (quote imbalance, trade flow) is incomplete for the current bar.
-        Safe to call from a background thread (only mutates state under GIL).
-        Recovers via normal clean-bar path once the queue drains.
+        Sets FAILED (not DEGRADED) because dropped records mean the in-memory
+        state (VWAP, trade flow, quote imbalance, cumulative volume) is no longer
+        consistent with the actual market feed — it cannot self-heal by waiting
+        for the next clean bar. Recovery requires an explicit resync / restart.
+
+        This is a DATA_LOSS condition, distinct from BACKLOGGED (lag only,
+        no drops): a backlogged consumer still sees all events and recovers
+        once it catches up. A queue full drop means the event is gone.
+
+        Called via loop.call_soon_threadsafe() from the background record thread
+        so state mutation stays on the event-loop thread (single writer).
         """
+        reason = "Ingress records dropped — live state integrity unknown, resync required"
         for symbol, state in self._states.items():
-            self._degrade(symbol, state, "Ingress queue full — records dropped")
+            if state.quality != DataQualityState.FAILED:
+                self._set_state(symbol, state, DataQualityState.FAILED, reason)
         logger.error(
-            "IngestionMonitor: ingress queue overload — degraded %d symbol(s)",
+            "IngestionMonitor: ingress DATA_LOSS — FAILED %d symbol(s)."
+            " Resync required before signals resume.",
             len(self._states),
         )
 

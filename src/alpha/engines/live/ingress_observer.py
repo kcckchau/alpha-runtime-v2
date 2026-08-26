@@ -216,14 +216,27 @@ class IngressObserver:
     def record_ingress_drop(self) -> None:
         """
         Called by _record_loop (background thread) when put_nowait raises queue.Full.
-        Thread-safe: only increments int counters (atomic under GIL) + logs.
+
+        Only increments counters — no per-record logging to avoid a self-reinforcing
+        slow-path feedback loop (log I/O on the already-overloaded record thread).
+        The periodic summary in _log_summary() reports the window drop count.
+        The throttled aggregate below fires at most once per WARN_THROTTLE_S seconds.
         """
         self._window_dropped += 1
         self._total_dropped += 1
-        logger.error(
-            "IngressObserver: ingress queue full — record dropped (total=%d)",
-            self._total_dropped,
-        )
+        now_ns = time.time_ns()
+        if (
+            self._last_queue_wait_warn_ns is None
+            or (now_ns - self._last_queue_wait_warn_ns) / 1_000_000_000 >= WARN_THROTTLE_S
+        ):
+            dropped_this_window = self._window_dropped
+            self._last_queue_wait_warn_ns = now_ns
+            logger.error(
+                "IngressObserver: ingress queue full — %d record(s) dropped this window"
+                " (total=%d)",
+                dropped_this_window,
+                self._total_dropped,
+            )
 
     def _log_summary(self, elapsed_s: float) -> None:
         rate = self._window_records / elapsed_s if elapsed_s > 0 else 0.0

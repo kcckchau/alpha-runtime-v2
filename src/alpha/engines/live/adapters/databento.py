@@ -104,7 +104,10 @@ _UNAUTHORIZED_SCHEMA_RE = re.compile(r"Not authorized for (\S+) schema")
 
 # Bounded ingress queue: decouples the Databento background thread from the
 # asyncio event loop. Records wait here until _ingress_consumer drains them.
-_INGRESS_QUEUE_MAXSIZE = 50_000   # ~25s of records at RTH-open burst (2000 q/s + 500 t/s)
+# Capacity is a hard memory bound — actual time-to-full depends entirely on
+# the producer rate (50k / 65k rec/s burst ≈ 0.8s). Use queue_wait /
+# oldest_event_age as the health signal, not queue depth alone.
+_INGRESS_QUEUE_MAXSIZE = 50_000
 _INGRESS_MAX_BATCH = 500          # max records drained per consumer iteration
 _INGRESS_IDLE_SLEEP_S = 0.0005   # 0.5ms sleep when queue is empty
 
@@ -442,7 +445,7 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                             )
                         ):
                             self._last_overload_signal_ns = now_ns
-                            self._ingress_overload_handler()
+                            self._loop.call_soon_threadsafe(self._ingress_overload_handler)
                 logger.warning("Databento live record loop: server closed the connection")
             except db.common.error.BentoError as exc:
                 msg = str(exc)
@@ -540,7 +543,7 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                 queue_wait_ms = (time.time_ns() - arrival_ns) / 1_000_000
                 self._observer.observe_queue_wait(queue_wait_ms)
                 try:
-                    self._dispatch(record)
+                    await self._dispatch(record)
                 except Exception:
                     logger.exception("Databento: dispatch error for %r", record)
                 drained += 1
@@ -551,7 +554,7 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
 
     # ── Dispatch ──────────────────────────────────────────────────────────────
 
-    def _dispatch(self, record: object) -> None:
+    async def _dispatch(self, record: object) -> None:
         rtype = getattr(record, "rtype", None)
         if rtype is None:
             return
@@ -560,13 +563,13 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
         rtype_int = int(rtype)
 
         if rtype_int in _RTYPE_OHLCV:
-            self._dispatch_bar(record, rtype_int)
+            await self._dispatch_bar(record, rtype_int)
         elif rtype_int == _RTYPE_MBP1:
-            self._dispatch_quote(record)
+            await self._dispatch_quote(record)
         elif rtype_int == _RTYPE_MBP10:
-            self._dispatch_book(record)
+            await self._dispatch_book(record)
         elif rtype_int == _RTYPE_TRADE:
-            self._dispatch_trade(record)
+            await self._dispatch_trade(record)
         elif rtype_int == _RTYPE_SYMBOL_MAPPING:
             self._handle_symbol_mapping(record)
         elif rtype_int == _RTYPE_SYSTEM:
@@ -600,7 +603,7 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                 iid, ticker, stype_in_sym,
             )
 
-    def _dispatch_bar(self, record: object, rtype_int: int) -> None:
+    async def _dispatch_bar(self, record: object, rtype_int: int) -> None:
         ticker = self._resolve_ticker(record)
         if ticker is None:
             return
@@ -625,9 +628,9 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                 is_replay=False,
             ),
         )
-        asyncio.ensure_future(handler(event))
+        await handler(event)
 
-    def _dispatch_quote(self, record: object) -> None:
+    async def _dispatch_quote(self, record: object) -> None:
         ticker = self._resolve_ticker(record)
         if ticker is None:
             return
@@ -673,9 +676,9 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                 is_replay=False,
             ),
         )
-        asyncio.ensure_future(handler(event))
+        await handler(event)
 
-    def _dispatch_trade(self, record: object) -> None:
+    async def _dispatch_trade(self, record: object) -> None:
         ticker = self._resolve_ticker(record)
         if ticker is None:
             return
@@ -726,9 +729,9 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                 is_replay=False,
             ),
         )
-        asyncio.ensure_future(trade_handler(event))
+        await trade_handler(event)
 
-    def _dispatch_book(self, record: object) -> None:
+    async def _dispatch_book(self, record: object) -> None:
         ticker = self._resolve_ticker(record)
         if ticker is None:
             return
@@ -749,4 +752,4 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                 is_replay=False,
             ),
         )
-        asyncio.ensure_future(handler(event))
+        await handler(event)
