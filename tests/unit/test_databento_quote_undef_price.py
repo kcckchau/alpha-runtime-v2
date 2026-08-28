@@ -58,8 +58,7 @@ class TestQuoteUndefPriceGuard:
         adapter._quote_handlers["MNQ-09"] = handler
         record = _quote_record([_level(bid_px=dbn.UNDEF_PRICE, ask_px=27_843_250_000_000)])
 
-        adapter._dispatch_quote(record)
-        await asyncio.sleep(0.01)
+        await adapter._dispatch_quote(record)
 
         assert received == []
 
@@ -73,8 +72,7 @@ class TestQuoteUndefPriceGuard:
         adapter._quote_handlers["MNQ-09"] = handler
         record = _quote_record([_level(bid_px=27_842_750_000_000, ask_px=dbn.UNDEF_PRICE)])
 
-        adapter._dispatch_quote(record)
-        await asyncio.sleep(0.01)
+        await adapter._dispatch_quote(record)
 
         assert received == []
 
@@ -88,8 +86,7 @@ class TestQuoteUndefPriceGuard:
         adapter._quote_handlers["MNQ-09"] = handler
         record = _quote_record([_level(bid_px=27_842_750_000_000, ask_px=27_843_250_000_000)])
 
-        adapter._dispatch_quote(record)
-        await asyncio.sleep(0.01)
+        await adapter._dispatch_quote(record)
 
         assert len(received) == 1
         assert received[0].bid_price == 27842.75

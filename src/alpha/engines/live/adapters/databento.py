@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import queue as _queue
 import re
 import time
 import threading
@@ -101,6 +102,15 @@ _RTYPE_ERROR = 21
 # but not live, so this isn't hypothetical.
 _UNAUTHORIZED_SCHEMA_RE = re.compile(r"Not authorized for (\S+) schema")
 
+# Bounded ingress queue: decouples the Databento background thread from the
+# asyncio event loop. Records wait here until _ingress_consumer drains them.
+# Capacity is a hard memory bound — actual time-to-full depends entirely on
+# the producer rate (50k / 65k rec/s burst ≈ 0.8s). Use queue_wait /
+# oldest_event_age as the health signal, not queue depth alone.
+_INGRESS_QUEUE_MAXSIZE = 50_000
+_INGRESS_MAX_BATCH = 500          # max records drained per consumer iteration
+_INGRESS_IDLE_SLEEP_S = 0.0005   # 0.5ms sleep when queue is empty
+
 
 def _to_datetime(ts_ns: int) -> datetime:
     return datetime.fromtimestamp(ts_ns / 1e9, tz=_UTC)
@@ -165,10 +175,40 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
 
         self._observer = IngressObserver()
         self._skipped_records_handler: Callable[[], None] | None = None
+        self._slow_reader_handler: Callable[[], None] | None = None
+        self._ingress_overload_handler: Callable[[], None] | None = None
+
+        # Bounded ingress queue — thread-safe SPSC buffer between record loop
+        # (background thread) and _ingress_consumer (event loop).
+        self._ingress_queue: _queue.Queue = _queue.Queue(maxsize=_INGRESS_QUEUE_MAXSIZE)
+        self._ingress_dropped: int = 0
+        self._last_overload_signal_ns: int | None = None
+        self._ingress_consumer_task: asyncio.Task | None = None
 
     def set_skipped_records_handler(self, fn: Callable[[], None]) -> None:
-        """Register a callback invoked when Databento reports SKIPPED_RECORDS."""
+        """
+        Register a callback invoked when Databento reports SKIPPED_RECORDS_AFTER_SLOW_READING.
+        This is DATA_LOSS — records were dropped. Wire to IngestionMonitor.on_skipped_records().
+        """
         self._skipped_records_handler = fn
+
+    def set_slow_reader_handler(self, fn: Callable[[], None]) -> None:
+        """
+        Register a callback invoked when Databento warns the client is a slow reader.
+        This is LAG only — no records dropped yet. Wire to IngestionMonitor.on_slow_reader_warning().
+        """
+        self._slow_reader_handler = fn
+
+    def set_ingress_overload_handler(self, fn: Callable[[], None]) -> None:
+        """
+        Register a callback invoked when the ingress queue is full.
+
+        Called from the background record thread at most once every 5 seconds.
+        The callback runs synchronously in that thread — keep it fast (state
+        mutation only, no asyncio). Typically wired to
+        IngestionMonitor.on_ingress_overload().
+        """
+        self._ingress_overload_handler = fn
 
     @property
     def source_id(self) -> DataSourceId:
@@ -211,10 +251,20 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
         self._loop = asyncio.get_running_loop()
         self._client = db.Live(key=self._settings.api_key.get_secret_value())
         self._connected = True
+        self._ingress_consumer_task = asyncio.create_task(
+            self._ingress_consumer(), name="databento-ingress-consumer"
+        )
         logger.info("Databento live adapter: session created")
 
     async def disconnect(self) -> None:
         self._connected = False
+        if self._ingress_consumer_task is not None:
+            self._ingress_consumer_task.cancel()
+            try:
+                await self._ingress_consumer_task
+            except asyncio.CancelledError:
+                pass
+            self._ingress_consumer_task = None
         if self._client is not None:
             try:
                 self._client.stop()
@@ -390,12 +440,24 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                         return
                     if not self._loop.is_running():
                         return
-                    arrival_ns = time.time_ns()
-                    self._observer.observe(record, arrival_ns)
+                    arrival_wall_ns = time.time_ns()
+                    arrival_mono_ns = time.monotonic_ns()
+                    self._observer.observe(record, arrival_wall_ns)
                     try:
-                        self._dispatch(record)
-                    except Exception:
-                        logger.exception("Databento: dispatch error for %r", record)
+                        self._ingress_queue.put_nowait((record, arrival_wall_ns, arrival_mono_ns))
+                    except _queue.Full:
+                        self._ingress_dropped += 1
+                        self._observer.record_ingress_drop()
+                        now_ns = time.time_ns()
+                        if (
+                            self._ingress_overload_handler is not None
+                            and (
+                                self._last_overload_signal_ns is None
+                                or now_ns - self._last_overload_signal_ns >= 5_000_000_000
+                            )
+                        ):
+                            self._last_overload_signal_ns = now_ns
+                            self._loop.call_soon_threadsafe(self._ingress_overload_handler)
                 logger.warning("Databento live record loop: server closed the connection")
             except db.common.error.BentoError as exc:
                 msg = str(exc)
@@ -471,9 +533,40 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
             list(self._sub_specs.keys()),
         )
 
+    # ── Ingress consumer ──────────────────────────────────────────────────────
+
+    async def _ingress_consumer(self) -> None:
+        """
+        Async task (event loop) that drains the bounded ingress queue and
+        dispatches records into the event loop.
+
+        Batches up to _INGRESS_MAX_BATCH records per iteration, then yields
+        the event loop with asyncio.sleep(0) so other tasks (BarFlowAggregator
+        handlers, FeatureEngine, etc.) remain responsive. When the queue is
+        empty, sleeps _INGRESS_IDLE_SLEEP_S (0.5ms) to avoid busy-spinning.
+        """
+        while True:
+            drained = 0
+            for _ in range(_INGRESS_MAX_BATCH):
+                try:
+                    record, _arrival_wall_ns, arrival_mono_ns = self._ingress_queue.get_nowait()
+                except _queue.Empty:
+                    break
+                queue_wait_ms = (time.monotonic_ns() - arrival_mono_ns) / 1_000_000
+                self._observer.observe_queue_wait(queue_wait_ms)
+                try:
+                    await self._dispatch(record)
+                except Exception:
+                    logger.exception("Databento: dispatch error for %r", record)
+                drained += 1
+            if drained > 0:
+                await asyncio.sleep(0)  # yield after each batch
+            else:
+                await asyncio.sleep(_INGRESS_IDLE_SLEEP_S)
+
     # ── Dispatch ──────────────────────────────────────────────────────────────
 
-    def _dispatch(self, record: object) -> None:
+    async def _dispatch(self, record: object) -> None:
         rtype = getattr(record, "rtype", None)
         if rtype is None:
             return
@@ -482,21 +575,30 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
         rtype_int = int(rtype)
 
         if rtype_int in _RTYPE_OHLCV:
-            self._dispatch_bar(record, rtype_int)
+            await self._dispatch_bar(record, rtype_int)
         elif rtype_int == _RTYPE_MBP1:
-            self._dispatch_quote(record)
+            await self._dispatch_quote(record)
         elif rtype_int == _RTYPE_MBP10:
-            self._dispatch_book(record)
+            await self._dispatch_book(record)
         elif rtype_int == _RTYPE_TRADE:
-            self._dispatch_trade(record)
+            await self._dispatch_trade(record)
         elif rtype_int == _RTYPE_SYMBOL_MAPPING:
             self._handle_symbol_mapping(record)
         elif rtype_int == _RTYPE_SYSTEM:
             msg = getattr(record, "msg", "") or ""
-            if "SKIPPED" in msg.upper():
-                logger.warning("Databento SKIPPED_RECORDS: %s", msg)
+            msg_upper = msg.upper()
+            if "SKIPPED" in msg_upper:
+                # SKIPPED_RECORDS_AFTER_SLOW_READING: gateway actually dropped
+                # records — this is DATA_LOSS, not lag. State may be corrupt.
+                logger.error("Databento SKIPPED_RECORDS (DATA_LOSS): %s", msg)
                 if self._skipped_records_handler is not None:
                     self._skipped_records_handler()
+            elif "SLOW" in msg_upper:
+                # Slow-reader warning: client is falling behind but records are
+                # NOT yet dropped. LAG only — state still intact, can recover.
+                logger.warning("Databento slow reader warning: %s", msg)
+                if self._slow_reader_handler is not None:
+                    self._slow_reader_handler()
             else:
                 logger.debug("Databento system: %s", msg)
         elif rtype_int == _RTYPE_ERROR:
@@ -522,7 +624,7 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                 iid, ticker, stype_in_sym,
             )
 
-    def _dispatch_bar(self, record: object, rtype_int: int) -> None:
+    async def _dispatch_bar(self, record: object, rtype_int: int) -> None:
         ticker = self._resolve_ticker(record)
         if ticker is None:
             return
@@ -547,13 +649,9 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                 is_replay=False,
             ),
         )
-        assert self._loop is not None
-        try:
-            asyncio.run_coroutine_threadsafe(handler(event), self._loop)
-        except RuntimeError:
-            pass  # Loop closed during shutdown
+        await handler(event)
 
-    def _dispatch_quote(self, record: object) -> None:
+    async def _dispatch_quote(self, record: object) -> None:
         ticker = self._resolve_ticker(record)
         if ticker is None:
             return
@@ -599,13 +697,9 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                 is_replay=False,
             ),
         )
-        assert self._loop is not None
-        try:
-            asyncio.run_coroutine_threadsafe(handler(event), self._loop)
-        except RuntimeError:
-            pass  # Loop closed during shutdown
+        await handler(event)
 
-    def _dispatch_trade(self, record: object) -> None:
+    async def _dispatch_trade(self, record: object) -> None:
         ticker = self._resolve_ticker(record)
         if ticker is None:
             return
@@ -656,13 +750,9 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                 is_replay=False,
             ),
         )
-        assert self._loop is not None
-        try:
-            asyncio.run_coroutine_threadsafe(trade_handler(event), self._loop)
-        except RuntimeError:
-            pass  # Loop closed during shutdown
+        await trade_handler(event)
 
-    def _dispatch_book(self, record: object) -> None:
+    async def _dispatch_book(self, record: object) -> None:
         ticker = self._resolve_ticker(record)
         if ticker is None:
             return
@@ -683,8 +773,4 @@ class DatabentoLiveFeedAdapter(LiveFeedAdapter):
                 is_replay=False,
             ),
         )
-        assert self._loop is not None
-        try:
-            asyncio.run_coroutine_threadsafe(handler(event), self._loop)
-        except RuntimeError:
-            pass  # Loop closed during shutdown
+        await handler(event)
